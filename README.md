@@ -1,9 +1,9 @@
 # Ponos
 
-Ponos enables event drivent distributed architectures by providing scalable
+Ponos enables event driven distributed architectures by providing scalable
 event streaming and tenanted worker pools based on Redis. 
 
-## Streaming
+## Streams
 
 Ponos streams provide a flexible mechanism for routing events across a fleet of
 microservices. Event sinks can subscribe to multiple streams and consume events
@@ -51,11 +51,11 @@ flowchart TD
     Topic2-->|fa:fa-bolt Events|Sink2
 ```
 
-See [Streaming](streaming/README.md) for more details.
+See [Streams](streams/README.md) for more details.
 
 ## Tenanted Workers
 
-Ponos builds on top of the [Streaming](streaming/README.md) package to implement a tenanted worker pool.
+Ponos builds on top of the [streams](streams/README.md) package to implement a tenanted worker pool.
 
 ## License
 
