@@ -24,10 +24,10 @@ is used to namespace the Redis keys and pub/sub channels used by the map.
 package main
 
 import (
-	"context"
+        "context"
 
-	"github.com/redis/go-redis/v9"
-	"goa.design/ponos/replicated"
+        "github.com/redis/go-redis/v9"
+        "goa.design/ponos/replicated"
 )
 
 func main() {
@@ -89,13 +89,13 @@ the notification to be received.
 package main
 
 import (
-	"context"
-	"fmt"
-	"strconv"
-	"sync"
+        "context"
+        "fmt"
+        "strconv"
+        "sync"
 
-	"github.com/redis/go-redis/v9"
-	"goa.design/ponos/replicated"
+        "github.com/redis/go-redis/v9"
+        "goa.design/ponos/replicated"
 )
 
 func main() {

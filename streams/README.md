@@ -226,7 +226,7 @@ sink := stream.NewSink("my-sink", ponos.WithSinkTopicPattern("my-topic.*"))
 Custom matching logic can also be provided:
 
 ```go
-sink := stream.NewSink("my-sink", ponos.WitSinkhEventMatcher(
+sink := stream.NewSink("my-sink", ponos.WithSinkEventMatcher(
     func(event *ponos.Event) bool {
         return event.Topic == "my-topic" && event.EventName == "event"
     }))

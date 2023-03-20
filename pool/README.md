@@ -39,7 +39,7 @@ func main() {
     rdb := redis.NewClient()
 
     // Stop processing jobs after 10 seconds.
-    ctx := context.WithDeadline(contdxt.Background(), time.Now().Add(10*time.Second))
+    ctx := context.WithDeadline(context.Background(), time.Now().Add(10*time.Second))
 
     // Connect to or create pool "fibonacci".
     pool, err := ponos.Pool("fibonacci", rdb)
