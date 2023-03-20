@@ -109,7 +109,14 @@ func (sm *Map) Set(ctx context.Context, key, value string) error {
 	if err := sm.txWithCurrent(ctx, key, set); err != nil {
 		return err
 	}
+
+	// send update
+	if err := sm.rdb.Publish(ctx, sm.channelName(), key+"="+value).Err(); err != nil {
+		return fmt.Errorf("failed to publish update: %w", err)
+	}
+
 	sm.content[key] = value
+
 	sm.logger.Info("replicated map %q: updated key %q to %q", sm.hashName(), key, value)
 	return nil
 }

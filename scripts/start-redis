@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -e
+
+GIT_ROOT=$(git rev-parse --show-toplevel)
+pushd "${GIT_ROOT}"
+
+# shellcheck source=utils/common.sh
+source ./scripts/utils/common.sh
+source .env
+
+docker-compose -p redis -f docker-compose/docker-compose-redis.yaml up -d --remove-orphans
+
+popd
