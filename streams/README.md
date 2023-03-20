@@ -8,7 +8,7 @@ API to create and consume streams, for example:
 package main
 
 import (
-    redis "github.com/go-redis/redis/v8"
+    redis "github.com/redis/go-redis/v9"
     "goa.design/ponos/streams"
 )
 

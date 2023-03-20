@@ -2,12 +2,14 @@ package streams
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"regexp"
 	"sync"
 	"time"
 
-	redis "github.com/go-redis/redis/v8"
+	"github.com/google/uuid"
+	redis "github.com/redis/go-redis/v9"
 )
 
 const (
@@ -28,12 +30,16 @@ type (
 		Name string
 		// C is the sink event channel.
 		C <-chan *Event
-		// conn is the redis connection.
-		conn *Conn
+		// rdb is the redis connection.
+		rdb *redis.Client
+		// consumer is the sink consumer name.
+		consumer string
+		// noAck is true if there is no need to acknowledge events.
+		noAck bool
 		// lock is the sink mutex.
 		lock sync.Mutex
 		// streams are the streams the sink consumes events from.
-		streams []*Stream
+		streams []*EventStream
 		// cursors are the stream cursors.
 		cursors map[string]string
 		// c is the sink event channel.
@@ -48,7 +54,7 @@ type (
 )
 
 // newSink creates a new sink.
-func newSink(ctx context.Context, name string, stream *Stream, opts ...SinkOption) *Sink {
+func newSink(ctx context.Context, name string, stream *EventStream, opts ...SinkOption) (*Sink, error) {
 	options := defaultSinkOptions()
 	for _, option := range opts {
 		option(&options)
@@ -66,26 +72,38 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...SinkOptio
 			eventMatcher = func(e *Event) bool { return topicPatternRegexp.MatchString(e.Topic) }
 		}
 	}
+	if err := stream.rdb.XGroupCreateMkStream(ctx, stream.Name, name, options.LastEventID).Err(); err != nil {
+		return nil, fmt.Errorf("failed to create Redis consumer group %s for stream %s: %w", name, stream.Name, err)
+	}
+	consumer := uuid.New().String()
+	if err := stream.rdb.XGroupCreateConsumer(ctx, stream.Name, name, consumer).Err(); err != nil {
+		return nil, fmt.Errorf("failed to create Redis consumer %s for consumer group %s: %w", consumer, name, err)
+	}
 	sink := &Sink{
 		Name:          name,
 		C:             c,
-		conn:          stream.conn,
-		streams:       []*Stream{stream},
+		rdb:           stream.rdb,
+		consumer:      uuid.New().String(),
+		noAck:         options.NoAck,
+		streams:       []*EventStream{stream},
 		cursors:       map[string]string{stream.Name: "0"},
 		c:             c,
 		errorReporter: options.ErrorReporter,
 		eventMatcher:  eventMatcher,
 	}
 	go sink.read(ctx)
-	return sink
+	return sink, nil
 }
 
 // AddStream adds the stream to the sink, it is idempotent.
-func (s *Sink) AddStream(stream *Stream) error {
+func (s *Sink) AddStream(ctx context.Context, stream *EventStream) error {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 	if _, ok := s.cursors[stream.Name]; ok {
 		return nil
+	}
+	if err := stream.rdb.XGroupCreateConsumer(ctx, stream.Name, s.Name, s.consumer).Err(); err != nil {
+		return fmt.Errorf("failed to create Redis consumer %s for consumer group %s: %w", s.consumer, s.Name, err)
 	}
 	s.streams = append(s.streams, stream)
 	s.cursors[stream.Name] = "0"
@@ -93,7 +111,7 @@ func (s *Sink) AddStream(stream *Stream) error {
 }
 
 // RemoveStream removes the stream from the sink, it is idempotent.
-func (s *Sink) RemoveStream(stream *Stream) error {
+func (s *Sink) RemoveStream(ctx context.Context, stream *EventStream) error {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 	delete(s.cursors, stream.Name)
@@ -103,11 +121,14 @@ func (s *Sink) RemoveStream(stream *Stream) error {
 			return nil
 		}
 	}
+	if err := s.rdb.XGroupDelConsumer(ctx, stream.Name, s.Name, s.consumer).Err(); err != nil {
+		return fmt.Errorf("failed to delete Redis consumer %s for consumer group %s: %w", s.consumer, s.Name, err)
+	}
 	return nil
 }
 
-// Close closes the sink, it is idempotent.
-func (s *Sink) Close() error {
+// Stop stops event polling and closes the sink channel, it is idempotent.
+func (s *Sink) Stop() error {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 	if s.closed {
@@ -118,8 +139,35 @@ func (s *Sink) Close() error {
 	return nil
 }
 
+// Destroy deletes the sink backing consumer group and closes the sink channel.
+// This causes all pending events to be lost.
+func (s *Sink) Destroy(ctx context.Context) error {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	if s.closed {
+		return nil
+	}
+	for _, stream := range s.streams {
+		if err := s.rdb.XGroupDestroy(ctx, stream.Name, s.Name).Err(); err != nil {
+			return fmt.Errorf("failed to destroy Redis consumer group %s for stream %s: %w", s.Name, stream.Name, err)
+		}
+	}
+	close(s.c)
+	s.closed = true
+	return nil
+}
+
 // read reads events from the streams and sends them to the sink channel.
 func (s *Sink) read(ctx context.Context) {
+	defer func() {
+		s.lock.Lock()
+		defer s.lock.Unlock()
+		for _, stream := range s.streams {
+			if err := s.rdb.XGroupDelConsumer(ctx, stream.Name, s.Name, s.consumer).Err(); err != nil {
+				s.errorReporter(ctx, fmt.Errorf("failed to delete Redis consumer %s for consumer group %s: %w", s.consumer, s.Name, err))
+			}
+		}
+	}()
 	for {
 		var readStreams []string
 		{
@@ -134,10 +182,13 @@ func (s *Sink) read(ctx context.Context) {
 			}
 			s.lock.Unlock()
 		}
-		events, err := s.conn.rdb.XRead(ctx, &redis.XReadArgs{
-			Streams: readStreams,
-			Count:   maxMessages,
-			Block:   blockMs,
+		events, err := s.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+			Group:    s.Name,
+			Consumer: s.consumer,
+			Streams:  readStreams,
+			Count:    maxMessages,
+			Block:    blockMs,
+			NoAck:    s.noAck,
 		}).Result()
 		if err != nil {
 			if err == redis.Nil {
@@ -145,32 +196,37 @@ func (s *Sink) read(ctx context.Context) {
 			}
 			s.errorReporter(ctx, err)
 			// Full jitter backoff.
+			// TBD: Should we exit after a certain number of retries?
 			time.Sleep(time.Duration(rand.Intn(maxJitterMs)) * time.Millisecond)
 			continue
 		}
 		s.lock.Lock()
-		defer s.lock.Unlock()
-		if s.closed {
-			return
-		}
-		for _, streamEvents := range events {
-			for _, event := range streamEvents.Messages {
-				var topic string
-				if event.Values["topic"] != nil {
-					topic = event.Values["topic"].(string)
+		{
+			if s.closed {
+				return
+			}
+			for _, streamEvents := range events {
+				for _, event := range streamEvents.Messages {
+					var topic string
+					if t, ok := event.Values["topic"]; ok {
+						topic = t.(string)
+					}
+					event := newEvent(
+						s.rdb,
+						streamEvents.Stream,
+						s.Name,
+						event.ID,
+						event.Values["event"].(string),
+						topic,
+						event.Values["payload"].([]byte),
+					)
+					if s.eventMatcher != nil && !s.eventMatcher(event) {
+						continue
+					}
+					s.c <- event
 				}
-				event := &Event{
-					ID:         event.ID,
-					StreamName: streamEvents.Stream,
-					EventName:  event.Values["event"].(string),
-					Topic:      topic,
-					Payload:    event.Values["payload"].([]byte),
-				}
-				if s.eventMatcher != nil && !s.eventMatcher(event) {
-					continue
-				}
-				s.c <- event
 			}
 		}
+		s.lock.Unlock()
 	}
 }

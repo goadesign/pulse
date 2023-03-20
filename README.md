@@ -3,6 +3,31 @@
 Ponos enables event driven distributed architectures by providing scalable
 event streaming and tenanted worker pools based on Redis. 
 
+## Replicated Maps
+
+Replicated maps provide a mechanism for sharing data across a fleet of
+microservices and receiving events when the data changes.
+
+Replicated maps consist of an in-memory map of strings with copies shared across
+all participating processes. Any process can update the replicated map, updates
+are propagated within milliseconds across all processes. Replicated maps are
+implemented using Redis hashes and pub/sub.
+
+```mermaid
+flowchart TD
+    subgraph Processes [Client Processes]
+        direction LR
+        H[fa:fa-microchip Process A]
+        G[fa:fa-microchip Process B]
+    end
+    Map[[fa:fa-map-o Replicated Map]]
+    H-->|fa:fa-map-o Set|Map
+    Map-.->|fa:fa-map-o Update|G
+    G-->|fa:fa-map-o Get|Map
+```
+
+See the [replicated package README](replicated/README.md) for more details.
+
 ## Streams
 
 Ponos streams provide a flexible mechanism for routing events across a fleet of
@@ -47,15 +72,40 @@ flowchart TD
     Producers-->|fa:fa-bolt Add event|Topic2
     Producers2-->|fa:fa-bolt Add event|Stream2
     Topic-->|fa:fa-bolt Events|Sink
+    Topic2-->|fa:fa-bolt Events|Sink
     Stream2-->|fa:fa-bolt Events|Sink
     Topic2-->|fa:fa-bolt Events|Sink2
 ```
 
-See [Streams](streams/README.md) for more details.
+See the [streams package README](streams/README.md) for more details.
 
-## Tenanted Workers
+## Tenanted Worker Pool
 
-Ponos builds on top of the [streams](streams/README.md) package to implement a tenanted worker pool.
+Ponos builds on top of the [replicated](replicated/README.md) and
+[streams](streams/README.md) packages to implement a tenanted worker pool where
+jobs are distributed to worker groups based on a key.
+
+```mermaid
+flowchart TD
+    subgraph Producers
+        direction LR
+        H[fa:fa-microchip Process]-.-G[fa:fa-microchip Process]
+    end
+    subgraph Pool
+        direction TB
+        subgraph Worker [Worker Group A]
+            direction TB
+            A[fa:fa-tasks Job keyed 1]-.-B[fa:fa-tasks Job keyed n]
+        end
+        subgraph Worker2 [Worker Group B]
+            direction TB
+            A2[fa:fa-tasks Job keyed n+1]-.-B2[fa:fa-tasks Job keyed m]
+        end
+    end
+    Producers-->|fa:fa-tasks Add keyed job|Pool
+```
+
+See the [pool package README](pool/README.md) for more details.
 
 ## License
 

@@ -3,6 +3,7 @@ package streams
 import (
 	"context"
 	"log"
+	"time"
 )
 
 type (
@@ -13,11 +14,14 @@ type (
 	EventMatcherFunc func(event *Event) bool
 
 	sinkOption struct {
-		Topic         string
-		TopicPattern  string
-		EventMatcher  EventMatcherFunc
-		BufferSize    int
-		ErrorReporter func(context.Context, error)
+		Topic          string
+		TopicPattern   string
+		EventMatcher   EventMatcherFunc
+		BufferSize     int
+		LastEventID    string
+		NoAck          bool
+		AckGracePeriod time.Duration
+		ErrorReporter  func(context.Context, error)
 	}
 )
 
@@ -43,11 +47,36 @@ func WithSinkEventMatcher(matcher EventMatcherFunc) SinkOption {
 	}
 }
 
-// WithSinkBufferSize sets the sink buffer size.
+// WithSinkBufferSize sets the sink channel buffer size.
 // The default buffer size is 1000.
 func WithSinkBufferSize(size int) SinkOption {
 	return func(o *sinkOption) {
 		o.BufferSize = size
+	}
+}
+
+// WithSinkLastEventID sets the last read event ID, the sink will start reading
+// from the next event. Use the special ID "0" to start from the beginning of
+// the stream. Starts from the last event by default.
+func WithSinkLastEventID(id string) SinkOption {
+	return func(o *sinkOption) {
+		o.LastEventID = id
+	}
+}
+
+// WithSinkNoAck removes the need to acknowledge events read from the sink.
+func WithSinkNoAck() SinkOption {
+	return func(o *sinkOption) {
+		o.NoAck = true
+	}
+}
+
+// WithSinkAckGracePeriod sets the grace period for acknowledging events.  The
+// default grace period is 30 seconds. Events that are not acknowledged within
+// the grace period will be redelivered.
+func WithSinkAckGracePeriod(d time.Duration) SinkOption {
+	return func(o *sinkOption) {
+		o.AckGracePeriod = d
 	}
 }
 
@@ -66,5 +95,7 @@ func defaultSinkOptions() sinkOption {
 		ErrorReporter: func(ctx context.Context, err error) {
 			log.Println(err)
 		},
+		LastEventID:    "$",
+		AckGracePeriod: 30 * time.Second,
 	}
 }
