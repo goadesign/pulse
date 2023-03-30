@@ -61,7 +61,7 @@ value for the key.
         val, ok := m.Get("foo") // ok is true
 ```
 
-### CLeaning Up
+### Cleaning Up
 
 When you are done with a replicated map you should cancel the context used to
 create it. This will cause the map to unsubscribe from the pub/sub channel and
