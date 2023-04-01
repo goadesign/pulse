@@ -2,12 +2,13 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"strconv"
 	"sync"
 
 	"github.com/redis/go-redis/v9"
+	"goa.design/clue/log"
+	"goa.design/ponos/ponos"
 	"goa.design/ponos/replicated"
 )
 
@@ -23,40 +24,51 @@ func main() {
 	defer cancel()
 
 	// Join or create a replicated map
-	m, err := replicated.Join(ctx, "my-map", client)
+	logCtx := log.Context(ctx)
+	log.FlushAndDisableBuffering(logCtx)
+	logger := ponos.AdaptClueLogger(logCtx)
+
+	m, err := replicated.Join(ctx, "my-map", client, replicated.WithLogger(logger))
 	if err != nil {
 		panic(err)
 	}
 
-	// Print the current contents of the map
-	fmt.Println(m.Map())
-
 	// Add a new key
-	m.Set(ctx, "foo", "bar")
+	if err := m.Set(ctx, "foo", "bar"); err != nil {
+		panic(err)
+	}
 
 	// Keys set by the current process are available immediately
-	val, ok := m.Get("foo")
-	fmt.Println(val, ok)
+	_, ok := m.Get("foo")
+	if !ok {
+		panic("key not found")
+	}
+
+	// Reset the map
+	if err = m.Reset(ctx); err != nil {
+		panic(err)
+	}
 
 	// Start a goroutine to listen for updates
+	numitems := 10
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-m.C:
-				fmt.Println("map updated:", m.Map())
-				if len(m.Map()) == 100 {
-					wg.Done()
+				if len(m.Map()) == numitems {
+					return
 				}
 			}
 		}
 	}()
 
 	// Send a few updates
-	for i := 0; i < 100; i++ {
+	for i := 0; i < numitems; i++ {
 		m.Set(ctx, "foo-"+strconv.Itoa(i+1), "bar")
 	}
 
