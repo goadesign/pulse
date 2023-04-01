@@ -26,7 +26,7 @@ type (
 		logger       *stdlog.Logger
 	}
 
-	// cluetLogger is a clue logger adapter.
+	// clueLogger is a clue logger adapter.
 	clueLogger struct {
 		logContext context.Context
 	}

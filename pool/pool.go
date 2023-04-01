@@ -48,7 +48,7 @@ type (
 const (
 	// Name of event used to send new job to workers.
 	eventNewJob string = "new_job"
-	// eventShtudown is the event used to shutdown workers.
+	// eventShutdown is the event used to shutdown workers.
 	eventShutdown string = "shutdown"
 )
 

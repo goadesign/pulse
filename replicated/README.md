@@ -24,10 +24,10 @@ is used to namespace the Redis keys and pub/sub channels used by the map.
 package main
 
 import (
-	"context"
+        "context"
 
-	"github.com/redis/go-redis/v9"
-	"goa.design/ponos/replicated"
+        "github.com/redis/go-redis/v9"
+        "goa.design/ponos/replicated"
 )
 
 func main() {
@@ -60,7 +60,7 @@ value for a given key. The `Set` method sets the value for a given key.
         val, ok := m.Get("foo") // ok is true
 ```
 
-### CLeaning Up
+### Cleaning Up
 
 When you are done with a replicated map you should cancel the context used to
 create it. This will cause the map to unsubscribe from the pub/sub channel and
@@ -88,13 +88,13 @@ the notifications to be received.
 package main
 
 import (
-	"context"
-	"fmt"
-	"strconv"
-	"sync"
+        "context"
+        "fmt"
+        "strconv"
+        "sync"
 
-	"github.com/redis/go-redis/v9"
-	"goa.design/ponos/replicated"
+        "github.com/redis/go-redis/v9"
+        "goa.design/ponos/replicated"
 )
 
 func main() {

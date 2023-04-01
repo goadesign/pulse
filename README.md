@@ -1,7 +1,7 @@
 # Ponos
 
 Ponos enables event driven distributed architectures by providing scalable
-event streaming and tenanted worker pools based on Redis. 
+event streaming and tenanted worker pools based on Redis.
 
 ## Replicated Maps
 
