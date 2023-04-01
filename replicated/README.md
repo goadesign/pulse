@@ -10,8 +10,8 @@ in-memory copies of a map across multiple nodes. Any change to the map is
 automatically replicated to all nodes and results in a notification that can be
 used to trigger actions.
 
-Upon joining a replicated map the node will receive a snapshot of the map and
-then receive updates as they occur.
+Upon joining a replicated map the node receives an up-to-date snapshot of its
+content followed by updates as they occur.
 
 ## Usage
 
@@ -47,8 +47,7 @@ func main() {
 ### Reading and Writing to the Map
 
 The `Map` method returns a copy of the current map. The `Get` method returns the
-value for a given key. The `Set` method updates the map and returns the previous
-value for the key.
+value for a given key. The `Set` method sets the value for a given key. 
 
 ```go
         // Print the current contents of the map
@@ -81,9 +80,9 @@ stop receiving updates.
 
 ## Example
 
-The following example creates a replicated map and then starts a goroutine to
-listen for notifications. The main goroutine then sets 100 keys and waits for
-the notification to be received.
+The following example creates a replicated map and then starts a goroutine that
+listens to notifications. The main goroutine then sets 100 keys and waits for
+the notifications to be received.
 
 ```go
 package main
@@ -113,16 +112,6 @@ func main() {
         if err != nil {
             panic(err)
         }
-
-        // Print the current contents of the map
-        fmt.Println(m.Map())
-
-        // Add a new key
-        m.Set(ctx, "foo", "bar")
-
-        // Keys set by the current process are available immediately
-        val, ok := m.Get("foo")
-        fmt.Println(val, ok)
 
         // Start a goroutine to listen for updates
         var wg sync.WaitGroup
