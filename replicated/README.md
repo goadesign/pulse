@@ -100,7 +100,8 @@ import (
 func main() {
         // Create a Redis client
         client := redis.NewClient(&redis.Options{
-            Addr: "localhost:6379",
+                Addr: "localhost:6379",
+                Password: os.Getenv("REDIS_PASSWORD"),
         })
     
         ctx, cancel := context.WithCancel(context.Background())
@@ -110,7 +111,7 @@ func main() {
         // Join or create a replicated map
         m, err := replicated.Join(ctx, "my-map", client)
         if err != nil {
-            panic(err)
+                panic(err)
         }
 
         // Start a goroutine to listen for updates
@@ -122,8 +123,8 @@ func main() {
                         case <-ctx.Done():
                                 return
                         case <-m.C:
-                                fmt.Println("map updated:", m.Map())
                                 if len(m.Map()) == 100 {
+                                        // We received all the updates
                                         wg.Done()
                                 }
                         }

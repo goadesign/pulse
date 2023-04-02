@@ -14,9 +14,13 @@ import (
 
 func main() {
 	// Create a Redis client
+	pwd := os.Getenv("REDIS_PASSWORD")
+	if pwd == "" {
+		panic("REDIS_PASSWORD not set")
+	}
 	client := redis.NewClient(&redis.Options{
 		Addr:     "localhost:6379",
-		Password: os.Getenv("REDIS_PASSWORD"),
+		Password: pwd,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
