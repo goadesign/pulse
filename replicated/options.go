@@ -4,7 +4,7 @@ import "goa.design/ponos/ponos"
 
 type (
 	// MapOption is a Map creation option.
-	MapOption func(*options) error
+	MapOption func(*options)
 
 	options struct {
 		// Channel name
@@ -13,11 +13,10 @@ type (
 	}
 )
 
-// WithLogger sets the logger used to report errors.
+// WithLogger sets the logger used by the map.
 func WithLogger(logger ponos.Logger) MapOption {
-	return func(o *options) error {
+	return func(o *options) {
 		o.Logger = logger
-		return nil
 	}
 }
 

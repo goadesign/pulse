@@ -3,7 +3,9 @@ package replicated
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +38,7 @@ type (
 		logger   ponos.Logger          // logger
 		sub      *redis.PubSub         // subscription to map updates
 		set      *redis.Script
+		incr     *redis.Script
 		del      *redis.Script
 		reset    *redis.Script
 		rdb      *redis.Client
@@ -62,6 +65,12 @@ const luaDelete = `
 const luaReset = `
    redis.call("DEL", KEYS[1])
    redis.call("PUBLISH", KEYS[2], "*=")
+`
+
+// luaIncr is the Lua script used to increment a value.
+const luaIncr = `
+   redis.call("HINCRBY", KEYS[1], ARGV[1], ARGV[2])
+   redis.call("PUBLISH", KEYS[2], ARGV[3])
 `
 
 // Join retrieves the content of the replicated map with the given name and
@@ -96,6 +105,7 @@ func Join(ctx context.Context, name string, rdb *redis.Client, options ...MapOpt
 		logger:   opts.Logger,
 		rdb:      rdb,
 		set:      redis.NewScript(luaSet),
+		incr:     redis.NewScript(luaIncr),
 		del:      redis.NewScript(luaDelete),
 		reset:    redis.NewScript(luaReset),
 		content:  make(map[string]string),
@@ -171,6 +181,34 @@ func (sm *Map) Set(ctx context.Context, key, value string) error {
 	return nil
 }
 
+// Increment increments the value for the given key, the value must be an
+// integer. An error is returned if the key is empty or contains an equal sign
+// or if the value.
+func (sm *Map) Increment(ctx context.Context, key string, delta int) error {
+	if len(key) == 0 {
+		return fmt.Errorf("ponos: invalid map key: %s (cannot be empty)", key)
+	}
+	if strings.Contains(key, "=") {
+		return fmt.Errorf("ponos: invalid map key: %s (cannot contain '=')", key)
+	}
+	sm.lock.Lock()
+	defer sm.lock.Unlock()
+	if sm.done {
+		return fmt.Errorf("ponos: map %s is closed", sm.name)
+	}
+
+	if err := sm.incr.Eval(
+		ctx,
+		sm.rdb,
+		[]string{sm.hashkey, sm.chankey},
+		key, delta, key+"+="+strconv.Itoa(delta),
+	).Err(); err != nil && err != redis.Nil {
+		return fmt.Errorf("ponos: map %s: failed to increment value for key %s: %w", sm.name, key, err)
+	}
+
+	return nil
+}
+
 // Delete deletes the value for the given key.
 func (sm *Map) Delete(ctx context.Context, key string) error {
 	sm.lock.Lock()
@@ -221,7 +259,7 @@ func (sm *Map) init(ctx context.Context) error {
 	sm.msgch = sm.sub.Channel()
 
 	// Make sure scripts are cached.
-	for _, script := range []string{luaSet, luaDelete, luaReset} {
+	for _, script := range []string{luaSet, luaDelete, luaReset, luaIncr} {
 		if err := sm.rdb.ScriptLoad(ctx, script).Err(); err != nil {
 			return fmt.Errorf("ponos: failed to load Lua script for map %s: %w", sm.name, err)
 		}
@@ -262,22 +300,17 @@ func (sm *Map) run(ctx context.Context) {
 			}
 			key, val := parts[0], parts[1]
 			sm.lock.Lock()
-			if key == "*" {
-				// reset
-				sm.content = make(map[string]string)
-				sm.logger.Info("ponos: map %s: reset", sm.name)
-				sm.lock.Unlock()
-				continue
-			}
-			if val == "" {
-				delete(sm.content, key)
-				sm.logger.Info("ponos: map %s: %s deleted", sm.name, key)
-			} else {
-				sm.content[key] = val
-				sm.logger.Info("ponos: map %s: %s=%s", sm.name, key, val)
+			switch {
+			case key == "*":
+				sm.doReset()
+			case val == "":
+				sm.doDelete(key)
+			case strings.HasSuffix(key, "+"):
+				sm.doIncrement(key[:len(key)-1], val)
+			default:
+				sm.doSet(key, val)
 			}
 			select {
-			// Non-blocking send.
 			case sm.notifych <- struct{}{}:
 			default:
 			}
@@ -290,6 +323,45 @@ func (sm *Map) run(ctx context.Context) {
 	}
 }
 
+// doReset resets the map content.
+func (sm *Map) doReset() {
+	sm.content = make(map[string]string)
+	sm.logger.Info("ponos: map %s: reset", sm.name)
+}
+
+// doDelete deletes the value for the given key.
+func (sm *Map) doDelete(key string) {
+	delete(sm.content, key)
+	sm.logger.Info("ponos: map %s: %s deleted", sm.name, key)
+}
+
+// doIncrement increments the value for the given key.
+func (sm *Map) doIncrement(key, delta string) {
+	if _, ok := sm.content[key]; !ok {
+		sm.content[key] = delta
+		sm.logger.Info("ponos: map %s: %s=%s", sm.name, key, delta)
+	} else {
+		v, err := strconv.Atoi(sm.content[key])
+		if err != nil {
+			sm.logger.Error(fmt.Errorf("ponos: map %s: failed to increment %s (value: %s, delta: %s): %w", sm.name, key, sm.content[key], delta, err))
+			return
+		}
+		d, err := strconv.Atoi(delta)
+		if err != nil {
+			sm.logger.Error(fmt.Errorf("ponos: map %s: failed to increment %s (value: %s, delta: %s): %w", sm.name, key, sm.content[key], delta, err))
+			return
+		}
+		sm.content[key] = strconv.Itoa(v + d)
+		sm.logger.Info("ponos: map %s: %s=%s", sm.name, key, sm.content[key])
+	}
+}
+
+// doSet sets the value for the given key.
+func (sm *Map) doSet(key, val string) {
+	sm.content[key] = val
+	sm.logger.Info("ponos: map %s: %s=%s", sm.name, key, val)
+}
+
 // reconnect attempts to reconnect to the Redis server forever.
 func (sm *Map) reconnect(ctx context.Context) {
 	sm.logger.Error(fmt.Errorf("ponos: map %s: disconnected", sm.name))
@@ -299,7 +371,7 @@ func (sm *Map) reconnect(ctx context.Context) {
 		sm.logger.Info("ponos: map %s: reconnect attempt %d", sm.name, count)
 		if err := sm.init(ctx); err != nil {
 			sm.logger.Error(fmt.Errorf("ponos: map %s: failed to reconnect: %w", sm.name, err))
-			time.Sleep(1 * time.Second)
+			time.Sleep(time.Duration(rand.Float64()*5+1) * time.Second)
 			continue
 		}
 		sm.logger.Info("ponos: map %s: reconnected", sm.name)

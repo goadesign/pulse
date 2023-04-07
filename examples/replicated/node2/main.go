@@ -30,7 +30,7 @@ func main() {
 	// Join or create a replicated map
 	logCtx := log.Context(ctx)
 	log.FlushAndDisableBuffering(logCtx)
-	logger := ponos.AdaptClueLogger(logCtx)
+	logger := ponos.ClueLogger(logCtx)
 
 	m, err := replicated.Join(ctx, "my-map", client, replicated.WithLogger(logger))
 	if err != nil {

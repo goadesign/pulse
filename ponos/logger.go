@@ -32,13 +32,13 @@ type (
 	}
 )
 
-// AdaptStdLogger adapts a Go standard library logger to a ponos logger.
-func AdaptStdLogger(logger *stdlog.Logger) Logger {
+// StdLogger adapts a Go standard library logger to a ponos logger.
+func StdLogger(logger *stdlog.Logger) Logger {
 	return &stdLogger{logger: logger}
 }
 
-// AdaptClueLogger adapts a clue logger to a ponos logger.
-func AdaptClueLogger(logCtx context.Context) Logger {
+// ClueLogger adapts a clue logger to a ponos logger.
+func ClueLogger(logCtx context.Context) Logger {
 	cluelog.MustContainLogger(logCtx)
 	return &clueLogger{logCtx}
 }

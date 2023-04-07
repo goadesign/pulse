@@ -76,15 +76,15 @@ func TestMapLocal(t *testing.T) {
 	assert.False(t, ok)
 
 	// Write multiple values
-	keys := []string{"foo", "bar", "baz"}
-	vals := []string{"foo", "bar", "baz"}
+	keys := []string{"foo", "bar", "baz", "int"}
+	vals := []string{"foo", "bar", "baz", "42"}
 	for i, k := range keys {
 		assert.NoError(t, m.Set(ctx, k, vals[i]))
 	}
 
 	// Check that the values are eventually available
-	require.Eventually(t, func() bool { return len(m.Map()) == 3 }, wf, tck)
-	require.Len(t, m.Keys(), 3)
+	require.Eventually(t, func() bool { return len(m.Map()) == 4 }, wf, tck)
+	require.Len(t, m.Keys(), 4)
 	for i, k := range keys {
 		assert.Equal(t, vals[i], m.Map()[k])
 		v, ok := m.Get(k)
@@ -92,12 +92,19 @@ func TestMapLocal(t *testing.T) {
 		assert.Equal(t, vals[i], v)
 	}
 
+	// Increment an integer value
+	assert.NoError(t, m.Increment(ctx, "int", 1))
+
+	// Check that the value is eventually incremented
+	require.Eventually(t, func() bool { return m.Map()["int"] == "43" }, wf, tck)
+	vals[3] = "43"
+
 	// Delete a value
 	assert.NoError(t, m.Delete(ctx, keys[0]))
 
 	// Check that the value is eventually no longer available
-	assert.Eventually(t, func() bool { return len(m.Map()) == 2 }, wf, tck)
-	assert.Len(t, m.Keys(), 2)
+	assert.Eventually(t, func() bool { return len(m.Map()) == 3 }, wf, tck)
+	assert.Len(t, m.Keys(), 3)
 	v, ok = m.Get(keys[0])
 	assert.False(t, ok)
 	assert.Empty(t, v)
@@ -148,7 +155,7 @@ func TestLogs(t *testing.T) {
 	ctx = log.Context(ctx, log.WithOutput(&buf))
 	log.FlushAndDisableBuffering(ctx)
 
-	m, err := Join(ctx, "test", rdb, WithLogger(ponos.AdaptClueLogger(ctx)))
+	m, err := Join(ctx, "test", rdb, WithLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 
 	const key, val = "foo", "bar"
@@ -208,7 +215,7 @@ func TestReconnect(t *testing.T) {
 	log.FlushAndDisableBuffering(ctx)
 	defer cancel()
 
-	m, err := Join(ctx, "test", rdb, WithLogger(ponos.AdaptClueLogger(ctx)))
+	m, err := Join(ctx, "test", rdb, WithLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 
 	// Write a value
