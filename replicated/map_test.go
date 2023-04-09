@@ -99,6 +99,18 @@ func TestMapLocal(t *testing.T) {
 	require.Eventually(t, func() bool { return m.Map()["int"] == "43" }, wf, tck)
 	vals[3] = "43"
 
+	// Append to a string value
+	assert.NoError(t, m.Append(ctx, "foo", "bar"))
+
+	// Check that the value is eventually appended
+	require.Eventually(t, func() bool { return m.Map()["foo"] == "foo,bar" }, wf, tck)
+
+	// Append again
+	assert.NoError(t, m.Append(ctx, "foo", "baz"))
+
+	// Check that the value is eventually appended
+	require.Eventually(t, func() bool { return m.Map()["foo"] == "foo,bar,baz" }, wf, tck)
+
 	// Delete a value
 	assert.NoError(t, m.Delete(ctx, keys[0]))
 
@@ -157,6 +169,7 @@ func TestLogs(t *testing.T) {
 
 	m, err := Join(ctx, "test", rdb, WithLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
+	assert.NoError(t, m.Reset(ctx))
 
 	const key, val = "foo", "bar"
 	wf := time.Second

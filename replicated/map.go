@@ -38,6 +38,7 @@ type (
 		logger   ponos.Logger          // logger
 		sub      *redis.PubSub         // subscription to map updates
 		set      *redis.Script
+		append   *redis.Script
 		incr     *redis.Script
 		del      *redis.Script
 		reset    *redis.Script
@@ -70,6 +71,18 @@ const luaReset = `
 // luaIncr is the Lua script used to increment a value.
 const luaIncr = `
    redis.call("HINCRBY", KEYS[1], ARGV[1], ARGV[2])
+   redis.call("PUBLISH", KEYS[2], ARGV[3])
+`
+
+// luaAppend is the Lua script used to append an item to an array value.
+const luaAppend = `
+   local v = redis.call("HGET", KEYS[1], ARGV[1])
+   if v then
+      v = v .. "," .. ARGV[2]
+   else
+      v = ARGV[2]
+   end
+   redis.call("HSET", KEYS[1], ARGV[1], v)
    redis.call("PUBLISH", KEYS[2], ARGV[3])
 `
 
@@ -106,6 +119,7 @@ func Join(ctx context.Context, name string, rdb *redis.Client, options ...MapOpt
 		rdb:      rdb,
 		set:      redis.NewScript(luaSet),
 		incr:     redis.NewScript(luaIncr),
+		append:   redis.NewScript(luaAppend),
 		del:      redis.NewScript(luaDelete),
 		reset:    redis.NewScript(luaReset),
 		content:  make(map[string]string),
@@ -157,95 +171,33 @@ func (sm *Map) Get(key string) (string, bool) {
 // Set sets the value for the given key. An error is returned if the key is
 // empty or contains an equal sign.
 func (sm *Map) Set(ctx context.Context, key, value string) error {
-	if len(key) == 0 {
-		return fmt.Errorf("ponos: invalid map key: %s (cannot be empty)", key)
-	}
-	if strings.Contains(key, "=") {
-		return fmt.Errorf("ponos: invalid map key: %s (cannot contain '=')", key)
-	}
-	sm.lock.Lock()
-	defer sm.lock.Unlock()
-	if sm.done {
-		return fmt.Errorf("ponos: map %s is closed", sm.name)
-	}
-
-	if err := sm.set.Eval(
-		ctx,
-		sm.rdb,
-		[]string{sm.hashkey, sm.chankey},
-		key, value, key+"="+value,
-	).Err(); err != nil && err != redis.Nil {
-		return fmt.Errorf("ponos: map %s: failed to set value %s for key %s: %w", sm.name, value, key, err)
-	}
-
-	return nil
+	return sm.runLuaScript(ctx, "set", sm.set, key, value, key+"="+value)
 }
 
-// Increment increments the value for the given key, the value must be an
-// integer. An error is returned if the key is empty or contains an equal sign
-// or if the value.
+// Increment increments the value for the given key, the value must represent an
+// integer. An error is returned if the key is empty or contains an equal sign.
+// An error is logged if the value does not represent an integer.
+// Use this method to avoud race conditions.
 func (sm *Map) Increment(ctx context.Context, key string, delta int) error {
-	if len(key) == 0 {
-		return fmt.Errorf("ponos: invalid map key: %s (cannot be empty)", key)
-	}
-	if strings.Contains(key, "=") {
-		return fmt.Errorf("ponos: invalid map key: %s (cannot contain '=')", key)
-	}
-	sm.lock.Lock()
-	defer sm.lock.Unlock()
-	if sm.done {
-		return fmt.Errorf("ponos: map %s is closed", sm.name)
-	}
+	return sm.runLuaScript(ctx, "incr", sm.incr, key, delta, key+"+="+strconv.Itoa(delta))
+}
 
-	if err := sm.incr.Eval(
-		ctx,
-		sm.rdb,
-		[]string{sm.hashkey, sm.chankey},
-		key, delta, key+"+="+strconv.Itoa(delta),
-	).Err(); err != nil && err != redis.Nil {
-		return fmt.Errorf("ponos: map %s: failed to increment value for key %s: %w", sm.name, key, err)
-	}
-
-	return nil
+// Append appends the given items to the value for the given key. The array of
+// items is stored as a comma-separated list (so items should not have commas
+// in them). An error is returned if the key is empty or contains an equal sign.
+func (sm *Map) Append(ctx context.Context, key string, items ...string) error {
+	sitems := strings.Join(items, ",")
+	return sm.runLuaScript(ctx, "append", sm.append, key, sitems, key+",="+sitems)
 }
 
 // Delete deletes the value for the given key.
 func (sm *Map) Delete(ctx context.Context, key string) error {
-	sm.lock.Lock()
-	defer sm.lock.Unlock()
-
-	if sm.done {
-		return fmt.Errorf("ponos: map %s is closed", sm.name)
-	}
-	if err := sm.del.Eval(
-		ctx,
-		sm.rdb,
-		[]string{sm.hashkey, sm.chankey},
-		key, key+"=",
-	).Err(); err != nil && err != redis.Nil {
-		return fmt.Errorf("ponos: map %s: failed to delete value for key %s: %w", sm.name, key, err)
-	}
-
-	return nil
+	return sm.runLuaScript(ctx, "delete", sm.del, key, key+"=")
 }
 
 // Reset clears the map content.
 func (sm *Map) Reset(ctx context.Context) error {
-	sm.lock.Lock()
-	defer sm.lock.Unlock()
-
-	if sm.done {
-		return fmt.Errorf("ponos: map %s is closed", sm.name)
-	}
-	if err := sm.reset.Eval(
-		ctx,
-		sm.rdb,
-		[]string{sm.hashkey, sm.chankey},
-	).Err(); err != nil && err != redis.Nil {
-		return fmt.Errorf("ponos: failed to reset map %s: %w", sm.name, err)
-	}
-
-	return nil
+	return sm.runLuaScript(ctx, "reset", sm.reset, "*")
 }
 
 // init initializes the map.
@@ -307,6 +259,8 @@ func (sm *Map) run(ctx context.Context) {
 				sm.doDelete(key)
 			case strings.HasSuffix(key, "+"):
 				sm.doIncrement(key[:len(key)-1], val)
+			case strings.HasSuffix(key, ","):
+				sm.doAppend(key[:len(key)-1], val)
 			default:
 				sm.doSet(key, val)
 			}
@@ -321,6 +275,30 @@ func (sm *Map) run(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// runLuaScript runs the given Lua script, the furst argument must be the key.
+func (sm *Map) runLuaScript(ctx context.Context, name string, script *redis.Script, args ...any) error {
+	key := args[0].(string)
+	if err := validateKey(key); err != nil {
+		return err
+	}
+	sm.lock.Lock()
+	defer sm.lock.Unlock()
+	if sm.done {
+		return fmt.Errorf("ponos: map %s is closed", sm.name)
+	}
+
+	if err := script.Eval(
+		ctx,
+		sm.rdb,
+		[]string{sm.hashkey, sm.chankey},
+		args...,
+	).Err(); err != nil && err != redis.Nil {
+		return fmt.Errorf("ponos: map %s: failed to run script %q for key %s: %w", sm.name, name, key, err)
+	}
+
+	return nil
 }
 
 // doReset resets the map content.
@@ -356,6 +334,17 @@ func (sm *Map) doIncrement(key, delta string) {
 	}
 }
 
+// doAppend appends the value for the given key.
+func (sm *Map) doAppend(key, val string) {
+	if _, ok := sm.content[key]; !ok {
+		sm.content[key] = val
+		sm.logger.Info("ponos: map %s: %s=%s", sm.name, key, val)
+	} else {
+		sm.content[key] += "," + val
+		sm.logger.Info("ponos: map %s: %s=%s", sm.name, key, sm.content[key])
+	}
+}
+
 // doSet sets the value for the given key.
 func (sm *Map) doSet(key, val string) {
 	sm.content[key] = val
@@ -379,8 +368,20 @@ func (sm *Map) reconnect(ctx context.Context) {
 	}
 }
 
+// redisKeyRegex is a regular expression that matches valid Redis keys.
 var redisKeyRegex = regexp.MustCompile(`^[^ \0\*\?\[\]]{1,512}$`)
 
 func isValidRedisKeyName(key string) bool {
 	return redisKeyRegex.MatchString(key)
+}
+
+// validateKey returns an error if the key is empty or contains an equal sign.
+func validateKey(key string) error {
+	if len(key) == 0 {
+		return fmt.Errorf("ponos: invalid map key: %s (cannot be empty)", key)
+	}
+	if strings.Contains(key, "=") {
+		return fmt.Errorf("ponos: invalid map key: %s (cannot contain '=')", key)
+	}
+	return nil
 }
