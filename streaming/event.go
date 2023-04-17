@@ -1,4 +1,4 @@
-package streams
+package streaming
 
 import (
 	"context"
@@ -24,6 +24,9 @@ type (
 		// rdb is the redis client.
 		rdb *redis.Client
 	}
+
+	// AckedEvent is an event that can be acknowledged.
+	AckedEvent Event
 )
 
 // newEvent creates a new event.
@@ -40,6 +43,6 @@ func newEvent(rdb *redis.Client, streamName, sinkName, id, eventName, topic stri
 }
 
 // Ack acknowledges the event.
-func (e *Event) Ack(ctx context.Context) error {
+func (e *AckedEvent) Ack(ctx context.Context) error {
 	return e.rdb.XAck(ctx, e.StreamName, e.SinkName, e.ID).Err()
 }

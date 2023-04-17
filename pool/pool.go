@@ -2,13 +2,13 @@ package pool
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"hash"
 	"hash/crc64"
 	"io"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -16,27 +16,37 @@ import (
 	redis "github.com/redis/go-redis/v9"
 
 	"goa.design/ponos/ponos"
-	"goa.design/ponos/replicated"
-	"goa.design/ponos/streams"
+	"goa.design/ponos/rmap"
+	"goa.design/ponos/streaming"
 )
 
 type (
 	// WorkerPool is a pool of workers.
 	WorkerPool struct {
 		Name          string
-		status        *replicated.Map // status replicated map used to track pool status across all clients
-		workers       *replicated.Map // worker replicated map indexes worker group and creation time by worker ID
-		lastSeen      *replicated.Map // worker keep-alive timestamps indexed by worker ID
-		workerTTL     time.Duration   // duration after which a worker is considered dead
-		leaseTTL      time.Duration   // duration after which a message lease expires
-		maxQueuedJobs int             // maximum number of jobs that can be queued
+		statusMap     *rmap.Map                    // status replicated map used to track pool status across all clients
+		keepAliveMap  *rmap.Map                    // worker keep-alive timestamps indexed by worker ID
+		workersMap    *rmap.Map                    // worker replicated map indexes worker group and creation time by worker ID
+		workerStreams map[string]*streaming.Stream // worker streams indexed by worker ID
+		jobStream     *streaming.Stream            // stream of jobs so we can requeue them if a worker dies
+		jobSink       *streaming.Sink              // reader for the job stream
+		workerTTL     time.Duration                // duration after which a worker is considered dead
+		leaseTTL      time.Duration                // duration after which a message lease expires
+		maxQueuedJobs int                          // maximum number of jobs that can be queued
 		logger        ponos.Logger
 		h             jumpHash
+		done          chan struct{} // closed when pool is stopped
 		rdb           *redis.Client
 
-		lock        sync.Mutex
-		knownGroups map[string]struct{} // worker groups last read from the workers replicated map
-		shutdown    bool                // prevents new workers and new jobs from being created when true
+		lock    sync.Mutex
+		stopped bool // prevents new workers and new jobs from being created when true
+	}
+
+	// poolWorker is the value stored in the workers replicated map.
+	poolWorker struct {
+		ID          uuid.UUID // worker ID
+		CreatedAt   int64     // worker creation time in nanoseconds
+		RefreshedAt int64     // worker last keep-alive time in nanoseconds
 	}
 
 	// jumpHash implement Jump Consistent Hash.
@@ -46,218 +56,230 @@ type (
 )
 
 const (
-	// Name of event used to send new job to workers.
-	eventNewJob string = "new_job"
-	// eventShutdown is the event used to shutdown workers.
-	eventShutdown string = "shutdown"
+	// evJob is the event used to send new job to workers.
+	evJob string = "j"
+	// evStop is the event used to shutdown workers.
+	evStop string = "s"
 )
 
 // shutdownStatusKey is the key used to store the shutdown status in the pool
 // status replicated map.
-const shutdownStatusKey = "shutdown"
+const shutdownStatusKey = "sd"
 
 // Pool returns a client to the pool with the given name.
 func Pool(ctx context.Context, name string, rdb *redis.Client, opts ...PoolOption) (*WorkerPool, error) {
-	status, err := replicated.Join(ctx, poolStatusName(name), rdb)
+	sm, err := rmap.Join(ctx, statusMapName(name), rdb)
 	if err != nil {
-		return nil, fmt.Errorf("failed to join pool status replicated map %q: %w", poolStatusName(name), err)
+		return nil, fmt.Errorf("failed to join pool status replicated map %q: %w", statusMapName(name), err)
 	}
-	// fail early if pool is shutdown
-	if _, ok := status.Get(shutdownStatusKey); ok {
-		return nil, fmt.Errorf("pool %q is shutdown", name)
+	// fail early if pool is stopped
+	if _, ok := sm.Get(shutdownStatusKey); ok {
+		return nil, fmt.Errorf("pool %q is stopped", name)
 	}
-	workers, err := replicated.Join(ctx, workerHashName(name), rdb)
+	km, err := rmap.Join(ctx, keepAliveMapName(name), rdb)
+	if err != nil {
+		return nil, fmt.Errorf("failed to join pool keep-alive replicated map %q: %w", keepAliveMapName(name), err)
+	}
+	wm, err := rmap.Join(ctx, workerHashName(name), rdb)
 	if err != nil {
 		return nil, fmt.Errorf("failed to join pool workers replicated map %q: %w", workerHashName(name), err)
 	}
-	lastSeen, err := replicated.Join(ctx, workerLastSeenName(name), rdb)
+	stream, err := streaming.NewStream(ctx, streamName(name), rdb)
 	if err != nil {
-		return nil, fmt.Errorf("failed to join pool workers last seen replicated map %q: %w", workerLastSeenName(name), err)
+		return nil, fmt.Errorf("failed to create pool job stream %q: %w", streamName(name), err)
 	}
+	sink, err := stream.NewSink(ctx, "jobs")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create pool job sink %q: %w", streamName(name), err)
+	}
+
 	options := defaultPoolOptions()
 	for _, opt := range opts {
 		opt(options)
 	}
 	p := &WorkerPool{
 		Name:          name,
-		status:        status,
-		workers:       workers,
-		knownGroups:   make(map[string]struct{}),
-		lastSeen:      lastSeen,
+		statusMap:     sm,
+		keepAliveMap:  km,
+		workersMap:    wm,
+		workerStreams: make(map[string]*streaming.Stream),
+		jobStream:     stream,
+		jobSink:       sink,
 		workerTTL:     options.workerTTL,
 		leaseTTL:      options.leaseTTL,
 		maxQueuedJobs: options.maxQueuedJobs,
-		logger:        options.logger,
+		logger:        options.logger.WithPrefix("pool", name),
 		h:             jumpHash{crc64.New(crc64.MakeTable(crc64.ECMA))},
+		done:          make(chan struct{}),
 		rdb:           rdb,
 	}
 
-	go p.ensureRunning(ctx)
+	go p.routeJobs()
+	go p.handleShutdown()
 
 	return p, nil
 }
 
-// NewWorker creates a new worker and adds it to pool.  The worker starts
+// NewWorker creates a new worker and adds it to the pool.  The worker starts
 // processing jobs immediately.
-// Cancel ctx to stop the worker and remove it from the pool.
 func (p *WorkerPool) NewWorker(ctx context.Context, opts ...WorkerOption) (*Worker, error) {
 	p.lock.Lock()
-	if p.shutdown {
-		p.lock.Unlock()
-		return nil, fmt.Errorf("pool %q is shutting down", p.Name)
+	defer p.lock.Unlock()
+	if p.stopped {
+		return nil, fmt.Errorf("pool %q is stopped", p.Name)
 	}
-	p.lock.Unlock()
-	options := defaultWorkerOptions()
-	for _, opt := range opts {
-		opt(options)
-	}
-	if options.group == "" {
-		options.group = uuid.New().String()
-	}
-	c := make(chan *Job, options.jobChannelSize)
-	w := &Worker{
-		ID:        uuid.NewString(),
-		Pool:      p.Name,
-		Group:     options.group,
-		C:         c,
-		CreatedAt: time.Now(),
-		c:         c,
-		lastSeen:  p.lastSeen,
-		workerTTL: p.workerTTL,
-		logger:    p.logger,
-	}
-	if err := p.lastSeen.Set(ctx, w.ID, strconv.FormatInt(time.Now().UnixNano(), 10)); err != nil {
-		return nil, fmt.Errorf("failed to add worker %q to pool %q: %w", w.ID, p.Name, err)
-	}
-	if err := p.workers.Set(ctx, w.ID, marshalWorker(w)); err != nil {
-		return nil, fmt.Errorf("failed to add worker %q to pool %q: %w", w.ID, p.Name, err)
-	}
-	sink, err := streams.Stream(ctx, w.ID, p.rdb).NewSink(ctx, w.Group)
+	w, err := newWorker(ctx, p, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create sink for worker %q: %w", w.ID, err)
+		return nil, err
 	}
-	go w.run(ctx, sink)
+	p.workerStreams[w.ID] = w.stream
 	return w, nil
 }
 
-// NewJob adds a job to the pool.
-func (p *WorkerPool) NewJob(ctx context.Context, key string, payload []byte) error {
+// DispatchJob dispatches a job to the proper worker in the pool.
+func (p *WorkerPool) DispatchJob(ctx context.Context, key string, payload []byte) error {
 	p.lock.Lock()
 	defer p.lock.Unlock()
+	if p.stopped {
+		return fmt.Errorf("pool %q is stopped", p.Name)
+	}
+	job := &Job{
+		Key:       key,
+		Payload:   payload,
+		CreatedAt: time.Now(),
+	}
+	m, err := marshalJob(job)
+	if err != nil {
+		return fmt.Errorf("failed to marshal job: %w", err)
+	}
+	if err := p.jobStream.Add(ctx, evJob, m); err != nil {
+		return fmt.Errorf("failed to add job to stream %q: %w", p.jobStream.Name, err)
+	}
 
-	if p.shutdown {
-		return fmt.Errorf("pool %q is shutting down", p.Name)
+	return nil
+}
+
+// Stop cancels all pending jobs and causes all workers to stop.  Stop
+// also prevents new workers from being created. It is safe to call Stop
+// multiple times.  Any job created by remote clients after Stop is called
+// is ignored. Once stopped a pool cannot be restarted.
+func (p *WorkerPool) Stop(ctx context.Context) error {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	if p.stopped {
+		return nil
+	}
+	if _, err := p.statusMap.Set(ctx, statusMapName(p.Name), "stop"); err != nil {
+		return fmt.Errorf("failed to set pool stop status: %w", err)
+	}
+	workers := p.workersMap.Map()
+	for id := range workers {
+		stream, err := p.workerStream(ctx, id)
+		if err != nil {
+			p.logger.Error(fmt.Errorf("stop: %w", err))
+			continue
+		}
+		if err := stream.Add(ctx, evStop, nil); err != nil {
+			p.logger.Error(fmt.Errorf("failed to add shutdown event to worker %q: %w", id, err))
+		}
+	}
+	close(p.done)
+	p.stopped = true
+	return nil
+}
+
+// routeJobs reads events from the pool job stream and routes them to the
+// appropriate worker.
+func (p *WorkerPool) routeJobs() {
+	ctx := context.Background()
+	for msg := range p.jobStream.C {
+		key, err := unmarshalJobKey(msg.Payload)
+		if err != nil {
+			p.logger.Error(fmt.Errorf("failed to unmarshal job: %w", err))
+			continue
+		}
+		if err := p.routeJob(ctx, key, msg.Payload); err != nil {
+			p.logger.Error(fmt.Errorf("failed to add job: %w", err))
+		}
+	}
+}
+
+// routeJob routes a dispatched job to the proper worker.
+func (p *WorkerPool) routeJob(ctx context.Context, key string, payload []byte) error {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	if p.stopped {
+		return fmt.Errorf("pool %q is stopped", p.Name)
 	}
 
 	// First, retrieve workers and sort IDs by creation time.
-	workers := p.workers.Map()
+	workers := p.workersMap.Map()
 	if len(workers) == 0 {
 		return fmt.Errorf("no worker in pool %q", p.Name)
 	}
-	workerIDsByGroup := make(map[string][]string)
-	workerGroupByID := make(map[string]string)
-	workerCreatedAtByID := make(map[string]time.Time)
-	for id, v := range workers {
-		group, createdAt := unmarshalWorker(v)
-		workerIDsByGroup[group] = append(workerIDsByGroup[group], id)
-		workerGroupByID[id] = group
-		workerCreatedAtByID[id] = createdAt
+	workerCreatedAtByID := make(map[string]int64, len(workers))
+	for id, createdAt := range workers {
+		cat, _ := strconv.ParseInt(createdAt, 10, 64)
+		workerCreatedAtByID[id] = cat
 	}
 	sortedIDs := make([]string, 0, len(workerCreatedAtByID))
 	for id := range workerCreatedAtByID {
 		sortedIDs = append(sortedIDs, id)
 	}
 	sort.Slice(sortedIDs, func(i, j int) bool {
-		return workerCreatedAtByID[sortedIDs[i]].Before(workerCreatedAtByID[sortedIDs[j]])
+		return workerCreatedAtByID[sortedIDs[i]] < workerCreatedAtByID[sortedIDs[j]]
 	})
 
 	// Then filter out workers that have not been seen for more than workerTTL.
-	lastSeen := p.lastSeen.Map()
+	alive := p.keepAliveMap.Map()
 	var activeIDs []string
 	for _, id := range sortedIDs {
-		ls, ok := lastSeen[id]
+		a, ok := alive[id]
 		if !ok {
 			// This could happen if a worker is removed from the
 			// pool and the last seen map deletion replicates before
 			// the workers map deletion.
 			continue
 		}
-		nanos, _ := strconv.ParseInt(ls, 10, 64)
+		nanos, _ := strconv.ParseInt(a, 10, 64)
 		horizon := time.Unix(0, nanos).Add(p.workerTTL)
 		if horizon.After(time.Now()) {
 			activeIDs = append(activeIDs, id)
 		} else {
-			if err := p.deleteWorker(ctx, id, workerIDsByGroup, workerGroupByID); err != nil {
+			if err := p.deleteWorker(ctx, id); err != nil {
 				p.logger.Error(fmt.Errorf("failed to delete worker %q: %w", id, err))
 			}
 		}
 	}
-
-	// Finally, stream the job to the worker group corresponding to the key hash.
 	if len(activeIDs) == 0 {
 		return fmt.Errorf("no active worker in pool %q", p.Name)
 	}
+
+	// Finally, stream the job to the worker group corresponding to the key hash.
 	wid := activeIDs[p.h.Hash(key, int64(len(activeIDs)))]
-	group, _ := unmarshalWorker(workers[wid])
-	job := &Job{
-		Key:       key,
-		Payload:   payload,
-		CreatedAt: time.Now(),
+	stream, err := p.workerStream(ctx, wid)
+	if err != nil {
+		return err
 	}
-	if err := streams.Stream(ctx, group, p.rdb).Add(ctx, eventNewJob, marshalJob(job)); err != nil {
-		return fmt.Errorf("failed to add job to worker group %q: %w", group, err)
+	if err := stream.Add(ctx, evJob, payload); err != nil {
+		return fmt.Errorf("failed to add job to worker stream %q: %w", workerStreamName(wid), err)
 	}
 
 	return nil
 }
 
-// Shutdown cancels all pending jobs and causes all workers to stop.  Shutdown
-// also prevents new workers from being created. It is safe to call Shutdown
-// multiple times.  Any job created by remote clients after Shutdown is called
-// is ignored.
-func (p *WorkerPool) Shutdown(ctx context.Context) error {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-	if p.shutdown {
-		return nil
-	}
-
-	if err := p.status.Set(ctx, poolStatusName(p.Name), "shutting down"); err != nil {
-		return fmt.Errorf("failed to set pool shutdown status: %w", err)
-	}
-	workers := p.workers.Map()
-	groups := make(map[string]struct{})
-	for _, v := range workers {
-		group, _ := unmarshalWorker(v)
-		groups[group] = struct{}{}
-	}
-	for group := range groups {
-		if err := streams.Stream(ctx, group, p.rdb).Add(ctx, eventShutdown, nil); err != nil {
-			return fmt.Errorf("failed to add shutdown event to worker group %q: %w", group, err)
-		}
-	}
-	p.shutdown = true
-	return nil
-}
-
-// Make sure pool is not shutdown.
-// There is a race condition between a client shutting down a pool and a
-// client joining the pool and creating a new worker group. The client
-// shutting down the pool will delete all the groups it knows about and
-// then set the shutdown status. The client joining the pool will
-// eventually read the shutdown status via ensureRunning and properly
-// cleanup the worker groups it created.
-func (p *WorkerPool) ensureRunning(ctx context.Context) {
+// Handle remove pool shutdown request.
+func (p *WorkerPool) handleShutdown() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-p.done:
 			return
 		case <-ticker.C:
-			if _, ok := p.status.Get(shutdownStatusKey); ok {
-				if err := p.Shutdown(ctx); err != nil {
-					p.logger.Error(fmt.Errorf("failed to shutdown pool %q: %w", p.Name, err))
+			if _, ok := p.statusMap.Get(shutdownStatusKey); ok {
+				if err := p.Stop(context.Background()); err != nil {
+					p.logger.Error(fmt.Errorf("failed to shutdown pool: %w", err))
 				}
 				return
 			}
@@ -265,22 +287,56 @@ func (p *WorkerPool) ensureRunning(ctx context.Context) {
 	}
 }
 
-// deleteWorker removes a worker from the pool deleting the worker group stream
-// if it was the last worker in the group.
-func (p *WorkerPool) deleteWorker(ctx context.Context, id string, workerIDsByGroup map[string][]string, workerGroupByID map[string]string) error {
-	if err := p.lastSeen.Delete(ctx, id); err != nil {
-		p.logger.Error(fmt.Errorf("failed to delete worker %q from last seen map: %w", id, err))
+// deleteWorker removes a worker from the pool deleting the worker stream.
+func (p *WorkerPool) deleteWorker(ctx context.Context, id string) error {
+	if _, err := p.keepAliveMap.Delete(ctx, id); err != nil {
+		p.logger.Error(fmt.Errorf("failed to delete worker %q from keep-alive map: %w", id, err))
 	}
-	if err := p.workers.Delete(ctx, id); err != nil {
+	if _, err := p.workersMap.Delete(ctx, id); err != nil {
 		p.logger.Error(fmt.Errorf("failed to delete worker %q from workers map: %w", id, err))
 	}
-	group := workerGroupByID[id]
-	if len(workerIDsByGroup[group]) == 1 {
-		if err := streams.Stream(ctx, group, p.rdb).Destroy(ctx); err != nil {
-			p.logger.Error(fmt.Errorf("failed to delete worker group %q: %w", group, err))
+	stream, err := p.workerStream(ctx, id)
+	if err != nil {
+		return err
+	}
+	// re-assign any queued jobs to other workers.
+	sink, err := stream.NewSink(ctx, "sink")
+	if err != nil {
+		p.logger.Error(fmt.Errorf("failed to re-assign jobs for worker %q: %w", id, err))
+	}
+	for msg := range sink.C {
+		if msg.EventName == evJob {
+			job := &Job{}
+			if err := json.Unmarshal(msg.Payload, job); err != nil {
+				p.logger.Error(fmt.Errorf("failed to unmarshal job: %w", err))
+				continue
+			}
+			if err := p.routeJob(ctx, job.Key, job.Payload); err != nil {
+				p.logger.Error(fmt.Errorf("failed to re-assign job: %w", err))
+			}
 		}
 	}
+	if err := stream.Destroy(ctx); err != nil {
+		p.logger.Error(fmt.Errorf("failed to delete worker stream: %w", err))
+	}
 	return nil
+}
+
+// workerStream retrieves the stream for a worker. It caches the result in the
+// workerStreams map.
+func (p *WorkerPool) workerStream(ctx context.Context, id string) (*streaming.Stream, error) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	stream, ok := p.workerStreams[id]
+	if !ok {
+		s, err := streaming.NewStream(ctx, workerStreamName(id), p.rdb)
+		if err != nil {
+			return nil, fmt.Errorf("failed to retrieve stream for worker %q: %w", id, err)
+		}
+		p.workerStreams[id] = s
+		stream = s
+	}
+	return stream, nil
 }
 
 // Jump Consistent Hashing, see https://arxiv.org/ftp/arxiv/papers/1406/1406.2294.pdf
@@ -300,54 +356,24 @@ func (jh jumpHash) Hash(key string, numBuckets int64) int64 {
 	return b
 }
 
-// poolStatusName returns the name of the key used to store the pool status.
-func poolStatusName(pool string) string {
-	return fmt.Sprintf("ponos:%s:status", pool)
+// statusMapName returns the name of the key used to store the pool status.
+func statusMapName(pool string) string {
+	return fmt.Sprintf("ponos:pool:status:%s", pool)
+}
+
+// keepAliveMapName returns the name of the key used to store the worker keep-alive
+// timestamps.
+func keepAliveMapName(pool string) string {
+	return fmt.Sprintf("ponos:pool:keepalive:%s", pool)
 }
 
 // workerHashName returns the name of the hash used to store the worker creation
 // timestamps.
 func workerHashName(pool string) string {
-	return fmt.Sprintf("ponos:%s:workers", pool)
+	return fmt.Sprintf("ponos:pool:workers:%s", pool)
 }
 
-// workerLastSeenName returns the name of the hash used to store the worker last
-// seen timestamps.
-func workerLastSeenName(pool string) string {
-	return fmt.Sprintf("ponos:%s:last_seen", pool)
-}
-
-// marshalWorker marshals the worker group and creation timestamp into a string.
-func marshalWorker(w *Worker) string {
-	return fmt.Sprintf("%s=%s", w.Group, w.CreatedAt.Format(time.RFC3339Nano))
-}
-
-// unmarshal unmarshals a worker group and creation timestamp from a string.
-func unmarshalWorker(s string) (group string, createdAt time.Time) {
-	parts := strings.Split(s, "=")
-	createdAt, _ = time.Parse(time.RFC3339Nano, parts[1])
-	return parts[0], createdAt
-}
-
-// marshalJob marshals a job into a string.
-func marshalJob(j *Job) []byte {
-	ts := j.CreatedAt.Format(time.RFC3339Nano)
-	return []byte(fmt.Sprintf("%s=%s=%s", j.Key, ts, j.Payload))
-}
-
-// unmarshalJob unmarshals a job from a string created by marshalJob.
-func unmarshalJob(data []byte) (*Job, error) {
-	parts := strings.SplitN(string(data), "=", 3)
-	if len(parts) != 3 {
-		return nil, fmt.Errorf("invalid job data: %s", data)
-	}
-	createdAt, err := time.Parse(time.RFC3339Nano, parts[1])
-	if err != nil {
-		return nil, fmt.Errorf("invalid job creation timestamp: %s", parts[1])
-	}
-	return &Job{
-		Key:       parts[0],
-		CreatedAt: createdAt,
-		Payload:   []byte(parts[2]),
-	}, nil
+// streamName returns the name of the stream used to store jobs.
+func streamName(pool string) string {
+	return fmt.Sprintf("ponos:pool:stream:%s", pool)
 }

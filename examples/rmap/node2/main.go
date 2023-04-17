@@ -2,14 +2,14 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
-	"strconv"
 	"sync"
 
 	"github.com/redis/go-redis/v9"
 	"goa.design/clue/log"
 	"goa.design/ponos/ponos"
-	"goa.design/ponos/replicated"
+	"goa.design/ponos/rmap"
 )
 
 func main() {
@@ -32,28 +32,12 @@ func main() {
 	log.FlushAndDisableBuffering(logCtx)
 	logger := ponos.ClueLogger(logCtx)
 
-	m, err := replicated.Join(ctx, "my-map", client, replicated.WithLogger(logger))
+	m, err := rmap.Join(ctx, "my-map", client, rmap.WithLogger(logger))
 	if err != nil {
 		panic(err)
 	}
 
-	// Add a new key
-	if err := m.Set(ctx, "foo", "bar"); err != nil {
-		panic(err)
-	}
-
-	// Keys set by the current process are available immediately
-	_, ok := m.Get("foo")
-	if !ok {
-		panic("key not found")
-	}
-
-	// Reset the map
-	if err = m.Reset(ctx); err != nil {
-		panic(err)
-	}
-
-	// Start a goroutine to listen for updates
+	// Start a goroutine to listen for updates from node1
 	numitems := 10
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -71,11 +55,7 @@ func main() {
 		}
 	}()
 
-	// Send a few updates
-	for i := 0; i < numitems; i++ {
-		m.Set(ctx, "foo-"+strconv.Itoa(i+1), "bar")
-	}
-
-	// Wait for the updates to be received
+	// Wait for the updates from node1 to be received
+	fmt.Println("Waiting for updates from node1...")
 	wg.Wait()
 }

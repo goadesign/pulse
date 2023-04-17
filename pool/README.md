@@ -1,27 +1,39 @@
 # Tenanted Worker Pools
 
-Ponos builds on top of its streaming and replicated map capabilities to provide
-a scalable and reliable tenanted worker pools.
+The `pool` package builds on top of the Ponos `streams` and `replicated`
+packages to provide a scalable and reliable dedicated worker pools.
 
 ## Overview
 
-A *tenanted* worker pool is a collection of workers that process jobs where each
+A *dedicated* worker pool is a collection of workers that process jobs where each
 worker is assigned a range of job keys. Jobs are distributed to workers based on
 the job key and a consistent hashing algorithm.
 
-Workers can be grouped into worker groups. Each worker group is identified by a
-unique name and is assigned a range of job keys. This makes is possible to scale
-dynamically the number of workers assigned to a given job key range.
+Workers can be added or removed from the pool dynamically. Jobs get
+automatically re-assigned to workers when the pool grows or shrinks. This makes
+it possible to implement auto-scaling solutions, for example based on queueing
+delays.
 
-Workers and worker groups can be added or removed from the pool dynamically.
-Ponos minimizes the number of job re-assignments when the worker pool grows or
-shrinks.  This makes it possible to implement auto-scaling solutions, for
-example based on queueing delays.
+Ponos uses the [Jump Consistent Hash](https://arxiv.org/abs/1406.2294) algorithm
+to assign jobs to workers which provides a good balance between load balancing
+and worker assignment stability.
+
+## Usage and Trade-offs
+
+In general Ponos dedicated worker pools are useful whenever workers need to be
+stateful and their state is dependent on the jobs. For example when workers need
+to maintain a connection to a remote service or when they need to maintain a
+local cache.
+
+The target use case is one where the number of jobs is larger than the number of
+workers and where the job payloads should be small as they are stored in memory.
 
 ## Example
 
-A worker pool named "fibonacci" is created and a worker is added to it. The
-worker starts consuming jobs.
+The following example creates a worker pool named "fibonacci", the job payloads
+consists of a single 64-bit unsigned integer. The worker computes the
+[Fibonacci number](https://en.wikipedia.org/wiki/Fibonacci_number) of the
+payload and prints it to stdout.
 
 `worker.go`
 
@@ -38,8 +50,8 @@ import (
 func main() {
     rdb := redis.NewClient()
 
-    // Stop processing jobs after 10 seconds.
-    ctx := context.WithDeadline(context.Background(), time.Now().Add(10*time.Second))
+    // Stop processing jobs after 5 seconds.
+    ctx := context.WithDeadline(context.Background(), time.Now().Add(5*time.Second))
 
     // Connect to or create pool "fibonacci".
     pool, err := ponos.Pool("fibonacci", rdb)
@@ -67,9 +79,6 @@ func fib(n uint64) uint64 {
     return fib(n-1) + fib(n-2)
 }
 ```
-
-A new job is enqueued on the pool. The job is assigned to the worker created
-above.
 
 `client.go`
 
@@ -103,10 +112,6 @@ func main() {
 
 ## Use Cases
 
-In general Ponos tenanted worker pools are useful whenever workers need to
-be stateful and their state is dependent on the jobs. For example when workers
-need to maintain a connection to a remote service or when workers need to
-maintain a local cache.
 
 ### Multitenant Background Jobs
 

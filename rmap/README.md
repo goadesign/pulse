@@ -27,7 +27,7 @@ import (
         "context"
 
         "github.com/redis/go-redis/v9"
-        "goa.design/ponos/replicated"
+        "goa.design/ponos/rmap"
 )
 
 func main() {
@@ -37,7 +37,7 @@ func main() {
         })
     
         // Join or create a replicated map
-        m, err := replicated.Join(context.Background(), "my-map", client)
+        m, err := rmap.Join(context.Background(), "my-map", client)
         if err != nil {
             panic(err)
         }
@@ -72,7 +72,7 @@ stop receiving updates.
         defer cancel()
 
         // Join or create a replicated map
-        m, err := replicated.Join(ctx, "my-map", client)
+        m, err := rmap.Join(ctx, "my-map", client)
         if err != nil {
             panic(err)
         }
@@ -94,7 +94,7 @@ import (
         "sync"
 
         "github.com/redis/go-redis/v9"
-        "goa.design/ponos/replicated"
+        "goa.design/ponos/rmap"
 )
 
 func main() {
@@ -109,7 +109,7 @@ func main() {
         defer cancel()
 
         // Join or create a replicated map
-        m, err := replicated.Join(ctx, "my-map", client)
+        m, err := rmap.Join(ctx, "my-map", client)
         if err != nil {
                 panic(err)
         }

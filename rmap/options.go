@@ -1,4 +1,4 @@
-package replicated
+package rmap
 
 import "goa.design/ponos/ponos"
 

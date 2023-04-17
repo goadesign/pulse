@@ -231,3 +231,5 @@ sink := stream.NewSink("my-sink", ponos.WithSinkEventMatcher(
         return event.Topic == "my-topic" && event.EventName == "event"
     }))
 ```
+
+> Note: Event filtering is done in the client
