@@ -19,12 +19,6 @@ import (
 const (
 	// maxJitterMs is the maximum retry backoff jitter in milliseconds.
 	maxJitterMs = 5000
-
-	// pollDuration is the maximum stream read block time duration.
-	pollDuration = 3 * time.Second
-
-	// maxMessages is the maximum number of messages to read from the stream.
-	maxMessages = 100
 )
 
 type (
@@ -49,6 +43,11 @@ type (
 		// streamCursors is the stream cursors used to read events in
 		// the form [stream1, ">", stream2, ">", ..."]
 		streamCursors []string
+		// blockDuration is the XREADGROUP timeout.
+		blockDuration time.Duration
+		// maxPolled is the maximum number of events to read in one
+		// XREADGROUP call.
+		maxPolled int64
 		// readchan is used to communicate the results of XREADGROU
 		readchan chan []redis.XStream
 		// errchan is used to communicate errors from XREADGROUP.
@@ -106,7 +105,7 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...SinkOptio
 	}
 
 	// Create the consumer group, ignore error if it already exists.
-	if err := stream.rdb.XGroupCreateMkStream(ctx, stream.key, name, options.LastEventID).Err(); err != nil && !isBusyGroupErr(err) {
+	if err := stream.rdb.XGroupCreate(ctx, stream.key, name, options.LastEventID).Err(); err != nil && !isBusyGroupErr(err) {
 		return nil, fmt.Errorf("failed to create Redis consumer group %s for stream %s: %w", name, stream.Name, err)
 	}
 
@@ -122,6 +121,8 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...SinkOptio
 		noAck:         options.NoAck,
 		streams:       []*Stream{stream},
 		streamCursors: []string{stream.key, ">"},
+		blockDuration: options.BlockDuration,
+		maxPolled:     options.MaxPolled,
 		readchan:      make(chan []redis.XStream),
 		errchan:       make(chan error),
 		c:             c,
@@ -312,12 +313,13 @@ func (s *Sink) readOnce() ([]redis.XStream, error) {
 	readStreams := s.streamCursors
 	s.lock.Unlock()
 	go func() {
+		s.logger.Debug("polling", "streams", readStreams)
 		events, err := s.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
 			Group:    s.Name,
 			Consumer: s.consumer,
 			Streams:  readStreams,
-			Count:    maxMessages,
-			Block:    pollDuration,
+			Count:    s.maxPolled,
+			Block:    s.blockDuration,
 			NoAck:    s.noAck,
 		}).Result()
 		func() {
