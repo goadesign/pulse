@@ -1,8 +1,6 @@
 package streaming
 
 import (
-	"context"
-
 	redis "github.com/redis/go-redis/v9"
 )
 
@@ -24,9 +22,6 @@ type (
 		// rdb is the redis client.
 		rdb *redis.Client
 	}
-
-	// AckedEvent is an event that can be acknowledged.
-	AckedEvent Event
 )
 
 // newEvent creates a new event.
@@ -40,9 +35,4 @@ func newEvent(rdb *redis.Client, streamName, sinkName, id, eventName, topic stri
 		Payload:    payload,
 		rdb:        rdb,
 	}
-}
-
-// Ack acknowledges the event.
-func (e *AckedEvent) Ack(ctx context.Context) error {
-	return e.rdb.XAck(ctx, e.StreamName, e.SinkName, e.ID).Err()
 }

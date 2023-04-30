@@ -33,7 +33,8 @@ func TestDestroy(t *testing.T) {
 
 	s2, err := NewStream(ctx, "testDestroy2", rdb)
 	assert.NoError(t, err)
-	s2.Add(ctx, "foo", []byte("bar"))
+	_, err = s2.Add(ctx, "foo", []byte("bar"))
+	assert.NoError(t, err)
 	exists, err = rdb.Exists(ctx, s2.key).Result()
 	assert.NoError(t, err)
 	assert.Equal(t, int64(1), exists)
@@ -44,7 +45,7 @@ func TestOptions(t *testing.T) {
 	s, err := NewStream(ctx, "testOptions", nil, WithMaxLen(10), WithLogger(nil))
 	assert.NoError(t, err)
 	assert.Equal(t, 10, s.MaxLen)
-	assert.Equal(t, &ponos.NilLogger{}, s.logger)
+	assert.Equal(t, ponos.NoopLogger(), s.logger)
 }
 
 func TestAdd(t *testing.T) {
@@ -52,7 +53,8 @@ func TestAdd(t *testing.T) {
 	s, err := NewStream(ctx, "testAdd", rdb)
 	assert.NoError(t, err)
 
-	assert.NoError(t, s.Add(ctx, "foo", []byte("bar")))
+	_, err = s.Add(ctx, "foo", []byte("bar"))
+	assert.NoError(t, err)
 	l, err := rdb.XLen(ctx, s.key).Result()
 	assert.NoError(t, err)
 	assert.Equal(t, int64(1), l)
@@ -69,8 +71,10 @@ func TestRemove(t *testing.T) {
 	s, err := NewStream(ctx, "testRemove", rdb)
 	assert.NoError(t, err)
 
-	assert.NoError(t, s.Add(ctx, "foo", []byte("bar")))
-	assert.NoError(t, s.Add(ctx, "foo2", []byte("bar2")))
+	_, err = s.Add(ctx, "foo", []byte("bar"))
+	assert.NoError(t, err)
+	_, err = s.Add(ctx, "foo2", []byte("bar2"))
+	assert.NoError(t, err)
 
 	l, err := rdb.XLen(ctx, s.key).Result()
 	assert.NoError(t, err)
@@ -93,7 +97,8 @@ func TestTopic(t *testing.T) {
 	assert.NoError(t, err)
 
 	tp := s.NewTopic("foo")
-	tp.Add(ctx, "bar", []byte("baz"))
+	_, err = tp.Add(ctx, "bar", []byte("baz"))
+	assert.NoError(t, err)
 
 	l, err := rdb.XLen(ctx, s.key).Result()
 	assert.NoError(t, err)

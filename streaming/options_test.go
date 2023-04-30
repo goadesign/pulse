@@ -21,7 +21,7 @@ func TestStreamOptions(t *testing.T) {
 			opts: []StreamOption{},
 			want: streamOptions{
 				MaxLen: 1000,
-				Logger: &ponos.NilLogger{},
+				Logger: ponos.NoopLogger(),
 			},
 		},
 		{
@@ -29,7 +29,7 @@ func TestStreamOptions(t *testing.T) {
 			opts: []StreamOption{WithMaxLen(10)},
 			want: streamOptions{
 				MaxLen: 10,
-				Logger: &ponos.NilLogger{},
+				Logger: ponos.NoopLogger(),
 			},
 		},
 		{
@@ -63,51 +63,83 @@ func TestReaderOptions(t *testing.T) {
 			name: "default",
 			opts: []ReaderOption{},
 			want: readerOptions{
-				BufferSize:  1000,
-				LastEventID: "$",
+				BlockDuration: 5 * time.Second,
+				MaxPolled:     1000,
+				BufferSize:    1000,
+				LastEventID:   "$",
+			},
+		},
+		{
+			name: "block duration",
+			opts: []ReaderOption{WithReaderBlockDuration(10 * time.Second)},
+			want: readerOptions{
+				BlockDuration: 10 * time.Second,
+				MaxPolled:     1000,
+				BufferSize:    1000,
+				LastEventID:   "$",
+			},
+		},
+		{
+			name: "max polled",
+			opts: []ReaderOption{WithReaderMaxPolled(10)},
+			want: readerOptions{
+				BlockDuration: 5 * time.Second,
+				MaxPolled:     10,
+				BufferSize:    1000,
+				LastEventID:   "$",
 			},
 		},
 		{
 			name: "topic",
 			opts: []ReaderOption{WithReaderTopic("foo")},
 			want: readerOptions{
-				BufferSize:  1000,
-				LastEventID: "$",
-				Topic:       "foo",
+				BlockDuration: 5 * time.Second,
+				MaxPolled:     1000,
+				BufferSize:    1000,
+				LastEventID:   "$",
+				Topic:         "foo",
 			},
 		},
 		{
 			name: "topic pattern",
 			opts: []ReaderOption{WithReaderTopicPattern("foo*")},
 			want: readerOptions{
-				BufferSize:   1000,
-				LastEventID:  "$",
-				TopicPattern: "foo*",
+				BlockDuration: 5 * time.Second,
+				MaxPolled:     1000,
+				BufferSize:    1000,
+				LastEventID:   "$",
+				TopicPattern:  "foo*",
 			},
 		},
 		{
 			name: "event matcher",
 			opts: []ReaderOption{WithReaderEventMatcher(nil)},
 			want: readerOptions{
-				BufferSize:   1000,
-				LastEventID:  "$",
-				EventMatcher: nil,
+				BlockDuration: 5 * time.Second,
+				MaxPolled:     1000,
+				BufferSize:    1000,
+				LastEventID:   "$",
+				EventMatcher:  nil,
 			},
 		},
 		{
 			name: "buffer size",
 			opts: []ReaderOption{WithReaderBufferSize(10)},
 			want: readerOptions{
-				BufferSize:  10,
-				LastEventID: "$",
+				BlockDuration: 5 * time.Second,
+				MaxPolled:     1000,
+				BufferSize:    10,
+				LastEventID:   "$",
 			},
 		},
 		{
 			name: "last event ID",
 			opts: []ReaderOption{WithReaderLastEventID("foo")},
 			want: readerOptions{
-				BufferSize:  1000,
-				LastEventID: "foo",
+				BlockDuration: 5 * time.Second,
+				MaxPolled:     1000,
+				BufferSize:    1000,
+				LastEventID:   "foo",
 			},
 		},
 	}
@@ -134,6 +166,30 @@ func TestSinkOptions(t *testing.T) {
 			name: "default",
 			opts: []SinkOption{},
 			want: sinkOptions{
+				BlockDuration:  5 * time.Second,
+				MaxPolled:      1000,
+				BufferSize:     1000,
+				LastEventID:    "$",
+				AckGracePeriod: 30 * time.Second,
+			},
+		},
+		{
+			name: "block duration",
+			opts: []SinkOption{WithSinkBlockDuration(10 * time.Second)},
+			want: sinkOptions{
+				BlockDuration:  10 * time.Second,
+				MaxPolled:      1000,
+				BufferSize:     1000,
+				LastEventID:    "$",
+				AckGracePeriod: 30 * time.Second,
+			},
+		},
+		{
+			name: "max polled",
+			opts: []SinkOption{WithSinkMaxPolled(10)},
+			want: sinkOptions{
+				BlockDuration:  5 * time.Second,
+				MaxPolled:      10,
 				BufferSize:     1000,
 				LastEventID:    "$",
 				AckGracePeriod: 30 * time.Second,
@@ -143,6 +199,8 @@ func TestSinkOptions(t *testing.T) {
 			name: "topic",
 			opts: []SinkOption{WithSinkTopic("foo")},
 			want: sinkOptions{
+				BlockDuration:  5 * time.Second,
+				MaxPolled:      1000,
 				BufferSize:     1000,
 				LastEventID:    "$",
 				AckGracePeriod: 30 * time.Second,
@@ -153,6 +211,8 @@ func TestSinkOptions(t *testing.T) {
 			name: "topic pattern",
 			opts: []SinkOption{WithSinkTopicPattern("foo*")},
 			want: sinkOptions{
+				BlockDuration:  5 * time.Second,
+				MaxPolled:      1000,
 				BufferSize:     1000,
 				LastEventID:    "$",
 				AckGracePeriod: 30 * time.Second,
@@ -163,6 +223,8 @@ func TestSinkOptions(t *testing.T) {
 			name: "event matcher",
 			opts: []SinkOption{WithSinkEventMatcher(nil)},
 			want: sinkOptions{
+				BlockDuration:  5 * time.Second,
+				MaxPolled:      1000,
 				BufferSize:     1000,
 				LastEventID:    "$",
 				AckGracePeriod: 30 * time.Second,
@@ -173,6 +235,8 @@ func TestSinkOptions(t *testing.T) {
 			name: "buffer size",
 			opts: []SinkOption{WithSinkBufferSize(10)},
 			want: sinkOptions{
+				BlockDuration:  5 * time.Second,
+				MaxPolled:      1000,
 				BufferSize:     10,
 				LastEventID:    "$",
 				AckGracePeriod: 30 * time.Second,
@@ -182,6 +246,8 @@ func TestSinkOptions(t *testing.T) {
 			name: "last event ID",
 			opts: []SinkOption{WithSinkLastEventID("foo")},
 			want: sinkOptions{
+				BlockDuration:  5 * time.Second,
+				MaxPolled:      1000,
 				BufferSize:     1000,
 				LastEventID:    "foo",
 				AckGracePeriod: 30 * time.Second,
@@ -191,6 +257,8 @@ func TestSinkOptions(t *testing.T) {
 			name: "start at",
 			opts: []SinkOption{WithSinkStartAt(date)},
 			want: sinkOptions{
+				BlockDuration:  5 * time.Second,
+				MaxPolled:      1000,
 				BufferSize:     1000,
 				LastEventID:    fmt.Sprintf("%d-0", date.UnixMilli()),
 				AckGracePeriod: 30 * time.Second,
@@ -200,6 +268,8 @@ func TestSinkOptions(t *testing.T) {
 			name: "no ack",
 			opts: []SinkOption{WithSinkNoAck()},
 			want: sinkOptions{
+				BlockDuration:  5 * time.Second,
+				MaxPolled:      1000,
 				BufferSize:     1000,
 				LastEventID:    "$",
 				AckGracePeriod: 30 * time.Second,
@@ -210,6 +280,8 @@ func TestSinkOptions(t *testing.T) {
 			name: "ack grace period",
 			opts: []SinkOption{WithSinkAckGracePeriod(10 * time.Second)},
 			want: sinkOptions{
+				BlockDuration:  5 * time.Second,
+				MaxPolled:      1000,
 				BufferSize:     1000,
 				LastEventID:    "$",
 				AckGracePeriod: 10 * time.Second,

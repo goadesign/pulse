@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,20 +27,24 @@ type (
 		lock sync.Mutex
 		// streams are the streams the reader consumes events from.
 		streams []*Stream
-		// streamNames is the stream names used to read events in
+		// streamKeys is the stream names used to read events in
 		// the same order as streamCursors
-		streamNames []string
+		streamKeys []string
 		// streamCursors is the stream cursors used to read events in
 		// the same order as streamNames
 		streamCursors []string
-		// readchan is used to communicate the results of XREADBLOCK
-		readchan chan []redis.XStream
-		// errchan is used to communicate errors from XREADGROUP.
-		errchan chan error
+		// blockDuration is the XREADBLOCK timeout.
+		blockDuration time.Duration
+		// maxPolled is the maximum number of events to read in one
+		// XREADBLOCK call.
+		maxPolled int64
 		// c is the reader event channel.
 		c chan *Event
-		// done is the reader done channel.
-		done chan struct{}
+		// donechan is the reader donechan channel.
+		donechan chan struct{}
+		// streamschan notifies the reader when streams are added or
+		// removed.
+		streamschan chan struct{}
 		// wait is the reader cleanup wait group.
 		wait sync.WaitGroup
 		// stopping is true if Stop was called.
@@ -74,12 +79,13 @@ func newReader(ctx context.Context, stream *Stream, opts ...ReaderOption) (*Read
 		C:             c,
 		startID:       options.LastEventID,
 		streams:       []*Stream{stream},
-		streamNames:   []string{stream.Name},
+		streamKeys:    []string{stream.key},
 		streamCursors: []string{options.LastEventID},
-		readchan:      make(chan []redis.XStream),
-		errchan:       make(chan error),
+		blockDuration: options.BlockDuration,
+		maxPolled:     options.MaxPolled,
 		c:             c,
-		done:          make(chan struct{}),
+		donechan:      make(chan struct{}),
+		streamschan:   make(chan struct{}),
 		eventMatcher:  eventMatcher,
 		logger:        stream.logger,
 		rdb:           stream.rdb,
@@ -97,7 +103,7 @@ func newReader(ctx context.Context, stream *Stream, opts ...ReaderOption) (*Read
 func (r *Reader) AddStream(ctx context.Context, stream *Stream, opts ...AddStreamOption) error {
 	r.lock.Lock()
 	defer r.lock.Unlock()
-	for _, name := range r.streamNames {
+	for _, name := range r.streamKeys {
 		if name == stream.Name {
 			return nil
 		}
@@ -111,8 +117,9 @@ func (r *Reader) AddStream(ctx context.Context, stream *Stream, opts ...AddStrea
 		startID = options.LastEventID
 	}
 	r.streams = append(r.streams, stream)
-	r.streamNames = append(r.streamNames, stream.Name)
+	r.streamKeys = append(r.streamKeys, stream.key)
 	r.streamCursors = append(r.streamCursors, startID)
+	r.notifyStreamChange()
 	r.logger.Info("added stream to reader", "stream", stream.Name)
 	return nil
 }
@@ -124,11 +131,12 @@ func (r *Reader) RemoveStream(ctx context.Context, stream *Stream) error {
 	for i, st := range r.streams {
 		if st == stream {
 			r.streams = append(r.streams[:i], r.streams[i+1:]...)
-			r.streamNames = append(r.streamNames[:i], r.streamNames[i+1:]...)
+			r.streamKeys = append(r.streamKeys[:i], r.streamKeys[i+1:]...)
 			r.streamCursors = append(r.streamCursors[:i], r.streamCursors[i+1:]...)
 			break
 		}
 	}
+	r.notifyStreamChange()
 	r.logger.Info("removed stream from reader", "stream", stream.Name)
 	return nil
 }
@@ -140,7 +148,8 @@ func (r *Reader) Stop() {
 		return
 	}
 	r.stopping = true
-	close(r.done)
+	close(r.donechan)
+	close(r.streamschan)
 	r.lock.Unlock()
 	r.wait.Wait()
 	r.lock.Lock()
@@ -160,18 +169,32 @@ func (r *Reader) Stopped() bool {
 func (r *Reader) read() {
 	defer r.cleanup()
 	for {
-		events, err := r.readOnce()
+		events, err := readOnce(
+			context.Background(),
+			func(ctx context.Context) ([]redis.XStream, error) {
+				r.lock.Lock()
+				// force copy so no two goroutines can share the memory
+				readStreams := make([]string, len(r.streamKeys))
+				copy(readStreams, r.streamKeys)
+				readStreams = append(readStreams, r.streamCursors...)
+				r.lock.Unlock()
+				r.logger.Debug("reading", "streams", readStreams, "max", r.maxPolled, "block", r.blockDuration)
+				return r.rdb.XRead(ctx, &redis.XReadArgs{
+					Streams: readStreams,
+					Count:   r.maxPolled,
+					Block:   r.blockDuration,
+				}).Result()
+			},
+			r.streamschan,
+			r.donechan,
+			r.logger,
+		)
 		if r.isStopping() {
 			return
 		}
 		if err != nil {
-			if err == redis.Nil {
-				continue // No event at this time, just loop
-			}
-			d := time.Duration(rand.Intn(maxJitterMs)) * time.Millisecond
-			r.logger.Error(fmt.Errorf("reader failed to read events: %w, retrying in %v", err, d))
-			time.Sleep(d)
-			continue // Full jitter eternal retry
+			handleReadEvent(err, r.logger)
+			continue
 		}
 
 		var evs []*Event
@@ -200,6 +223,14 @@ func (r *Reader) read() {
 				r.logger.Debug("event received", "stream", streamEvents.Stream, "event", ev.ID)
 				evs = append(evs, ev)
 			}
+			r.lock.Lock()
+			for i := range r.streamKeys {
+				if r.streamKeys[i] == streamEvents.Stream {
+					r.streamCursors[i] = streamEvents.Messages[len(streamEvents.Messages)-1].ID
+					break
+				}
+			}
+			r.lock.Unlock()
 		}
 
 		r.lock.Lock()
@@ -210,39 +241,77 @@ func (r *Reader) read() {
 	}
 }
 
-// readOnce reads events from the streams using the backing consumer group.  It
-// blocks up to blockMs milliseconds or until the reader is stopped if no events
-// are available.
-func (r *Reader) readOnce() ([]redis.XStream, error) {
-	ctx := context.Background()
+// readOnce calls the provided readFn and returns the events or error.
+// readOnce cancels the context if the reader is stopping or if the streams
+// attached to the reader have changed.
+// NOTE: the Redis client does not currently support context cancellation.
+// See https://github.com/redis/go-redis/issues/2276. This means the read
+// will block until the timeout is reached.
+func readOnce(
+	ctx context.Context,
+	readFn func(context.Context) ([]redis.XStream, error),
+	streamschan chan struct{},
+	donechan chan struct{},
+	logger ponos.Logger,
+) ([]redis.XStream, error) {
 
+	readchan := make(chan []redis.XStream)
+	errchan := make(chan error)
+	defer close(readchan)
+	defer close(errchan)
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	go func() {
-		events, err := r.rdb.XRead(ctx, &redis.XReadArgs{
-			Streams: append(r.streamNames, r.streamCursors...),
-			Count:   maxMessages,
-			Block:   pollDuration,
-		}).Result()
-		func() {
-			r.lock.Lock()
-			defer r.lock.Unlock()
-			if r.stopping {
-				return
+		events, err := readFn(cctx)
+		if err != nil {
+			if cctx.Err() != nil {
+				err = nil
 			}
-			if err != nil {
-				r.errchan <- err
-				return
-			}
-			r.readchan <- events
-		}()
+			errchan <- err
+			return
+		}
+		readchan <- events
 	}()
-
 	select {
-	case events := <-r.readchan:
+	case events := <-readchan:
 		return events, nil
-	case err := <-r.errchan:
+	case err := <-errchan:
 		return nil, err
-	case <-r.done:
-		return nil, nil
+	case <-streamschan:
+		cancel()
+		logger.Debug("reading aborted", "reason", "streams changed")
+	case <-donechan:
+		cancel()
+		logger.Debug("reading aborted", "reason", "reader stopped")
+	}
+	for {
+		select {
+		case events := <-readchan:
+			return events, nil
+		case err := <-errchan:
+			return nil, err
+		}
+	}
+}
+
+// handleReadEvent retries retryable read errors and ignores non-retryable.
+func handleReadEvent(err error, logger ponos.Logger) {
+	if err == redis.Nil {
+		return // No event at this time, just loop
+	}
+	if strings.Contains(err.Error(), "NOGROUP") {
+		return // Consumer group was removed with RemoveStream, just loop (s.streamCursors will be updated)
+	}
+	d := time.Duration(rand.Intn(maxJitterMs)) * time.Millisecond
+	logger.Error(fmt.Errorf("failed to read events: %w, retrying in %v", err, d))
+	time.Sleep(d)
+}
+
+// notifyStreamChange notifies the reader that the streams have changed.
+func (r *Reader) notifyStreamChange() {
+	select {
+	case r.streamschan <- struct{}{}:
+	default:
 	}
 }
 
@@ -252,8 +321,6 @@ func (r *Reader) readOnce() ([]redis.XStream, error) {
 func (r *Reader) cleanup() {
 	r.lock.Lock()
 	defer r.lock.Unlock()
-	close(r.readchan)
-	close(r.errchan)
 	close(r.c)
 	r.wait.Done()
 }

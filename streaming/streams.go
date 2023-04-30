@@ -24,6 +24,8 @@ type (
 		C <-chan *Event
 		// logger is the logger used by the stream.
 		logger ponos.Logger
+		// rootLogger is the prefix-free logger used to create sink loggers.
+		rootLogger ponos.Logger
 		// key is the redis key used for the stream.
 		key string
 		// rdb is the redis connection.
@@ -45,6 +47,8 @@ type (
 )
 
 const (
+	// streamKeyPrefix is the prefix used for stream keys.
+	streamKeyPrefix = "ponos:stream:"
 	// nameKey is the key used to store the event name.
 	nameKey = "n"
 	// payloadKey is the key used to store the event payload.
@@ -63,18 +67,21 @@ func NewStream(ctx context.Context, name string, rdb *redis.Client, opts ...Stre
 	for _, option := range opts {
 		option(&options)
 	}
-	var logger ponos.Logger
+	var logger, rootLogger ponos.Logger
 	if options.Logger != nil {
 		logger = options.Logger.WithPrefix("ponos:stream", name)
+		rootLogger = options.Logger
 	} else {
-		logger = &ponos.NilLogger{}
+		logger = ponos.NoopLogger()
+		rootLogger = logger
 	}
 	s := &Stream{
-		Name:   name,
-		MaxLen: options.MaxLen,
-		logger: logger,
-		key:    "ponos:stream:" + name,
-		rdb:    rdb,
+		Name:       name,
+		MaxLen:     options.MaxLen,
+		logger:     logger,
+		rootLogger: rootLogger,
+		key:        streamKeyPrefix + name,
+		rdb:        rdb,
 	}
 	return s, nil
 }
@@ -95,7 +102,7 @@ func (s *Stream) NewReader(ctx context.Context, opts ...ReaderOption) (*Reader, 
 		s.logger.Error(err)
 		return nil, err
 	}
-	s.logger.Info("reader created")
+	s.logger.Info("create reader", "start", reader.startID)
 	return reader, nil
 }
 
@@ -117,7 +124,7 @@ func (s *Stream) NewSink(ctx context.Context, name string, opts ...SinkOption) (
 		s.logger.Error(err, "sink", name)
 		return nil, err
 	}
-	s.logger.Info("sink created", "sink", name)
+	s.logger.Info("create", "sink", name, "start", sink.startID)
 	return sink, nil
 }
 
@@ -129,15 +136,16 @@ func (s *Stream) NewTopic(name string) *Topic {
 	}
 }
 
-// Add appends an event to the stream.
-func (s *Stream) Add(ctx context.Context, name string, payload []byte) error {
-	if err := s.add(ctx, name, payload, nil); err != nil {
+// Add appends an event to the stream and returns its ID.
+func (s *Stream) Add(ctx context.Context, name string, payload []byte) (string, error) {
+	res, err := s.add(ctx, name, payload, nil)
+	if err != nil {
 		err := fmt.Errorf("failed to add event: %w", err)
 		s.logger.Error(err, "event", name)
-		return err
+		return "", err
 	}
-	s.logger.Debug("added", "event", name)
-	return nil
+	s.logger.Debug("add", "event", name, "id", res)
+	return res, nil
 }
 
 // Remove removes the events with the given IDs from the stream.
@@ -150,7 +158,7 @@ func (s *Stream) Remove(ctx context.Context, ids ...string) error {
 		s.logger.Error(err, "events", ids)
 		return err
 	}
-	s.logger.Debug("removed", "events", ids)
+	s.logger.Debug("remove", "events", ids)
 	return nil
 }
 
@@ -166,19 +174,20 @@ func (s *Stream) Destroy(ctx context.Context) error {
 	return nil
 }
 
-// Add appends an event to the topic.
-func (t *Topic) Add(ctx context.Context, name string, payload []byte) error {
-	if err := t.Stream.add(ctx, name, payload, &t.Name); err != nil {
+// Add appends an event to the topic and returns its id.
+func (t *Topic) Add(ctx context.Context, name string, payload []byte) (string, error) {
+	res, err := t.Stream.add(ctx, name, payload, &t.Name)
+	if err != nil {
 		err = fmt.Errorf("failed to add event %w", err)
 		t.Stream.logger.Error(err, "event", name, "topic", t.Name)
-		return err
+		return "", err
 	}
-	t.Stream.logger.Debug("added", "event", name, "topic", t.Name)
-	return nil
+	t.Stream.logger.Debug("add", "event", name, "topic", t.Name, "id", res)
+	return res, nil
 }
 
 // add appends an event to the stream.
-func (s *Stream) add(ctx context.Context, name string, payload []byte, topic *string) error {
+func (s *Stream) add(ctx context.Context, name string, payload []byte, topic *string) (string, error) {
 	values := []any{nameKey, name, payloadKey, payload}
 	if topic != nil {
 		values = append(values, topicKey, *topic)
@@ -188,7 +197,7 @@ func (s *Stream) add(ctx context.Context, name string, payload []byte, topic *st
 		Values: values,
 		MaxLen: int64(s.MaxLen),
 		Approx: true,
-	}).Err()
+	}).Result()
 }
 
 // redisKeyRegex is a regular expression that matches valid Redis keys.

@@ -31,7 +31,7 @@ func main() {
 	}
 
 	// Add a new event
-	if err := stream.Add(context.Background(), "event", []byte("payload")); err != nil {
+	if _, err := stream.Add(context.Background(), "event", []byte("payload")); err != nil {
 		panic(err)
 	}
 
@@ -44,6 +44,6 @@ func main() {
 	// Consume all events
 	for event := range sink.C {
 		fmt.Printf("event: %s, payload: %s\n", event.EventName, event.Payload)
-		event.Ack(ctx)
+		sink.Ack(ctx, event)
 	}
 }

@@ -38,7 +38,7 @@ func main() {
 	}
 
 	// Add a new key
-	if err := m.Set(ctx, "foo", "bar"); err != nil {
+	if _, err := m.Set(ctx, "foo", "bar"); err != nil {
 		panic(err)
 	}
 

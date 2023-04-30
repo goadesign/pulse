@@ -225,8 +225,7 @@ func TestLogs(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	var buf Buffer
 	ctx := context.Background()
-	ctx = log.Context(ctx, log.WithOutput(&buf))
-	log.FlushAndDisableBuffering(ctx)
+	ctx = log.Context(ctx, log.WithOutput(&buf), log.WithDebug())
 
 	m, err := Join(ctx, "test", rdb, WithLogger(ponos.ClueLogger(ctx)))
 	require.NoError(t, err)

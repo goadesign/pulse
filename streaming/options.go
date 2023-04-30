@@ -29,14 +29,18 @@ type (
 	}
 
 	readerOptions struct {
-		Topic        string
-		TopicPattern string
-		EventMatcher EventMatcherFunc
-		BufferSize   int
-		LastEventID  string
+		BlockDuration time.Duration
+		MaxPolled     int64
+		Topic         string
+		TopicPattern  string
+		EventMatcher  EventMatcherFunc
+		BufferSize    int
+		LastEventID   string
 	}
 
 	sinkOptions struct {
+		BlockDuration  time.Duration
+		MaxPolled      int64
 		Topic          string
 		TopicPattern   string
 		EventMatcher   EventMatcherFunc
@@ -62,6 +66,23 @@ func WithMaxLen(len int) StreamOption {
 func WithLogger(logger ponos.Logger) StreamOption {
 	return func(o *streamOptions) {
 		o.Logger = logger
+	}
+}
+
+// WithReaderBlockDuration sets the maximum amount of time the reader waits for
+// MaxPolled events. The default block duration is 5 seconds. If the block
+// duration is set to 0 then the reader blocks indefinitely.
+func WithReaderBlockDuration(d time.Duration) ReaderOption {
+	return func(o *readerOptions) {
+		o.BlockDuration = d
+	}
+}
+
+// WithReaderMaxPolled sets the maximum number of events polled by the reader at once. The
+// default maximum number of events is 1000.
+func WithReaderMaxPolled(n int64) ReaderOption {
+	return func(o *readerOptions) {
+		o.MaxPolled = n
 	}
 }
 
@@ -128,6 +149,23 @@ func WithReaderLastEventID(id string) ReaderOption {
 func WithReaderStartAt(startAt time.Time) ReaderOption {
 	return func(o *readerOptions) {
 		o.LastEventID = fmt.Sprintf("%d-0", startAt.UnixMilli())
+	}
+}
+
+// WithSinkBlockDuration sets the maximum amount of time the sink waits for
+// MaxPolled events. The default block duration is 5 seconds. If the block
+// duration is set to 0 then the sink blocks indefinitely.
+func WithSinkBlockDuration(d time.Duration) SinkOption {
+	return func(o *sinkOptions) {
+		o.BlockDuration = d
+	}
+}
+
+// WithSinkMaxPolled sets the maximum number of events polled by the sink at once. The
+// default maximum number of events is 1000.
+func WithSinkMaxPolled(n int64) SinkOption {
+	return func(o *sinkOptions) {
+		o.MaxPolled = n
 	}
 }
 
@@ -258,21 +296,25 @@ func WithAddStreamStartAt(startAt time.Time) AddStreamOption {
 func defaultStreamOptions() streamOptions {
 	return streamOptions{
 		MaxLen: 1000,
-		Logger: &ponos.NilLogger{},
+		Logger: ponos.NoopLogger(),
 	}
 }
 
 // defaultReaderOptions returns the default options.
 func defaultReaderOptions() readerOptions {
 	return readerOptions{
-		BufferSize:  1000,
-		LastEventID: "$",
+		BlockDuration: 5 * time.Second,
+		MaxPolled:     1000,
+		BufferSize:    1000,
+		LastEventID:   "$",
 	}
 }
 
 // defaultSinkOptions returns the default options.
 func defaultSinkOptions() sinkOptions {
 	return sinkOptions{
+		BlockDuration:  5 * time.Second,
+		MaxPolled:      1000,
 		BufferSize:     1000,
 		LastEventID:    "$",
 		AckGracePeriod: 30 * time.Second,

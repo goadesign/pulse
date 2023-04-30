@@ -23,6 +23,6 @@ func WithLogger(logger ponos.Logger) MapOption {
 // defaultOptions returns the default options.
 func defaultOptions() *options {
 	return &options{
-		Logger: &ponos.NilLogger{},
+		Logger: ponos.NoopLogger(),
 	}
 }

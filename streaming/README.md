@@ -14,39 +14,109 @@ import (
 
 func main() {
     // Connect to Redis
-    conn, err := streams.New(context.Background(), redis.NewClient())
+    rdb := redis.NewClient(&redis.Options{ Addr: "localhost:6379" })
+
+    // Create stream "my-stream"
+    stream, err := streaming.NewStream(context.Background(), "my-stream", rdb)
     if err != nil {
         panic(err)
     }
 
-    // Create stream named "my-stream".
-    stream := conn.Stream("my-stream")
-
-    // Add a new event
+    // Add a new event to the stream
     if err := stream.Add(context.Background(), "event", "payload"); err != nil {
         panic(err)
     }
 
-    // Create event sink
-    sink := stream.NewSink("my-sink")
-    defer sink.Close()
+    // Create event reader
+    reader := stream.NewReader()
 
-    // Consume all events  
-    for event := range sink.C {
-        fmt.Printf("event: %s, payload: %s\n", event.Name, event.Payload)
-        event.Ack()
-    }
+    // Consume event
+    event := <-reader.C 
+    fmt.Printf("event: %s, payload: %s\n", event.Name, event.Payload)
+
+    // Cleanup
+    reader.Stop()
 }
+```
+
+The code above creates a stream named "my-stream" and adds a new event to it.
+The event is then consumed by a reader. The reader is stopped after the event
+is consumed.
+
+Multiple readers can be created for the same stream. Readers are independent and
+each instance receives a copy of the same events. Readers can specify a start
+position for the stream cursor. The default start position is the last event in
+the stream.
+
+```go
+// Create stream "my-stream"
+stream, err := streaming.NewStream(context.Background(), "my-stream", rdb)
+
+// Write 2 events to the stream
+stream.Add(context.Background(), "event1", "payload1")
+stream.Add(context.Background(), "event2", "payload2")
+
+// Create reader for stream "my-stream" and read from the beginning
+reader := streaming.NewReader(context.Background(), streaming.WithReaderStartAtOldest())
+
+// Read both events
+event := <-reader.C
+fmt.Printf("reader 1, event: %s, payload: %s\n", event.Name, event.Payload)
+event = <-reader.C
+fmt.Printf("reader 1, event: %s, payload: %s\n", event.Name, event.Payload)
+
+// Create another reader for stream "my-stream" and start reading after the
+// first event
+otherReader := streaming.NewReader(context.Background(), streaming.WithReaderStartAt(event.ID))
+
+// Read second event
+event = <-otherReader.C
+fmt.Printf("reader 2, event: %s, payload: %s\n", event.Name, event.Payload)
+// Prints "reader 2, event: event2, payload: payload2"
 ```
 
 ## Event Sinks
 
-Event sinks allow for concurrent processing of event streams.  Each sink manages
-its own stream cursors and thus can consume events independently from other
-sinks.
+Event sinks enable concurrent processing of multiple events for better
+performance.  They also enable redundancy in case of node failure and network
+partitions.
 
-The code above can run concurrently in different processes to create multiple
-consumers for the same sink. Events are distributed evenly among the consumers.
+Event sinks make it possible for multiple nodes to share the same stream cursor.
+If a stream contains 3 events and 3 nodes are consuming the stream using the
+same sink (i.e. a sink with the same name), then each node will receive a unique
+event from the sequence. Nodes using a different sink (or a reader) will receive
+copies of the same events.  
+
+Sink nodes maintain a keep-alive timestamp and Ponos automatically requeues
+events that have been read by a node but not yet acknowledged passed the ack
+grace period configured when creating the sink.
+
+Creating a sink is as simple as:
+
+```go
+// Create stream "my-stream"
+stream, err := streaming.NewStream(context.Background(), "my-stream", rdb)
+if err != nil {
+    panic(err)
+}
+
+// Create sink "my-sink" for stream "my-stream"
+sink := stream.NewSink(context.Background(), "my-sink")
+defer sink.Close()
+
+// Consume event
+event := <-sink.C
+fmt.Printf("event: %s, payload: %s\n", event.Name, event.Payload)
+event.Ack()
+```
+
+Note a couple of differences with the reader example above:
+
+- The sink is created using `stream.NewSink(context.Background(), "my-sink")` instead of
+  `streaming.NewReader(context.Background())`. Each sink has a unique name, multiple nodes
+  using the same name will share the same stream cursor.
+- The event is acknowledged using `event.Ack()`. This is required to advance the stream cursor
+  and avoid reprocessing the same event.
 
 ```mermaid
 flowchart TD
@@ -66,13 +136,8 @@ flowchart TD
     Stream -->|fa:fa-bolt Event 1..n|Sink1
 ```
 
-Multiple sinks can be created for the same stream. Copies of the same event are
-distributed among all sinks.
-
-```go
-// Create sink "my-other-sink" for stream "my-stream"
-otherSink := stream.NewSink("my-other-sink")
-```
+As with readers, multiple sinks can be created for the same stream. Copies of
+the same event are distributed among all sinks.
 
 ```mermaid
 flowchart TD
@@ -99,18 +164,22 @@ flowchart TD
 
 ## Reading from multiple streams
 
-Sinks can also be used to read concurrently from multiple streams. For example:
+Readers and sinks can also read concurrently from multiple streams.  For
+example:
 
 ```go
 // Create stream "my-stream"
-stream := ponos.NewStream("my-stream", rdb)
+stream, err := streaming.NewStream(context.Background(), "my-stream", rdb)
+if err != nil {
+    panic(err)
+}
 
 // Create sink "my-sink" for stream "my-stream"
 sink := stream.NewSink("my-sink")
 defer sink.Close()
 
 // Create stream "my-other-stream"
-otherStream := ponos.NewStream("my-other-stream", rdb)
+otherStream := streaming.NewStream(context.Background(), "my-other-stream", rdb)
 
 // Add stream "my-other-stream" to sink "my-sink"
 sink.AddStream(otherStream)
@@ -150,21 +219,18 @@ flowchart TD
     Stream2 -->|fa:fa-bolt Event 1..n|Sink
 ```
 
-`AddStream` can be called at any time to add new streams to a sink. Streams can
-also be removed from sinks using `RemoveStream`.
+`AddStream` can be called at any time to add new streams to a reader or a sink.
+Streams can also be removed using `RemoveStream`.
 
 ```go
 // Remove stream "my-other-stream" from sink "my-sink"
 sink.RemoveStream(otherStream)
 ```
 
-Sinks provide a very versatile mechanism that can be used to create complex
-topologies of producers and consumers.
-
 ## Pub/Sub
 
 Streams supports a flexible pub/sub mechanism where events can be attached to
-topics and sinks can define simple or custom matching logic.
+topics and readers or sinks can define simple or custom matching logic.
 
 ```go
 // Create topics "my-topic" and "my-other-topic"
@@ -182,7 +248,7 @@ if err := otherTopic.Add(ctx, "event", "payload"); err != nil {
 }
 
 // Consume events for topic "my-topic"
-sink := stream.NewSink("my-sink", ponos.WithSinkTopic("my-topic"))
+sink, err := stream.NewSink(ctx, "my-sink", ponos.WithSinkTopic("my-topic"))
 defer sink.Close()
 for event := range sink.C {
     fmt.Printf("event: %s, payload: %s\n", event.EventName, event.Payload)
@@ -220,16 +286,18 @@ Topics can be matched using their name as in the example above or using complex
 patterns. For example:
 
 ```go
-sink := stream.NewSink("my-sink", ponos.WithSinkTopicPattern("my-topic.*"))
+sink, err := stream.NewSink(ctx, "my-sink", ponos.WithSinkTopicPattern("my-topic.*"))
 ```
 
 Custom matching logic can also be provided:
 
 ```go
-sink := stream.NewSink("my-sink", ponos.WithSinkEventMatcher(
+sink, err := stream.NewSink(ctx, "my-sink", ponos.WithSinkEventMatcher(
     func(event *ponos.Event) bool {
         return event.Topic == "my-topic" && event.EventName == "event"
     }))
 ```
 
-> Note: Event filtering is done in the client
+> Note: Event filtering is done locally in the sink or reader and does not
+> affect the underlying stream. This means that events are still stored in the
+> stream and can be consumed by other sinks.

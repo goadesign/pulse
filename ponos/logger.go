@@ -11,15 +11,21 @@ import (
 type (
 	// Interface used by Ponos to write log entries.
 	Logger interface {
+		// EnableDebug turns on debug logging.
 		EnableDebug()
+		// WithPrefix returns a logger that prefixes all log entries with the
+		// given key-value pairs.
 		WithPrefix(kvs ...any) Logger
+		// Debug logs a debug message.
 		Debug(msg string, kvs ...any)
+		// Info logs an info message.
 		Info(msg string, kvs ...any)
+		// Error logs an error message.
 		Error(err error, kvs ...any)
 	}
 
-	// NilLogger is a no-op logger.
-	NilLogger struct{}
+	// noopLogger is a no-op logger.
+	noopLogger struct{}
 
 	// stdLogger is a Go standard library logger adapter.
 	stdLogger struct {
@@ -35,10 +41,15 @@ type (
 )
 
 var (
-	_ Logger = (*NilLogger)(nil)
+	_ Logger = (*noopLogger)(nil)
 	_ Logger = (*stdLogger)(nil)
 	_ Logger = (*clueLogger)(nil)
 )
+
+// NoopLogger returns a no-op logger.
+func NoopLogger() Logger {
+	return &noopLogger{}
+}
 
 // StdLogger adapts a Go standard library logger to a ponos logger.
 func StdLogger(logger *stdlog.Logger) Logger {
@@ -51,11 +62,11 @@ func ClueLogger(logCtx context.Context) Logger {
 	return &clueLogger{logCtx}
 }
 
-func (l *NilLogger) EnableDebug()               {}
-func (l *NilLogger) WithPrefix(_ ...any) Logger { return l }
-func (l *NilLogger) Debug(_ string, _ ...any)   {}
-func (l *NilLogger) Info(_ string, _ ...any)    {}
-func (l *NilLogger) Error(_ error, _ ...any)    {}
+func (l *noopLogger) EnableDebug()               {}
+func (l *noopLogger) WithPrefix(_ ...any) Logger { return l }
+func (l *noopLogger) Debug(_ string, _ ...any)   {}
+func (l *noopLogger) Info(_ string, _ ...any)    {}
+func (l *noopLogger) Error(_ error, _ ...any)    {}
 
 func (l *stdLogger) EnableDebug() {
 	l.debugEnabled = true

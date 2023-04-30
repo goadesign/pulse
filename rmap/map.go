@@ -316,6 +316,13 @@ func (sm *Map) Stop() error {
 
 // init initializes the map.
 func (sm *Map) init(ctx context.Context) error {
+	// Make sure scripts are cached.
+	for _, script := range []string{luaSet, luaDelete, luaReset, luaIncr, luaAppend, luaRemove} {
+		if err := sm.rdb.ScriptLoad(ctx, script).Err(); err != nil {
+			return fmt.Errorf("ponos map: %s failed to load Lua scripts %q: %w", sm.name, script, err)
+		}
+	}
+
 	// Subscribe to updates.
 	sm.sub = sm.rdb.Subscribe(ctx, sm.chankey)
 	_, err := sm.sub.Receive(ctx) // Fail fast if we can't subscribe.
@@ -324,14 +331,11 @@ func (sm *Map) init(ctx context.Context) error {
 	}
 	sm.msgch = sm.sub.Channel()
 
-	// Make sure scripts are cached.
-	for _, script := range []string{luaSet, luaDelete, luaReset, luaIncr, luaAppend, luaRemove} {
-		if err := sm.rdb.ScriptLoad(ctx, script).Err(); err != nil {
-			return fmt.Errorf("ponos map: %s failed to load Lua scripts %q: %w", sm.name, script, err)
-		}
-	}
-
 	// read initial content
+	// Note: there's a (very) small window where we might be receiving
+	// updates for changes that are already applied by the time we call
+	// HGetAll. This is not a problem because we'll just overwrite the
+	// local copy with the same data.
 	cmd := sm.rdb.HGetAll(ctx, sm.hashkey)
 	if err := cmd.Err(); err != nil {
 		return fmt.Errorf("ponos map: %s failed to read initial content: %w", sm.name, err)
@@ -367,11 +371,14 @@ func (sm *Map) run() {
 			sm.lock.Lock()
 			switch {
 			case key == "*":
-				sm.doReset()
+				sm.content = make(map[string]string)
+				sm.logger.Debug("reset")
 			case val == "":
-				sm.doDelete(key)
+				delete(sm.content, key)
+				sm.logger.Debug("deleted", "key", key)
 			default:
-				sm.doSet(key, val)
+				sm.content[key] = val
+				sm.logger.Debug("set", key, val)
 			}
 			select {
 			case sm.notifych <- struct{}{}:
@@ -412,24 +419,6 @@ func (sm *Map) runLuaScript(ctx context.Context, name string, script *redis.Scri
 	}
 
 	return res, nil
-}
-
-// doReset resets the map content.
-func (sm *Map) doReset() {
-	sm.content = make(map[string]string)
-	sm.logger.Info("reset")
-}
-
-// doDelete deletes the value for the given key.
-func (sm *Map) doDelete(key string) {
-	delete(sm.content, key)
-	sm.logger.Info("deleted", "key", key)
-}
-
-// doSet sets the value for the given key.
-func (sm *Map) doSet(key, val string) {
-	sm.content[key] = val
-	sm.logger.Info("set", key, val)
 }
 
 // reconnect attempts to reconnect to the Redis server forever.
