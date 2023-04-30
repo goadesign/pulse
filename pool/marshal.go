@@ -25,109 +25,108 @@ func unmarshalWorker(b []byte) *poolWorker {
 }
 
 // marshalJob marshals a job into a byte slice.
-func marshalJob(job *Job) ([]byte, error) {
+func marshalJob(job *Job) []byte {
 	var buf bytes.Buffer
-
-	// Write Key length as int32
-	err := binary.Write(&buf, binary.LittleEndian, int32(len(job.Key)))
-	if err != nil {
-		return nil, err
+	if err := binary.Write(&buf, binary.LittleEndian, int32(len(job.Key))); err != nil {
+		panic(err)
 	}
-
-	// Write Key bytes
-	err = binary.Write(&buf, binary.LittleEndian, []byte(job.Key))
-	if err != nil {
-		return nil, err
+	if err := binary.Write(&buf, binary.LittleEndian, []byte(job.Key)); err != nil {
+		panic(err)
 	}
-
-	// Write Payload length as int32
-	err = binary.Write(&buf, binary.LittleEndian, int32(len(job.Payload)))
-	if err != nil {
-		return nil, err
+	if err := binary.Write(&buf, binary.LittleEndian, int32(len(job.Payload))); err != nil {
+		panic(err)
 	}
-
-	// Write Payload bytes
-	err = binary.Write(&buf, binary.LittleEndian, job.Payload)
-	if err != nil {
-		return nil, err
+	if err := binary.Write(&buf, binary.LittleEndian, job.Payload); err != nil {
+		panic(err)
 	}
-
-	// Write CreatedAt as Unix timestamp in int64 format
-	err = binary.Write(&buf, binary.LittleEndian, job.CreatedAt.UnixNano())
-	if err != nil {
-		return nil, err
+	if err := binary.Write(&buf, binary.LittleEndian, job.CreatedAt.UnixNano()); err != nil {
+		panic(err)
 	}
-
-	return buf.Bytes(), nil
+	return buf.Bytes()
 }
 
 // unmarshalJob unmarshals a job from a byte slice created by marshalJob.
-func unmarshalJob(data []byte) (*Job, error) {
+func unmarshalJob(data []byte) *Job {
 	reader := bytes.NewReader(data)
-
-	// Read Key length as int32
 	var keyLength int32
-	err := binary.Read(reader, binary.LittleEndian, &keyLength)
-	if err != nil {
-		return nil, err
+	if err := binary.Read(reader, binary.LittleEndian, &keyLength); err != nil {
+		panic(err)
 	}
-
-	// Read Key bytes
 	keyBytes := make([]byte, keyLength)
-	err = binary.Read(reader, binary.LittleEndian, &keyBytes)
-	if err != nil {
-		return nil, err
+	if err := binary.Read(reader, binary.LittleEndian, &keyBytes); err != nil {
+		panic(err)
 	}
-	keyValue := string(keyBytes)
-
-	// Read Payload length as int32
 	var payloadLength int32
-	err = binary.Read(reader, binary.LittleEndian, &payloadLength)
-	if err != nil {
-		return nil, err
+	if err := binary.Read(reader, binary.LittleEndian, &payloadLength); err != nil {
+		panic(err)
 	}
-
-	// Read Payload bytes
 	var payload []byte
 	if payloadLength > 0 {
 		payload = make([]byte, payloadLength)
-		err = binary.Read(reader, binary.LittleEndian, &payload)
-		if err != nil {
-			return nil, err
+		if err := binary.Read(reader, binary.LittleEndian, &payload); err != nil {
+			panic(err)
 		}
 	}
-
-	// Read CreatedAt as Unix timestamp in int64 format
 	var createdAtTimestamp int64
-	err = binary.Read(reader, binary.LittleEndian, &createdAtTimestamp)
-	if err != nil {
-		return nil, err
+	if err := binary.Read(reader, binary.LittleEndian, &createdAtTimestamp); err != nil {
+		panic(err)
 	}
-	createdAtValue := time.Unix(0, createdAtTimestamp).UTC()
-
-	// Construct Job struct and return
 	return &Job{
-		Key:       keyValue,
+		Key:       string(keyBytes),
 		Payload:   payload,
-		CreatedAt: createdAtValue,
-	}, nil
+		CreatedAt: time.Unix(0, createdAtTimestamp).UTC(),
+	}
 }
 
-func unmarshalJobKey(data []byte) (string, error) {
+func unmarshalJobKey(data []byte) string {
 	reader := bytes.NewReader(data)
-
-	// Read Key length as int32
 	var keyLength int32
-	err := binary.Read(reader, binary.LittleEndian, &keyLength)
-	if err != nil {
-		return "", err
+	if err := binary.Read(reader, binary.LittleEndian, &keyLength); err != nil {
+		panic(err)
 	}
-
-	// Read Key bytes
 	keyBytes := make([]byte, keyLength)
-	err = binary.Read(reader, binary.LittleEndian, &keyBytes)
-	if err != nil {
-		return "", err
+	if err := binary.Read(reader, binary.LittleEndian, &keyBytes); err != nil {
+		panic(err)
 	}
-	return string(keyBytes), nil
+	return string(keyBytes)
+}
+
+// marshalPendingJob marshals j into a string.
+func marshalPendingJob(job *pendingJob) string {
+	var buf bytes.Buffer
+	if err := binary.Write(&buf, binary.LittleEndian, int32(len(job.Key))); err != nil {
+		panic(err)
+	}
+	if err := binary.Write(&buf, binary.LittleEndian, []byte(job.Key)); err != nil {
+		panic(err)
+	}
+	if err := binary.Write(&buf, binary.LittleEndian, job.CreatedAt); err != nil {
+		panic(err)
+	}
+	if err := binary.Write(&buf, binary.LittleEndian, job.Done); err != nil {
+		panic(err)
+	}
+	return buf.String()
+}
+
+// unmarshalPendingJob unmarshals a poolJob from a byte slice created by marshalPoolJob.
+func unmarshalPendingJob(s string) *pendingJob {
+	var job pendingJob
+	reader := bytes.NewReader([]byte(s))
+	var keyLength int32
+	if err := binary.Read(reader, binary.LittleEndian, &keyLength); err != nil {
+		panic(err)
+	}
+	keyBytes := make([]byte, keyLength)
+	if err := binary.Read(reader, binary.LittleEndian, &keyBytes); err != nil {
+		panic(err)
+	}
+	job.Key = string(keyBytes)
+	if err := binary.Read(reader, binary.LittleEndian, &job.CreatedAt); err != nil {
+		panic(err)
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &job.Done); err != nil {
+		panic(err)
+	}
+	return &job
 }

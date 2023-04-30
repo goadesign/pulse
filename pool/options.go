@@ -3,6 +3,7 @@ package pool
 import (
 	"time"
 
+	"github.com/google/uuid"
 	"goa.design/ponos/ponos"
 )
 
@@ -10,11 +11,19 @@ type (
 	// PoolOption is a worker creation option.
 	PoolOption func(*poolOption)
 
+	// WorkerOption is a worker creation option.
+	WorkerOption func(*workerOption)
+
 	poolOption struct {
 		workerTTL     time.Duration
 		leaseTTL      time.Duration
 		maxQueuedJobs int
 		logger        ponos.Logger
+	}
+
+	workerOption struct {
+		group          string
+		jobChannelSize int
 	}
 )
 
@@ -43,8 +52,8 @@ func WithMaxQueuedJobs(max int) PoolOption {
 	}
 }
 
-// WithErrorReporter sets the handler used to report temporary errors.
-func WithErrorReporter(logger ponos.Logger) PoolOption {
+// WithLogger sets the handler used to report temporary errors.
+func WithLogger(logger ponos.Logger) PoolOption {
 	return func(o *poolOption) {
 		o.logger = logger
 	}
@@ -56,6 +65,29 @@ func defaultPoolOptions() *poolOption {
 		workerTTL:     10 * time.Second,
 		leaseTTL:      5 * time.Second,
 		maxQueuedJobs: 1000,
-		logger:        &ponos.NilLogger{},
+		logger:        ponos.NoopLogger(),
+	}
+}
+
+// WithWorkerGroup sets the worker group.  Ponos generates a random group ID if
+// not set.
+func WithWorkerGroup(group string) WorkerOption {
+	return func(o *workerOption) {
+		o.group = group
+	}
+}
+
+// WithJobChannelSize sets the size of the job channel. The default is 100.
+func WithJobChannelSize(size int) WorkerOption {
+	return func(o *workerOption) {
+		o.jobChannelSize = size
+	}
+}
+
+// defaultWorkerOptions returns the default options.
+func defaultWorkerOptions() *workerOption {
+	return &workerOption{
+		group:          uuid.NewString(),
+		jobChannelSize: 100,
 	}
 }

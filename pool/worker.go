@@ -25,15 +25,16 @@ type (
 		// CreatedAt is the time the worker was created.
 		CreatedAt time.Time
 
-		stream       *streaming.Stream
-		reader       *streaming.Reader
-		c            chan *Job
-		done         chan struct{}
-		workersMap   *rmap.Map
-		keepAliveMap *rmap.Map
-		workerTTL    time.Duration
-		jobTTL       time.Duration
-		logger       ponos.Logger
+		jobsStream        *streaming.Stream
+		reader            *streaming.Reader
+		c                 chan *Job
+		done              chan struct{}
+		workersMap        *rmap.Map
+		keepAliveMap      *rmap.Map
+		workerShutdownMap *rmap.Map
+		workerTTL         time.Duration
+		jobTTL            time.Duration
+		logger            ponos.Logger
 
 		lock    sync.Mutex
 		stopped bool
@@ -62,30 +63,31 @@ func newWorker(ctx context.Context, p *WorkerPool, opts ...WorkerOption) (*Worke
 	if _, err := p.workersMap.Set(ctx, wid, strconv.FormatInt(createdAt.UnixNano(), 10)); err != nil {
 		return nil, fmt.Errorf("failed to add worker %q to pool %q: %w", wid, p.Name, err)
 	}
-	stream, err := streaming.NewStream(ctx, workerStreamName(wid), p.rdb)
+	jobsStream, err := streaming.NewStream(ctx, workerJobsStreamName(wid), p.rdb, streaming.WithLogger(p.logger))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create stream for worker %q: %w", wid, err)
+		return nil, fmt.Errorf("failed to create jobs stream for worker %q: %w", wid, err)
 	}
-	reader, err := stream.NewReader(ctx)
+	reader, err := jobsStream.NewReader(ctx, streaming.WithReaderBlockDuration(p.workerTTL), streaming.WithReaderMaxPolled(1))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create reader for worker %q: %w", wid, err)
 	}
 	w := &Worker{
-		ID:           wid,
-		Pool:         p,
-		C:            c,
-		CreatedAt:    time.Now(),
-		stream:       stream,
-		reader:       reader,
-		c:            c,
-		done:         make(chan struct{}),
-		workersMap:   p.workersMap,
-		keepAliveMap: p.keepAliveMap,
-		workerTTL:    p.workerTTL,
-		logger:       p.logger.WithPrefix("worker", wid),
+		ID:                wid,
+		Pool:              p,
+		C:                 c,
+		CreatedAt:         time.Now(),
+		jobsStream:        jobsStream,
+		reader:            reader,
+		c:                 c,
+		done:              make(chan struct{}),
+		workersMap:        p.workersMap,
+		keepAliveMap:      p.keepAliveMap,
+		workerShutdownMap: p.workerShutdownMap,
+		workerTTL:         p.workerTTL,
+		logger:            p.logger.WithPrefix("worker", wid),
 	}
 
-	go w.handleJobs()
+	go w.handleEvents()
 	go w.keepAlive()
 
 	return w, nil
@@ -105,21 +107,8 @@ func (w *Worker) Stop(ctx context.Context) error {
 	if _, err := w.keepAliveMap.Delete(ctx, w.ID); err != nil {
 		return fmt.Errorf("failed to remove worker %q from keep alive map: %w", w.ID, err)
 	}
-	// Requeue any jobs that were not processed.
 	w.reader.Stop()
-	for msg := range w.reader.C {
-		if msg.EventName == evJob {
-			job, err := unmarshalJob(msg.Payload)
-			if err != nil {
-				w.logger.Error(fmt.Errorf("failed to unmarshal job: %w", err))
-				continue
-			}
-			if err := w.Pool.routeJob(ctx, job.Key, job.Payload); err != nil {
-				w.logger.Error(fmt.Errorf("failed to requeue job: %w", err))
-			}
-		}
-	}
-	if err := w.stream.Destroy(ctx); err != nil {
+	if err := w.jobsStream.Destroy(ctx); err != nil {
 		return fmt.Errorf("failed to destroy stream for worker %q: %w", w.ID, err)
 	}
 	close(w.done)
@@ -127,26 +116,42 @@ func (w *Worker) Stop(ctx context.Context) error {
 	return nil
 }
 
-// handleJobs is the worker loop.
-func (w *Worker) handleJobs() {
+// handleEvents is the worker loop.
+func (w *Worker) handleEvents() {
 	ctx := context.Background()
 	for msg := range w.reader.C {
 		switch msg.EventName {
 		case evJob:
-			job, err := unmarshalJob(msg.Payload)
-			if err != nil {
-				w.logger.Error(fmt.Errorf("failed to unmarshal job: %w", err))
-				continue
-			}
+			job := unmarshalJob(msg.Payload)
 			if job.CreatedAt.Add(w.jobTTL).After(time.Now()) {
 				w.logger.Error(fmt.Errorf("job %s expired (created %s)", job.Key, job.CreatedAt.Round(time.Second)))
 				continue
 			}
 			w.c <- job
+			pendingJobs := w.Pool.pendingJobsMap.Map()
+			var pendingJobID string
+			var pendingJob *pendingJob
+			for id, pj := range pendingJobs {
+				upj := unmarshalPendingJob(pj)
+				if upj.Key == job.Key {
+					pendingJobID = id
+					pendingJob = upj
+					break
+				}
+			}
+			if pendingJobID == "" {
+				w.logger.Error(fmt.Errorf("job %s not found in pending jobs map", job.Key))
+				continue
+			}
+			pendingJob.Done = true
+			if _, err := w.Pool.pendingJobsMap.Set(ctx, pendingJobID, string(marshalPendingJob(pendingJob))); err != nil {
+				w.logger.Error(fmt.Errorf("failed to remove pending job %s: %w", job.Key, err))
+			}
 		case evStop:
 			if err := w.Stop(ctx); err != nil {
 				w.logger.Error(fmt.Errorf("failed to stop: %w", err))
 			}
+			w.workerShutdownMap.Set(ctx, w.ID, "true")
 		default:
 			w.logger.Error(fmt.Errorf("unexpected event %s", msg.EventName))
 		}
@@ -170,8 +175,8 @@ func (w *Worker) keepAlive() {
 	}
 }
 
-// workerStreamName returns the name of the stream used to communicate with the
+// workerJobsStreamName returns the name of the stream used to communicate with the
 // worker with the given ID.
-func workerStreamName(id string) string {
+func workerJobsStreamName(id string) string {
 	return "worker:" + id
 }

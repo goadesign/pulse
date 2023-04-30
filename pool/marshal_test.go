@@ -32,10 +32,8 @@ func TestMarshalJob(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			marshaled, err := marshalJob(&tc.job)
-			assert.NoError(t, err)
-			job, err := unmarshalJob(marshaled)
-			assert.NoError(t, err)
+			marshaled := marshalJob(&tc.job)
+			job := unmarshalJob(marshaled)
 
 			// Compare original and unmarshaled Job structs
 			assert.Equal(t, tc.job.Key, job.Key)
@@ -43,12 +41,11 @@ func TestMarshalJob(t *testing.T) {
 			assert.Equal(t, tc.job.CreatedAt, job.CreatedAt)
 
 			// Compare original and unmarshaled byte slices
-			marshaled2, _ := marshalJob(job)
+			marshaled2 := marshalJob(job)
 			assert.True(t, bytes.Equal(marshaled, marshaled2))
 
 			// Compare unmarshaled job key
-			key, err := unmarshalJobKey(marshaled)
-			assert.NoError(t, err)
+			key := unmarshalJobKey(marshaled)
 			assert.Equal(t, tc.job.Key, key)
 		})
 	}
@@ -86,6 +83,43 @@ func TestMarshalPoolWoker(t *testing.T) {
 			// Compare original and unmarshaled byte slices
 			marshaled2 := marshalWorker(worker)
 			assert.True(t, bytes.Equal(marshaled, marshaled2))
+		})
+	}
+}
+
+func TestMarshalPendingJob(t *testing.T) {
+	// Test cases
+	testCases := []struct {
+		name string
+		job  pendingJob
+	}{
+		{
+			name: "simple job",
+			job: pendingJob{
+				Key:       "foo",
+				CreatedAt: time.Date(2022, 1, 2, 0, 0, 0, 0, time.UTC).UnixNano(),
+			},
+		},
+		{
+			name: "done job",
+			job: pendingJob{
+				Key:       "foo",
+				CreatedAt: time.Date(2022, 1, 2, 0, 0, 0, 0, time.UTC).UnixNano(),
+				Done:      true,
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			marshaled := marshalPendingJob(&tc.job)
+			job := unmarshalPendingJob(marshaled)
+
+			// Compare original and unmarshaled poolJob structs
+			assert.Equal(t, tc.job.CreatedAt, job.CreatedAt)
+
+			// Compare original and unmarshaled byte slices
+			marshaled2 := marshalPendingJob(job)
+			assert.Equal(t, marshaled, marshaled2)
 		})
 	}
 }

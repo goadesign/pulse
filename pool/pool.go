@@ -2,7 +2,6 @@ package pool
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"hash"
 	"hash/crc64"
@@ -23,20 +22,22 @@ import (
 type (
 	// WorkerPool is a pool of workers.
 	WorkerPool struct {
-		Name          string
-		statusMap     *rmap.Map                    // status replicated map used to track pool status across all clients
-		keepAliveMap  *rmap.Map                    // worker keep-alive timestamps indexed by worker ID
-		workersMap    *rmap.Map                    // worker replicated map indexes worker group and creation time by worker ID
-		workerStreams map[string]*streaming.Stream // worker streams indexed by worker ID
-		jobStream     *streaming.Stream            // stream of jobs so we can requeue them if a worker dies
-		jobSink       *streaming.Sink              // reader for the job stream
-		workerTTL     time.Duration                // duration after which a worker is considered dead
-		leaseTTL      time.Duration                // duration after which a message lease expires
-		maxQueuedJobs int                          // maximum number of jobs that can be queued
-		logger        ponos.Logger
-		h             jumpHash
-		done          chan struct{} // closed when pool is stopped
-		rdb           *redis.Client
+		Name              string
+		keepAliveMap      *rmap.Map                    // worker keep-alive timestamps indexed by ID
+		workersMap        *rmap.Map                    // worker creation times by ID
+		pendingJobsMap    *rmap.Map                    // creation timestamp and status by pending job ID
+		workerShutdownMap *rmap.Map                    // map used to stop workers indexes worker status by ID
+		workerStreams     map[string]*streaming.Stream // worker streams indexed by ID
+		jobStream         *streaming.Stream            // stream of jobs so we can requeue them if a worker dies
+		jobSink           *streaming.Sink              // reader for the job stream
+		pendingJobs       map[string]*streaming.Event  // pending jobs indexed by unique ID
+		workerTTL         time.Duration                // duration after which a worker is considered dead
+		leaseTTL          time.Duration                // duration after which a message lease expires
+		maxQueuedJobs     int                          // maximum number of jobs that can be queued
+		logger            ponos.Logger
+		h                 jumpHash
+		done              chan struct{} // closed when pool is stopped
+		rdb               *redis.Client
 
 		lock    sync.Mutex
 		stopped bool // prevents new workers and new jobs from being created when true
@@ -47,6 +48,13 @@ type (
 		ID          uuid.UUID // worker ID
 		CreatedAt   int64     // worker creation time in nanoseconds
 		RefreshedAt int64     // worker last keep-alive time in nanoseconds
+	}
+
+	// pendingJob is the value stored in the pending jobs replicated map.
+	pendingJob struct {
+		Key       string // job key
+		CreatedAt int64  // job creation time in nanoseconds
+		Done      bool   // true if the job has been processed
 	}
 
 	// jumpHash implement Jump Consistent Hash.
@@ -68,54 +76,60 @@ const shutdownStatusKey = "sd"
 
 // Pool returns a client to the pool with the given name.
 func Pool(ctx context.Context, name string, rdb *redis.Client, opts ...PoolOption) (*WorkerPool, error) {
-	sm, err := rmap.Join(ctx, statusMapName(name), rdb)
-	if err != nil {
-		return nil, fmt.Errorf("failed to join pool status replicated map %q: %w", statusMapName(name), err)
-	}
-	// fail early if pool is stopped
-	if _, ok := sm.Get(shutdownStatusKey); ok {
-		return nil, fmt.Errorf("pool %q is stopped", name)
-	}
-	km, err := rmap.Join(ctx, keepAliveMapName(name), rdb)
-	if err != nil {
-		return nil, fmt.Errorf("failed to join pool keep-alive replicated map %q: %w", keepAliveMapName(name), err)
-	}
-	wm, err := rmap.Join(ctx, workerHashName(name), rdb)
-	if err != nil {
-		return nil, fmt.Errorf("failed to join pool workers replicated map %q: %w", workerHashName(name), err)
-	}
-	stream, err := streaming.NewStream(ctx, streamName(name), rdb)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create pool job stream %q: %w", streamName(name), err)
-	}
-	sink, err := stream.NewSink(ctx, "jobs")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create pool job sink %q: %w", streamName(name), err)
-	}
-
 	options := defaultPoolOptions()
 	for _, opt := range opts {
 		opt(options)
 	}
+	logger := options.logger
+	if logger == nil {
+		logger = ponos.NoopLogger()
+	}
+	km, err := rmap.Join(ctx, keepAliveMapName(name), rdb, rmap.WithLogger(logger))
+	if err != nil {
+		return nil, fmt.Errorf("failed to join pool keep-alive replicated map %q: %w", keepAliveMapName(name), err)
+	}
+	wm, err := rmap.Join(ctx, workersMapName(name), rdb, rmap.WithLogger(logger))
+	if err != nil {
+		return nil, fmt.Errorf("failed to join pool workers replicated map %q: %w", workersMapName(name), err)
+	}
+	wsm, err := rmap.Join(ctx, workerShutdownMapName(name), rdb, rmap.WithLogger(logger))
+	if err != nil {
+		return nil, fmt.Errorf("failed to join pool worker status replicated map %q: %w", workerShutdownMapName(name), err)
+	}
+	jm, err := rmap.Join(ctx, jobsMapName(name), rdb, rmap.WithLogger(logger))
+	if err != nil {
+		return nil, fmt.Errorf("failed to join pool jobs replicated map %q: %w", jobsMapName(name), err)
+	}
+	stream, err := streaming.NewStream(ctx, streamName(name), rdb, streaming.WithLogger(logger))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create pool job stream %q: %w", streamName(name), err)
+	}
+	sink, err := stream.NewSink(ctx, "jobs", streaming.WithSinkBlockDuration(time.Minute), streaming.WithSinkMaxPolled(1))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create pool job sink %q: %w", streamName(name), err)
+	}
+
 	p := &WorkerPool{
-		Name:          name,
-		statusMap:     sm,
-		keepAliveMap:  km,
-		workersMap:    wm,
-		workerStreams: make(map[string]*streaming.Stream),
-		jobStream:     stream,
-		jobSink:       sink,
-		workerTTL:     options.workerTTL,
-		leaseTTL:      options.leaseTTL,
-		maxQueuedJobs: options.maxQueuedJobs,
-		logger:        options.logger.WithPrefix("pool", name),
-		h:             jumpHash{crc64.New(crc64.MakeTable(crc64.ECMA))},
-		done:          make(chan struct{}),
-		rdb:           rdb,
+		Name:              name,
+		keepAliveMap:      km,
+		workersMap:        wm,
+		pendingJobsMap:    jm,
+		workerShutdownMap: wsm,
+		workerStreams:     make(map[string]*streaming.Stream),
+		jobStream:         stream,
+		jobSink:           sink,
+		pendingJobs:       make(map[string]*streaming.Event),
+		workerTTL:         options.workerTTL,
+		leaseTTL:          options.leaseTTL,
+		maxQueuedJobs:     options.maxQueuedJobs,
+		logger:            logger,
+		h:                 jumpHash{crc64.New(crc64.MakeTable(crc64.ECMA))},
+		done:              make(chan struct{}),
+		rdb:               rdb,
 	}
 
 	go p.routeJobs()
-	go p.handleShutdown()
+	go p.managePendingJobs()
 
 	return p, nil
 }
@@ -128,11 +142,14 @@ func (p *WorkerPool) NewWorker(ctx context.Context, opts ...WorkerOption) (*Work
 	if p.stopped {
 		return nil, fmt.Errorf("pool %q is stopped", p.Name)
 	}
+	if len(p.workerShutdownMap.Keys()) > 0 {
+		return nil, fmt.Errorf("pool %q is shutting down", p.Name)
+	}
 	w, err := newWorker(ctx, p, opts...)
 	if err != nil {
 		return nil, err
 	}
-	p.workerStreams[w.ID] = w.stream
+	p.workerStreams[w.ID] = w.jobsStream
 	return w, nil
 }
 
@@ -148,30 +165,24 @@ func (p *WorkerPool) DispatchJob(ctx context.Context, key string, payload []byte
 		Payload:   payload,
 		CreatedAt: time.Now(),
 	}
-	m, err := marshalJob(job)
-	if err != nil {
-		return fmt.Errorf("failed to marshal job: %w", err)
-	}
-	if err := p.jobStream.Add(ctx, evJob, m); err != nil {
+	if err := p.jobStream.Add(ctx, evJob, marshalJob(job)); err != nil {
 		return fmt.Errorf("failed to add job to stream %q: %w", p.jobStream.Name, err)
 	}
-
 	return nil
 }
 
-// Stop cancels all pending jobs and causes all workers to stop.  Stop
-// also prevents new workers from being created. It is safe to call Stop
-// multiple times.  Any job created by remote clients after Stop is called
-// is ignored. Once stopped a pool cannot be restarted.
-func (p *WorkerPool) Stop(ctx context.Context) error {
+// Stop causes all workers to stop once all pending jobs either complete or
+// expire.  It is safe to call Stop multiple times.  Any job created by remote
+// clients after Stop is called is ignored. Stop blocks until all workers have
+// stopped or wait duration has elapsed.
+func (p *WorkerPool) Stop(ctx context.Context, wait time.Duration) error {
 	p.lock.Lock()
-	defer p.lock.Unlock()
 	if p.stopped {
+		p.lock.Unlock()
 		return nil
 	}
-	if _, err := p.statusMap.Set(ctx, statusMapName(p.Name), "stop"); err != nil {
-		return fmt.Errorf("failed to set pool stop status: %w", err)
-	}
+	p.jobSink.Stop()
+	p.workerShutdownMap.Set(ctx, shutdownStatusKey, "true") // Prevent new workers from joining.
 	workers := p.workersMap.Map()
 	for id := range workers {
 		stream, err := p.workerStream(ctx, id)
@@ -185,27 +196,41 @@ func (p *WorkerPool) Stop(ctx context.Context) error {
 	}
 	close(p.done)
 	p.stopped = true
-	return nil
+	p.lock.Unlock()
+
+	defer p.cleanup(ctx)
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	for {
+		select {
+		case <-timer.C:
+			return fmt.Errorf("timed out waiting for workers to stop")
+		case <-p.workerShutdownMap.C:
+			if len(p.workersMap.Keys())+1 == len(p.workerShutdownMap.Keys()) {
+				return nil
+			}
+		case <-p.workersMap.C:
+			if len(p.workersMap.Keys())+1 == len(p.workerShutdownMap.Keys()) {
+				return nil
+			}
+		}
+	}
 }
 
 // routeJobs reads events from the pool job stream and routes them to the
 // appropriate worker.
 func (p *WorkerPool) routeJobs() {
 	ctx := context.Background()
-	for msg := range p.jobStream.C {
-		key, err := unmarshalJobKey(msg.Payload)
-		if err != nil {
-			p.logger.Error(fmt.Errorf("failed to unmarshal job: %w", err))
-			continue
-		}
-		if err := p.routeJob(ctx, key, msg.Payload); err != nil {
-			p.logger.Error(fmt.Errorf("failed to add job: %w", err))
+	for ev := range p.jobSink.C {
+		p.logger.Debug("routing job", "event", ev.ID)
+		if err := p.routeJob(ctx, ev); err != nil {
+			p.logger.Error(fmt.Errorf("failed to route job: %w", err))
 		}
 	}
 }
 
-// routeJob routes a dispatched job to the proper worker.
-func (p *WorkerPool) routeJob(ctx context.Context, key string, payload []byte) error {
+// routeJob routes a dispatched job to the proper worker. It records the job status as routed.
+func (p *WorkerPool) routeJob(ctx context.Context, ev *streaming.Event) error {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 	if p.stopped {
@@ -254,6 +279,13 @@ func (p *WorkerPool) routeJob(ctx context.Context, key string, payload []byte) e
 	if len(activeIDs) == 0 {
 		return fmt.Errorf("no active worker in pool %q", p.Name)
 	}
+	// Record the job status in the jobs replicated map.
+	key := unmarshalJobKey(ev.Payload)
+	jid := uuid.NewString()
+	pjob := pendingJob{Key: key, CreatedAt: time.Now().UnixNano()}
+	if _, err := p.pendingJobsMap.Set(ctx, jid, marshalPendingJob(&pjob)); err != nil {
+		return fmt.Errorf("failed to set job %q in jobs map: %w", key, err)
+	}
 
 	// Finally, stream the job to the worker group corresponding to the key hash.
 	wid := activeIDs[p.h.Hash(key, int64(len(activeIDs)))]
@@ -261,61 +293,87 @@ func (p *WorkerPool) routeJob(ctx context.Context, key string, payload []byte) e
 	if err != nil {
 		return err
 	}
-	if err := stream.Add(ctx, evJob, payload); err != nil {
-		return fmt.Errorf("failed to add job to worker stream %q: %w", workerStreamName(wid), err)
+	if err := stream.Add(ctx, evJob, ev.Payload); err != nil {
+		return fmt.Errorf("failed to add job to worker stream %q: %w", workerJobsStreamName(wid), err)
 	}
+	p.pendingJobs[jid] = ev
 
 	return nil
 }
 
-// Handle remove pool shutdown request.
-func (p *WorkerPool) handleShutdown() {
-	ticker := time.NewTicker(time.Second)
+// managePendingJobs checks the entries in the pending jobs replicated map and
+// acks jobs the pool created that are done, it then removes the job from the
+// map.  Note: if a job is assigned to a worker that never processes it then the
+// job stream will redeliver the job to the pool. The pool will then route the
+// job to another worker. This is why we don't need to explicitely delete jobs
+// from the pending jobs map after some time.
+func (p *WorkerPool) managePendingJobs() {
+	ticker := time.NewTicker(p.leaseTTL / 2)
 	defer ticker.Stop()
 	for {
 		select {
+		case <-p.pendingJobsMap.C:
+			p.ackDoneJobs()
+		case <-ticker.C:
+			p.rerouteStaleJobs()
 		case <-p.done:
 			return
-		case <-ticker.C:
-			if _, ok := p.statusMap.Get(shutdownStatusKey); ok {
-				if err := p.Stop(context.Background()); err != nil {
-					p.logger.Error(fmt.Errorf("failed to shutdown pool: %w", err))
+		}
+	}
+}
+
+// ackDoneJobs acks jobs that are done and removes them from the pending jobs map.
+func (p *WorkerPool) ackDoneJobs() {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	pending := p.pendingJobsMap.Map()
+	for id, job := range p.pendingJobs {
+		if pj, ok := pending[id]; ok {
+			pjob := unmarshalPendingJob(pj)
+			if pjob.Done {
+				if err := p.jobSink.Ack(context.Background(), job); err != nil {
+					p.logger.Error(fmt.Errorf("failed to ack job %q: %w", id, err))
 				}
-				return
+				delete(p.pendingJobs, id)
+				if _, err := p.pendingJobsMap.Delete(context.Background(), id); err != nil {
+					p.logger.Error(fmt.Errorf("failed to delete pending job %q from pending jobs map: %w", id, err))
+				}
 			}
 		}
+	}
+}
+
+// rerouteStaleJobs reroutes jobs that have been pending for more than leaseTTL using the Redis XAUTOCLAIM command.
+func (p *WorkerPool) rerouteStaleJobs() {
+	args := redis.XAutoClaimArgs{
+		Stream:   p.jobStream.Name,
+		Group:    p.jobSink.Name,
+		Consumer: p.Name,
+		MinIdle:  p.leaseTTL,
+		Start:    "0-0",
+	}
+	if err := p.rdb.XAutoClaim(context.Background(), &args).Err(); err != nil {
+		p.logger.Error(fmt.Errorf("failed to reroute stale jobs: %w", err))
 	}
 }
 
 // deleteWorker removes a worker from the pool deleting the worker stream.
 func (p *WorkerPool) deleteWorker(ctx context.Context, id string) error {
+	fmt.Println("deleting worker", id)
+	defer fmt.Println("deleted worker", id)
 	if _, err := p.keepAliveMap.Delete(ctx, id); err != nil {
 		p.logger.Error(fmt.Errorf("failed to delete worker %q from keep-alive map: %w", id, err))
 	}
+	fmt.Println("deleting worker", id)
 	if _, err := p.workersMap.Delete(ctx, id); err != nil {
 		p.logger.Error(fmt.Errorf("failed to delete worker %q from workers map: %w", id, err))
 	}
+	fmt.Println("deleting stream", id)
 	stream, err := p.workerStream(ctx, id)
 	if err != nil {
 		return err
 	}
-	// re-assign any queued jobs to other workers.
-	sink, err := stream.NewSink(ctx, "sink")
-	if err != nil {
-		p.logger.Error(fmt.Errorf("failed to re-assign jobs for worker %q: %w", id, err))
-	}
-	for msg := range sink.C {
-		if msg.EventName == evJob {
-			job := &Job{}
-			if err := json.Unmarshal(msg.Payload, job); err != nil {
-				p.logger.Error(fmt.Errorf("failed to unmarshal job: %w", err))
-				continue
-			}
-			if err := p.routeJob(ctx, job.Key, job.Payload); err != nil {
-				p.logger.Error(fmt.Errorf("failed to re-assign job: %w", err))
-			}
-		}
-	}
+	fmt.Println("destroying stream", id)
 	if err := stream.Destroy(ctx); err != nil {
 		p.logger.Error(fmt.Errorf("failed to delete worker stream: %w", err))
 	}
@@ -323,13 +381,11 @@ func (p *WorkerPool) deleteWorker(ctx context.Context, id string) error {
 }
 
 // workerStream retrieves the stream for a worker. It caches the result in the
-// workerStreams map.
+// workerStreams map. Caller is responsible for locking.
 func (p *WorkerPool) workerStream(ctx context.Context, id string) (*streaming.Stream, error) {
-	p.lock.Lock()
-	defer p.lock.Unlock()
 	stream, ok := p.workerStreams[id]
 	if !ok {
-		s, err := streaming.NewStream(ctx, workerStreamName(id), p.rdb)
+		s, err := streaming.NewStream(ctx, workerJobsStreamName(id), p.rdb, streaming.WithLogger(p.logger))
 		if err != nil {
 			return nil, fmt.Errorf("failed to retrieve stream for worker %q: %w", id, err)
 		}
@@ -337,6 +393,25 @@ func (p *WorkerPool) workerStream(ctx context.Context, id string) (*streaming.St
 		stream = s
 	}
 	return stream, nil
+}
+
+// cleanup deletes the pool replicated maps and the worker streams.
+func (p *WorkerPool) cleanup(ctx context.Context) {
+	if err := p.keepAliveMap.Reset(ctx); err != nil {
+		p.logger.Error(fmt.Errorf("failed to reset keep-alive map: %w", err))
+	}
+	if err := p.workersMap.Reset(ctx); err != nil {
+		p.logger.Error(fmt.Errorf("failed to reset workers map: %w", err))
+	}
+	if err := p.pendingJobsMap.Reset(ctx); err != nil {
+		p.logger.Error(fmt.Errorf("failed to reset pending jobs map: %w", err))
+	}
+	if err := p.workerShutdownMap.Reset(ctx); err != nil {
+		p.logger.Error(fmt.Errorf("failed to reset worker shutdown map: %w", err))
+	}
+	if err := p.jobStream.Destroy(ctx); err != nil {
+		p.logger.Error(fmt.Errorf("failed to destroy job stream: %w", err))
+	}
 }
 
 // Jump Consistent Hashing, see https://arxiv.org/ftp/arxiv/papers/1406/1406.2294.pdf
@@ -356,24 +431,31 @@ func (jh jumpHash) Hash(key string, numBuckets int64) int64 {
 	return b
 }
 
-// statusMapName returns the name of the key used to store the pool status.
-func statusMapName(pool string) string {
-	return fmt.Sprintf("ponos:pool:status:%s", pool)
-}
-
-// keepAliveMapName returns the name of the key used to store the worker keep-alive
-// timestamps.
+// keepAliveMapName returns the name of the replicated map used to store the
+// worker keep-alive timestamps.
 func keepAliveMapName(pool string) string {
 	return fmt.Sprintf("ponos:pool:keepalive:%s", pool)
 }
 
-// workerHashName returns the name of the hash used to store the worker creation
-// timestamps.
-func workerHashName(pool string) string {
+// workersMapName returns the name of the replicated map used to store the
+// worker creation timestamps.
+func workersMapName(pool string) string {
 	return fmt.Sprintf("ponos:pool:workers:%s", pool)
 }
 
-// streamName returns the name of the stream used to store jobs.
+// workerShutdownMapName returns the name of the replicated map used to store the
+// worker status.
+func workerShutdownMapName(pool string) string {
+	return fmt.Sprintf("ponos:pool:workers:shutdown:%s", pool)
+}
+
+// jobsMapName returns the name of the replicated map used to store the job
+// creation timestamps.
+func jobsMapName(pool string) string {
+	return fmt.Sprintf("ponos:pool:jobs:%s", pool)
+}
+
+// streamName returns the name of the stream used to dispatch jobs.
 func streamName(pool string) string {
 	return fmt.Sprintf("ponos:pool:stream:%s", pool)
 }

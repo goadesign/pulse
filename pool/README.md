@@ -80,7 +80,7 @@ func fib(n uint64) uint64 {
 }
 ```
 
-`client.go`
+`producer.go`
 
 ```go
 package main
@@ -126,3 +126,87 @@ created which periodically ensures that all tenants have a dedicated job (and
 removes any stale job) for eventual consistency.
 
 See the background job example for more details.
+
+## Data Flows
+
+The following diagram illustrates the data flow involved in adding a new job to
+a Ponos worker pool:
+* The producer calls `DispatchJob` which adds an event to the pool job stream.
+* The pool job stream is read by the pool sink which creates an entry in the
+   pending jobs map and adds the job to the dedicated worker stream.
+* The dedicated worker stream is read by the worker which adds the job to its
+  channel.
+* The worker user code reads the job from its channel and processes it.
+* The worker marks the job as completed in the pending jobs map.
+* The pool sink gets notified of the completed job, acks the job from the
+  pool job stream and removes it from the pending jobs map.
+
+
+```mermaid
+%%{ init: { 'flowchart': { 'curve': 'monotoneX' } } }%%
+%%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
+flowchart LR
+    subgraph p[Producer Process]
+        pr[User code] --1. DispatchJob--> po[Pool]
+        ps
+    end
+    subgraph w[Worker Process]
+        r[Reader] --7. Add Job--> c[[Worker Channel]]
+        c -.Job.-> u[User code]
+    end
+    subgraph rdb[Redis]
+        r --8. Mark Job Complete--> pj
+        pj -.9. Notify.-> ps
+        ps --11. Delete Pending Job--> pj
+        po --2. Add Job--> js([Pool Job Stream])
+        ps --10. Ack Job--> js
+        js -.3. Job.-> ps[Pool Sink]
+        ps --4. Set Pending Job--> pj[(Pending Jobs <br/> Replicated Map)]
+        ps --5. Add Job--> ws(["Worker Stream (dedicated)"])
+        ws -.6. Job.-> r
+    end
+    
+    classDef userCode fill:#9A6D1F, stroke:#D9B871, stroke-width:2px, color:#FFF2CC;
+    classDef producer fill:#2C5A9A, stroke:#6B96C1, stroke-width:2px, color:#CCE0FF;
+    classDef ponos fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
+    classDef background fill:#7A7A7A, color:#F2F2F2;
+
+    class pr,u userCode;
+    class pj,js,ws ponos;
+    class po,ps,r,c producer;
+    class p,w,rdb background; 
+
+    linkStyle 0 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 1 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 2 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 3 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 4 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 5 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 6 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 7 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 8 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 9 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 10 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 11 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+```
+
+The worker pool uses a job stream so that jobs that do not get acknowledged in time
+are automatically re-queued. This is useful in case of worker failure or
+network partitioning. The pool sink applies the consistent hashing algorithm
+to the job key to determine which worker stream the job should be added to. This
+ensures that unhealthy workers are properly ignored when requeuing jobs.
+
+## Failure Modes And Recovery
+
+### Worker Failure
+
+When a worker fails, the jobs it was processing are re-assigned to other
+workers. The worker will automatically reconnect to the pool and resume
+processing jobs.
+
+### Redis Failure
+
+When Redis fails, the worker pool will automatically reconnect to Redis and
+resume processing jobs.
+
+
