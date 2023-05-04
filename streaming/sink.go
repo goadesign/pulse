@@ -16,9 +16,11 @@ import (
 	"goa.design/ponos/rmap"
 )
 
-const (
+var (
 	// maxJitterMs is the maximum retry backoff jitter in milliseconds.
 	maxJitterMs = 5000
+	// checkStalePeriod is the period at which stale sinks are checked.
+	checkStalePeriod = 500 * time.Millisecond
 )
 
 type (
@@ -32,6 +34,8 @@ type (
 		stopped bool
 		// consumer is the sink consumer name.
 		consumer string
+		// staleLockKeyName is the stale check lock key name.
+		staleLockKeyName string
 		// startID is the sink start event ID.
 		startID string
 		// noAck is true if there is no need to acknowledge events.
@@ -113,6 +117,9 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...SinkOptio
 	if _, err := cm.AppendValues(ctx, name, consumer); err != nil {
 		return nil, fmt.Errorf("failed to append store consumer %s for sink %s: %w", consumer, name, err)
 	}
+	if _, err := km.Set(ctx, consumer, strconv.FormatInt(time.Now().Unix(), 10)); err != nil {
+		return nil, fmt.Errorf("failed to update sink keep-alive: %v", err)
+	}
 
 	// Create the consumer group, ignore error if it already exists.
 	if err := stream.rdb.XGroupCreateMkStream(ctx, stream.key, name, options.LastEventID).Err(); err != nil && !isBusyGroupErr(err) {
@@ -127,6 +134,7 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...SinkOptio
 		Name:                  name,
 		C:                     c,
 		consumer:              consumer,
+		staleLockKeyName:      fmt.Sprintf("ponos:sink:%s:stalelock", name),
 		startID:               options.LastEventID,
 		noAck:                 options.NoAck,
 		streams:               []*Stream{stream},
@@ -140,7 +148,7 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...SinkOptio
 		consumersMap:          map[string]*rmap.Map{stream.Name: cm},
 		consumersKeepAliveMap: km,
 		ackGracePeriod:        options.AckGracePeriod,
-		logger:                stream.rootLogger.WithPrefix("sink", name),
+		logger:                stream.rootLogger.WithPrefix("sink", name, "consumer", consumer),
 		rdb:                   stream.rdb,
 	}
 
@@ -152,7 +160,7 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...SinkOptio
 
 // Ack acknowledges the event.
 func (s *Sink) Ack(ctx context.Context, e *Event) error {
-	err := e.rdb.XAck(ctx, e.StreamName, e.SinkName, e.ID).Err()
+	err := e.rdb.XAck(ctx, e.streamKey, e.SinkName, e.ID).Err()
 	if err != nil {
 		s.logger.Error(err, "ack", e.ID, "stream", e.StreamName)
 		return err
@@ -267,66 +275,73 @@ func (s *Sink) Stopped() bool {
 
 // read reads events from the streams and sends them to the sink channel.
 func (s *Sink) read() {
+	ctx := context.Background()
 	defer s.wait.Done()
-	defer s.cleanup()
+	defer close(s.c)
+	defer s.removeConsumer(ctx, s.consumer)
 	for {
-		events, err := readOnce(
-			context.Background(),
-			func(ctx context.Context) ([]redis.XStream, error) {
-				s.lock.Lock()
-				readStreams := make([]string, len(s.streamCursors))
-				copy(readStreams, s.streamCursors)
-				s.lock.Unlock()
-				s.logger.Debug("reading", "streams", readStreams, "max", s.maxPolled, "block", s.blockDuration)
-				return s.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
-					Group:    s.Name,
-					Consumer: s.consumer,
-					Streams:  readStreams,
-					Count:    s.maxPolled,
-					Block:    s.blockDuration,
-					NoAck:    s.noAck,
-				}).Result()
-			},
-			s.streamschan,
-			s.donechan,
-			s.logger)
+		streamsEvents, err := readOnce(ctx, s.readGroup, s.streamschan, s.donechan, s.logger)
 		if s.isStopping() {
 			return
 		}
 		if err != nil {
-			handleReadEvent(err, s.logger)
+			handleReadError(err, s.logger)
 			continue
 		}
-		var evs []*Event
-		for _, streamEvents := range events {
-			evs = append(evs, s.convertMessages(streamEvents.Stream[len(streamKeyPrefix):], streamEvents.Messages)...)
-		}
+
 		s.lock.Lock()
-		for _, ev := range evs {
-			s.c <- ev
+		for _, events := range streamsEvents {
+			streamName := events.Stream[len(streamKeyPrefix):]
+			streamEvents(streamName, events.Stream, s.Name, events.Messages, s.eventMatcher, s.c, s.rdb, s.logger)
 		}
 		s.lock.Unlock()
 	}
 }
 
-// manageStaleMessages leverages the consumers keep-alive map to detect when a
-// consumer is no longer active and claim its messages.
+// manageStaleMessages does 3 things:
+//
+//  1. It refreshes this consumer keep-alive every half ack grace period
+//  2. It claims any stale message every check stale period (a stale message is
+//     one that has been read but not acked for more than the ack grace period)
+//  3. It leverages the consumers keep-alive map to detect when a consumer is
+//     no longer active and removes it from the consumer group.
 func (s *Sink) manageStaleMessages() {
 	defer s.wait.Done()
 	ctx := context.Background()
-	ticker := time.NewTicker(s.ackGracePeriod / 2)
-	defer ticker.Stop()
+	keepAliveTicker := time.NewTicker(s.ackGracePeriod / 2)
+	checkStaleTicker := time.NewTicker(checkStalePeriod)
+	defer keepAliveTicker.Stop()
+	defer checkStaleTicker.Stop()
 	ackSeconds := int64(s.ackGracePeriod.Seconds())
 	for {
 		select {
-		case <-ticker.C:
+		case <-keepAliveTicker.C:
 			// Update this consumer keep-alive
-			if _, err := s.consumersKeepAliveMap.Set(ctx, s.consumer, strconv.FormatInt(time.Now().Unix(), 10)); err != nil {
+			t := strconv.FormatInt(time.Now().Unix(), 10)
+			if _, err := s.consumersKeepAliveMap.Set(ctx, s.consumer, t); err != nil {
 				s.logger.Error(fmt.Errorf("failed to update sink keep-alive: %v", err))
 			}
-			// Check for stale consumers
+
+		case <-checkStaleTicker.C:
+			// Check for stale messages and consumers.  All the
+			// consumers run the stale check loop but the check only
+			// needs to happen once every 250ms-500ms.  A simple
+			// redis key is used to lock the check.
+			acquired, err := s.rdb.SetNX(ctx, "stale-check-lock", "1", checkStalePeriod).Result()
+			if err != nil {
+				s.logger.Error(fmt.Errorf("failed to acquire stale check lock: %v", err))
+				continue
+			}
+			if !acquired {
+				continue
+			}
 			consumers := s.consumersKeepAliveMap.Map()
 			for consumer, lastKeepAlive := range consumers {
+				// 1. Claim stale messages
+				if err := s.claimStaleMessages(ctx, consumer); err != nil {
+					s.logger.Error(fmt.Errorf("failed to claim stale messages: %v", err))
+				}
+				// 2. Remove stale consumers
 				if consumer == s.consumer {
 					continue
 				}
@@ -335,13 +350,16 @@ func (s *Sink) manageStaleMessages() {
 					s.logger.Error(fmt.Errorf("failed to parse sink keep-alive: %v", err))
 					continue
 				}
-				if time.Now().Unix()-lastKeepAliveTime > ackSeconds {
-					// Consumer is stale, claim its messages
-					if err := s.claimStaleMessages(ctx, consumer); err != nil {
-						s.logger.Error(fmt.Errorf("failed to claim stale messages: %v", err))
-					}
+				// We consider a consumer stale if it has not sent a keep-alive
+				// for more than twice the ackGracePeriod. This is to avoid
+				// removing a consumer that still owns messages in the PEL.
+				if time.Now().Unix()-lastKeepAliveTime > 2*ackSeconds {
+					// Consumer is stale, remove it
+					s.logger.Info("removing stale consumer", "consumer", consumer)
+					s.removeConsumer(ctx, consumer)
 				}
 			}
+
 		case <-s.donechan:
 			return
 		}
@@ -361,43 +379,46 @@ func (s *Sink) claimStaleMessages(ctx context.Context, consumer string) error {
 			Start:    "0-0",
 			Consumer: consumer,
 		}
-		messages, _, err := s.rdb.XAutoClaim(ctx, &args).Result()
+		start, err := s.claim(ctx, stream.Name, args)
 		if err != nil {
 			return fmt.Errorf("failed to claim stale messages for stream %s: %w", stream.Name, err)
 		}
-		events := s.convertMessages(stream.Name, messages)
-		for _, e := range events {
-			s.c <- e
+		for start != "0-0" {
+			args.Start = start
+			start, err = s.claim(ctx, stream.Name, args)
+			if err != nil {
+				return fmt.Errorf("failed to claim stale messages for stream %s: %w", stream.Name, err)
+			}
 		}
 	}
 	return nil
 }
 
-// convertMessages converts the Redis messages to AckedEvents.
-func (s *Sink) convertMessages(streamName string, msgs []redis.XMessage) []*Event {
-	var evs []*Event
-	for _, event := range msgs {
-		var topic string
-		if t, ok := event.Values["topic"]; ok {
-			topic = t.(string)
-		}
-		ev := newEvent(
-			s.rdb,
-			streamName,
-			s.Name,
-			event.ID,
-			event.Values[nameKey].(string),
-			topic,
-			[]byte(event.Values[payloadKey].(string)),
-		)
-		if s.eventMatcher != nil && !s.eventMatcher(ev) {
-			s.logger.Debug("event did not match event matcher", "stream", streamName, "event", ev.ID)
-			continue
-		}
-		s.logger.Debug("event received", "stream", streamName, "event", ev.ID)
-		evs = append(evs, ev)
+// Helper function to claim messages from a stream used by claimStaleMessages.
+func (s *Sink) claim(ctx context.Context, streamName string, args redis.XAutoClaimArgs) (string, error) {
+	messages, start, err := s.rdb.XAutoClaim(ctx, &args).Result()
+	if len(messages) > 0 {
+		s.logger.Info("stale messages", "stale-consumer", args.Consumer, "count", len(messages))
+		streamEvents(streamName, args.Stream, s.Name, messages, s.eventMatcher, s.c, s.rdb, s.logger)
 	}
-	return evs
+	return start, err
+}
+
+// readGroup reads events from the streams using the sink consumer group.
+func (s *Sink) readGroup(ctx context.Context) ([]redis.XStream, error) {
+	s.lock.Lock()
+	readStreams := make([]string, len(s.streamCursors))
+	copy(readStreams, s.streamCursors)
+	s.lock.Unlock()
+	s.logger.Debug("reading", "streams", readStreams, "max", s.maxPolled, "block", s.blockDuration)
+	return s.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group:    s.Name,
+		Consumer: s.consumer,
+		Streams:  readStreams,
+		Count:    s.maxPolled,
+		Block:    s.blockDuration,
+		NoAck:    s.noAck,
+	}).Result()
 }
 
 // notifyStreamChange notifies the reader that the streams have changed.
@@ -408,18 +429,17 @@ func (s *Sink) notifyStreamChange() {
 	}
 }
 
-// cleanup removes the consumer from the consumer groups and removes the sink
-// from the sinks map. This method is called automatically when the sink is
+// removeConsumer removes the consumer from the consumer groups and removes the
+// sink from the sinks map. This method is called automatically when the sink is
 // stopped.
-func (s *Sink) cleanup() {
+func (s *Sink) removeConsumer(ctx context.Context, consumer string) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	ctx := context.Background()
 	for _, stream := range s.streams {
-		if err := s.rdb.XGroupDelConsumer(ctx, stream.key, s.Name, s.consumer).Err(); err != nil {
+		if err := s.rdb.XGroupDelConsumer(ctx, stream.key, s.Name, consumer).Err(); err != nil {
 			s.logger.Error(fmt.Errorf("failed to delete Redis consumer: %w", err), "stream", stream.Name)
 		}
-		remains, err := s.consumersMap[stream.Name].RemoveValues(ctx, s.Name, s.consumer)
+		remains, err := s.consumersMap[stream.Name].RemoveValues(ctx, s.Name, consumer)
 		if err != nil {
 			s.logger.Error(fmt.Errorf("failed to remove consumer from consumer map: %w", err), "stream", stream.Name)
 		}
@@ -429,7 +449,9 @@ func (s *Sink) cleanup() {
 			}
 		}
 	}
-	close(s.c)
+	if _, err := s.consumersKeepAliveMap.Delete(ctx, consumer); err != nil {
+		s.logger.Error(fmt.Errorf("failed to remove consumer from keep-alive map: %w", err))
+	}
 }
 
 func (s *Sink) deleteConsumerGroup(ctx context.Context, stream *Stream) error {

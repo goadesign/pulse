@@ -63,7 +63,7 @@ func newWorker(ctx context.Context, p *WorkerPool, opts ...WorkerOption) (*Worke
 	if _, err := p.workersMap.Set(ctx, wid, strconv.FormatInt(createdAt.UnixNano(), 10)); err != nil {
 		return nil, fmt.Errorf("failed to add worker %q to pool %q: %w", wid, p.Name, err)
 	}
-	jobsStream, err := streaming.NewStream(ctx, workerJobsStreamName(wid), p.rdb, streaming.WithLogger(p.logger))
+	jobsStream, err := streaming.NewStream(ctx, workerJobsStreamName(wid), p.rdb, streaming.WithStreamLogger(p.logger))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create jobs stream for worker %q: %w", wid, err)
 	}

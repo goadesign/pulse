@@ -14,7 +14,7 @@ import (
 func TestNewReader(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	ctx = testContext(t)
-	s, err := NewStream(ctx, "testNewReader", rdb, WithLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(ctx, "testNewReader", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	reader, err := s.NewReader(ctx)
 	assert.NoError(t, err)
@@ -25,7 +25,7 @@ func TestNewReader(t *testing.T) {
 func TestReaderReadOnce(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	ctx = testContext(t)
-	s, err := NewStream(ctx, "testReadOnce", rdb, WithLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(ctx, "testReadOnce", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	reader, err := s.NewReader(ctx, WithReaderStartAtOldest(), WithReaderBlockDuration(testBlockDuration))
 	require.NoError(t, err)
@@ -41,7 +41,7 @@ func TestReaderReadOnce(t *testing.T) {
 func TestReaderReadSinceLastEvent(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	ctx = testContext(t)
-	s, err := NewStream(ctx, "testReadSinceLastEvent", rdb, WithLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(ctx, "testReadSinceLastEvent", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 
 	// Add and read 2 events consecutively
@@ -61,7 +61,7 @@ func TestReaderReadSinceLastEvent(t *testing.T) {
 	assert.Equal(t, []byte("payload2"), read.Payload)
 
 	// Create new reader with last event ID set to first event and read last event
-	reader2, err := s.NewReader(ctx, WithReaderLastEventID(eventID), WithReaderBlockDuration(testBlockDuration))
+	reader2, err := s.NewReader(ctx, WithReaderStartAfter(eventID), WithReaderBlockDuration(testBlockDuration))
 	require.NoError(t, err)
 	defer reader2.Stop()
 	read = readOneReaderEvent(t, reader2)
@@ -69,7 +69,7 @@ func TestReaderReadSinceLastEvent(t *testing.T) {
 	assert.Equal(t, []byte("payload2"), read.Payload)
 
 	// Create new reader with last event ID set to 0 and read the 2 events
-	reader3, err := s.NewReader(ctx, WithReaderLastEventID("0"), WithReaderBlockDuration(testBlockDuration))
+	reader3, err := s.NewReader(ctx, WithReaderStartAfter("0"), WithReaderBlockDuration(testBlockDuration))
 	require.NoError(t, err)
 	defer reader3.Stop()
 	read = readOneReaderEvent(t, reader3)
@@ -83,7 +83,7 @@ func TestReaderReadSinceLastEvent(t *testing.T) {
 func TestCleanupReader(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	ctx = testContext(t)
-	s, err := NewStream(ctx, "testCleanupReader", rdb, WithLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(ctx, "testCleanupReader", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	reader, err := s.NewReader(ctx, WithReaderStartAtOldest(), WithReaderBlockDuration(testBlockDuration))
 	require.NoError(t, err)
@@ -106,11 +106,11 @@ func TestCleanupReader(t *testing.T) {
 func TestAddReaderStream(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	ctx = testContext(t)
-	s, err := NewStream(ctx, "testAddStream", rdb, WithLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(ctx, "testAddStream", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	reader, err := s.NewReader(ctx, WithReaderStartAtOldest(), WithReaderBlockDuration(testBlockDuration))
 	require.NoError(t, err)
-	s2, err := NewStream(ctx, "testAddStream2", rdb, WithLogger(ponos.ClueLogger(ctx)))
+	s2, err := NewStream(ctx, "testAddStream2", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	assert.NoError(t, reader.AddStream(ctx, s2))
 	assert.NoError(t, reader.AddStream(ctx, s2)) // Make sure it's idempotent
@@ -135,9 +135,9 @@ func TestAddReaderStream(t *testing.T) {
 func TestRemoveReaderStream(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	ctx = testContext(t)
-	s, err := NewStream(ctx, "testRemoveStream", rdb, WithLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(ctx, "testRemoveStream", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
-	s2, err := NewStream(ctx, "testRemoveStream2", rdb, WithLogger(ponos.ClueLogger(ctx)))
+	s2, err := NewStream(ctx, "testRemoveStream2", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	reader, err := s.NewReader(ctx, WithReaderStartAtOldest(), WithReaderBlockDuration(testBlockDuration))
 	require.NoError(t, err)

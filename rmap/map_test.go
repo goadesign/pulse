@@ -93,6 +93,7 @@ func TestMapLocal(t *testing.T) {
 	// Check that the values are eventually available
 	require.Eventually(t, func() bool { return len(m.Map()) == 3 }, wf, tck)
 	require.Len(t, m.Keys(), 3)
+	assert.Len(t, m.Keys(), 3)
 	for i, k := range keys {
 		assert.Equal(t, vals[i], m.Map()[k])
 		v, ok := m.Get(k)
@@ -108,6 +109,7 @@ func TestMapLocal(t *testing.T) {
 	// Check that the value is eventually no longer available
 	assert.Eventually(t, func() bool { return len(m.Map()) == 2 }, wf, tck)
 	assert.Len(t, m.Keys(), 2)
+	assert.Equal(t, m.Len(), 2)
 	v, ok = m.Get(keys[0])
 	assert.False(t, ok)
 	assert.Empty(t, v)
@@ -139,7 +141,7 @@ func TestMapLocal(t *testing.T) {
 	assert.Eventually(t, func() bool { return m.stopped }, wf, tck)
 
 	// Check that we can still read the map after it has been closed.
-	assert.Len(t, m.Map(), 1)
+	assert.Equal(t, m.Len(), 1)
 	assert.Equal(t, val, m.Map()[key])
 	require.Len(t, m.Keys(), 1)
 	assert.Equal(t, key, m.Keys()[0])

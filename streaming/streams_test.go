@@ -42,7 +42,7 @@ func TestDestroy(t *testing.T) {
 }
 
 func TestOptions(t *testing.T) {
-	s, err := NewStream(ctx, "testOptions", nil, WithMaxLen(10), WithLogger(nil))
+	s, err := NewStream(ctx, "testOptions", nil, WithStreamMaxLen(10), WithStreamLogger(nil))
 	assert.NoError(t, err)
 	assert.Equal(t, 10, s.MaxLen)
 	assert.Equal(t, ponos.NoopLogger(), s.logger)

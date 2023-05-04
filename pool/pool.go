@@ -100,7 +100,7 @@ func Pool(ctx context.Context, name string, rdb *redis.Client, opts ...PoolOptio
 	if err != nil {
 		return nil, fmt.Errorf("failed to join pool jobs replicated map %q: %w", jobsMapName(name), err)
 	}
-	stream, err := streaming.NewStream(ctx, streamName(name), rdb, streaming.WithLogger(logger))
+	stream, err := streaming.NewStream(ctx, streamName(name), rdb, streaming.WithStreamLogger(logger))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create pool job stream %q: %w", streamName(name), err)
 	}
@@ -165,7 +165,7 @@ func (p *WorkerPool) DispatchJob(ctx context.Context, key string, payload []byte
 		Payload:   payload,
 		CreatedAt: time.Now(),
 	}
-	if err := p.jobStream.Add(ctx, evJob, marshalJob(job)); err != nil {
+	if _, err := p.jobStream.Add(ctx, evJob, marshalJob(job)); err != nil {
 		return fmt.Errorf("failed to add job to stream %q: %w", p.jobStream.Name, err)
 	}
 	return nil
@@ -190,7 +190,7 @@ func (p *WorkerPool) Stop(ctx context.Context, wait time.Duration) error {
 			p.logger.Error(fmt.Errorf("stop: %w", err))
 			continue
 		}
-		if err := stream.Add(ctx, evStop, nil); err != nil {
+		if _, err := stream.Add(ctx, evStop, nil); err != nil {
 			p.logger.Error(fmt.Errorf("failed to add shutdown event to worker %q: %w", id, err))
 		}
 	}
@@ -293,7 +293,7 @@ func (p *WorkerPool) routeJob(ctx context.Context, ev *streaming.Event) error {
 	if err != nil {
 		return err
 	}
-	if err := stream.Add(ctx, evJob, ev.Payload); err != nil {
+	if _, err := stream.Add(ctx, evJob, ev.Payload); err != nil {
 		return fmt.Errorf("failed to add job to worker stream %q: %w", workerJobsStreamName(wid), err)
 	}
 	p.pendingJobs[jid] = ev
@@ -385,7 +385,7 @@ func (p *WorkerPool) deleteWorker(ctx context.Context, id string) error {
 func (p *WorkerPool) workerStream(ctx context.Context, id string) (*streaming.Stream, error) {
 	stream, ok := p.workerStreams[id]
 	if !ok {
-		s, err := streaming.NewStream(ctx, workerJobsStreamName(id), p.rdb, streaming.WithLogger(p.logger))
+		s, err := streaming.NewStream(ctx, workerJobsStreamName(id), p.rdb, streaming.WithStreamLogger(p.logger))
 		if err != nil {
 			return nil, fmt.Errorf("failed to retrieve stream for worker %q: %w", id, err)
 		}

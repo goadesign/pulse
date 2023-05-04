@@ -55,15 +55,15 @@ type (
 	}
 )
 
-// WithMaxLen sets the maximum number of events stored by the stream.
-func WithMaxLen(len int) StreamOption {
+// WithStreamMaxLen sets the maximum number of events stored by the stream.
+func WithStreamMaxLen(len int) StreamOption {
 	return func(o *streamOptions) {
 		o.MaxLen = len
 	}
 }
 
-// WithLogger sets the logger used by the stream.
-func WithLogger(logger ponos.Logger) StreamOption {
+// WithStreamLogger sets the logger used by the stream.
+func WithStreamLogger(logger ponos.Logger) StreamOption {
 	return func(o *streamOptions) {
 		o.Logger = logger
 	}
@@ -119,7 +119,7 @@ func WithReaderBufferSize(size int) ReaderOption {
 
 // WithReaderStartAtNewest sets the reader start position to the newest event,
 // this is the default. Only one of WithReaderStartAtNewest,
-// WithReaderStartAtOldest, WithReaderLastEventID or WithReaderStartAt can be
+// WithReaderStartAtOldest, WithReaderStartAfter or WithReaderStartAt can be
 // used.
 func WithReaderStartAtNewest() ReaderOption {
 	return func(o *readerOptions) {
@@ -128,7 +128,7 @@ func WithReaderStartAtNewest() ReaderOption {
 }
 
 // WithReaderStartAtOldest sets the reader start position to the oldest event.
-// Only one of WithReaderStartAtOldest, WithReaderLastEventID or
+// Only one of WithReaderStartAtOldest, WithReaderStartAfter or
 // WithReaderStartAt should be used.
 func WithReaderStartAtOldest() ReaderOption {
 	return func(o *readerOptions) {
@@ -136,9 +136,9 @@ func WithReaderStartAtOldest() ReaderOption {
 	}
 }
 
-// WithReaderLastEventID sets the last read event ID, the reader will start
+// WithReaderStartAfter sets the last read event ID, the reader will start
 // reading from the next event.
-func WithReaderLastEventID(id string) ReaderOption {
+func WithReaderStartAfter(id string) ReaderOption {
 	return func(o *readerOptions) {
 		o.LastEventID = id
 	}
@@ -202,7 +202,7 @@ func WithSinkBufferSize(size int) SinkOption {
 
 // WithSinkStartAtNewest sets the sink start position to the newest event,
 // this is the default. Only one of WithSinkStartAtNewest,
-// WithSinkStartAtOldest, WithSinkLastEventID or WithSinkStartAt can be used.
+// WithSinkStartAtOldest, WithSinkStartAfter or WithSinkStartAt can be used.
 func WithSinkStartAtNewest() SinkOption {
 	return func(o *sinkOptions) {
 		o.LastEventID = "$"
@@ -210,7 +210,7 @@ func WithSinkStartAtNewest() SinkOption {
 }
 
 // WithSinkStartAtOldest sets the sink start position to the oldest event.
-// Only one of WithSinkStartAtNewest, WithSinkStartAtOldest, WithSinkLastEventID
+// Only one of WithSinkStartAtNewest, WithSinkStartAtOldest, WithSinkStartAfter
 // or WithSinkStartAt can be used.
 func WithSinkStartAtOldest() SinkOption {
 	return func(o *sinkOptions) {
@@ -218,10 +218,10 @@ func WithSinkStartAtOldest() SinkOption {
 	}
 }
 
-// WithSinkLastEventID sets the last read event ID, the sink will start reading
+// WithSinkStartAfter sets the last read event ID, the sink will start reading
 // from the next event. Only one of WithSinkStartAtNewest,
-// WithSinkStartAtOldest, WithSinkLastEventID or WithSinkStartAt can be used.
-func WithSinkLastEventID(id string) SinkOption {
+// WithSinkStartAtOldest, WithSinkStartAfter or WithSinkStartAt can be used.
+func WithSinkStartAfter(id string) SinkOption {
 	return func(o *sinkOptions) {
 		o.LastEventID = id
 	}
@@ -229,7 +229,7 @@ func WithSinkLastEventID(id string) SinkOption {
 
 // WithSinkStartAt sets the start position for the sink, defaults
 // to the last event. Only one of WithSinkStartAtNewest,
-// WithSinkStartAtOldest, WithSinkLastEventID or WithSinkStartAt can be used.
+// WithSinkStartAtOldest, WithSinkStartAfter or WithSinkStartAt can be used.
 func WithSinkStartAt(startAt time.Time) SinkOption {
 	return func(o *sinkOptions) {
 		o.LastEventID = fmt.Sprintf("%d-0", startAt.UnixMilli())
@@ -244,9 +244,11 @@ func WithSinkNoAck() SinkOption {
 }
 
 // WithSinkAckGracePeriod sets the grace period for acknowledging events.  The
-// default grace period is 30 seconds. Events that are not acknowledged within
-// the grace period will be redelivered.
+// default grace period is 30 seconds, the minimum is 1s.
 func WithSinkAckGracePeriod(d time.Duration) SinkOption {
+	if d < time.Second {
+		d = time.Second
+	}
 	return func(o *sinkOptions) {
 		o.AckGracePeriod = d
 	}
@@ -254,7 +256,7 @@ func WithSinkAckGracePeriod(d time.Duration) SinkOption {
 
 // WithAddStreamStartAtNewest sets the sink start position for the added stream
 // to the newest event.  Only one of WithAddStreamStartAtNewest,
-// WithAddStreamStartAtOldest, WithAddStreamLastEventID or WithAddStreamStartAt
+// WithAddStreamStartAtOldest, WithAddStreamStartAfter or WithAddStreamStartAt
 // can be used.
 func WithAddStreamStartAtNewest() AddStreamOption {
 	return func(o *addStreamOptions) {
@@ -264,7 +266,7 @@ func WithAddStreamStartAtNewest() AddStreamOption {
 
 // WithAddStreamStartAtOldest sets the sink start position for the added stream
 // to the oldest event.  Only one of WithAddStreamStartAtNewest,
-// WithAddStreamStartAtOldest, WithAddStreamLastEventID or WithAddStreamStartAt
+// WithAddStreamStartAtOldest, WithAddStreamStartAfter or WithAddStreamStartAt
 // can be used.
 func WithAddStreamStartAtOldest() AddStreamOption {
 	return func(o *addStreamOptions) {
@@ -272,11 +274,11 @@ func WithAddStreamStartAtOldest() AddStreamOption {
 	}
 }
 
-// WithAddStreamLastEventID sets the last read event ID, the sink will start
+// WithAddStreamStartAfter sets the last read event ID, the sink will start
 // reading from the next event. Only one of WithAddStreamStartAtNewest,
-// WithAddStreamStartAtOldest, WithAddStreamLastEventID or WithAddStreamStartAt
+// WithAddStreamStartAtOldest, WithAddStreamStartAfter or WithAddStreamStartAt
 // can be used.
-func WithAddStreamLastEventID(id string) AddStreamOption {
+func WithAddStreamStartAfter(id string) AddStreamOption {
 	return func(o *addStreamOptions) {
 		o.LastEventID = id
 	}
@@ -284,7 +286,7 @@ func WithAddStreamLastEventID(id string) AddStreamOption {
 
 // WithAddStreamStartAt sets the start position for the added stream to the
 // event added on or after startAt. Only one of WithAddStreamStartAtNewest,
-// WithAddStreamStartAtOldest, WithAddStreamLastEventID or WithAddStreamStartAt
+// WithAddStreamStartAtOldest, WithAddStreamStartAfter or WithAddStreamStartAt
 // can be used.
 func WithAddStreamStartAt(startAt time.Time) AddStreamOption {
 	return func(o *addStreamOptions) {

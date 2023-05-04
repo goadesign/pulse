@@ -207,6 +207,14 @@ func (sm *Map) Keys() []string {
 	return keys
 }
 
+// Len returns the number of items in the replicated map.
+func (sm *Map) Len() int {
+	sm.lock.Lock()
+	defer sm.lock.Unlock()
+
+	return len(sm.content)
+}
+
 // Get returns the value for the given key.
 func (sm *Map) Get(key string) (string, bool) {
 	sm.lock.Lock()

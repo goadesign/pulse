@@ -25,7 +25,7 @@ func main() {
 	log.FlushAndDisableBuffering(ctx)
 
 	// Create example stream
-	stream, err := streaming.NewStream(ctx, "my-stream", rdb, streaming.WithLogger(ponos.ClueLogger(ctx)))
+	stream, err := streaming.NewStream(ctx, "my-stream", rdb, streaming.WithStreamLogger(ponos.ClueLogger(ctx)))
 	if err != nil {
 		panic(err)
 	}

@@ -16,13 +16,15 @@ import (
 var (
 	wf                = time.Second
 	tck               = time.Millisecond
-	testBlockDuration = 100 * time.Millisecond
+	testStalePeriod   = 10 * time.Millisecond
+	testBlockDuration = 50 * time.Millisecond
+	testAckDuration   = 20 * time.Millisecond
 )
 
 func TestNewSink(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	ctx = testContext(t)
-	s, err := NewStream(ctx, "testNewSink", rdb, WithLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(ctx, "testNewSink", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	sink, err := s.NewSink(ctx, "sink")
 	assert.NoError(t, err)
@@ -33,9 +35,11 @@ func TestNewSink(t *testing.T) {
 func TestReadOnce(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	ctx = testContext(t)
-	s, err := NewStream(ctx, "testReadOnce", rdb, WithLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(ctx, "testReadOnce", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
-	sink, err := s.NewSink(ctx, "sink", WithSinkStartAtOldest(), WithSinkBlockDuration(testBlockDuration))
+	sink, err := s.NewSink(ctx, "sink",
+		WithSinkStartAtOldest(),
+		WithSinkBlockDuration(testBlockDuration))
 	require.NoError(t, err)
 	defer cleanup(t, s, sink)
 
@@ -49,11 +53,14 @@ func TestReadOnce(t *testing.T) {
 func TestReadSinceLastEvent(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	ctx = testContext(t)
-	s, err := NewStream(ctx, "testReadSinceLastEvent", rdb, WithLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(ctx, "testReadSinceLastEvent", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 
 	// Add and read 2 events consecutively
-	sink, err := s.NewSink(ctx, "sink", WithSinkBlockDuration(testBlockDuration))
+	sink, err := s.NewSink(ctx, "sink",
+		WithSinkStartAtOldest(),
+		WithSinkBlockDuration(testBlockDuration),
+	)
 	require.NoError(t, err)
 	defer cleanup(t, s, sink)
 	_, err = s.Add(ctx, "event", []byte("payload"))
@@ -69,7 +76,9 @@ func TestReadSinceLastEvent(t *testing.T) {
 	assert.Equal(t, []byte("payload2"), read.Payload)
 
 	// Create new sink with last event ID set to first event and read last event
-	sink2, err := s.NewSink(ctx, "sink2", WithSinkLastEventID(eventID), WithSinkBlockDuration(testBlockDuration))
+	sink2, err := s.NewSink(ctx, "sink2",
+		WithSinkStartAfter(eventID),
+		WithSinkBlockDuration(testBlockDuration))
 	require.NoError(t, err)
 	defer sink2.Stop()
 	read = readOneEvent(t, sink2)
@@ -77,7 +86,9 @@ func TestReadSinceLastEvent(t *testing.T) {
 	assert.Equal(t, []byte("payload2"), read.Payload)
 
 	// Create new sink with last event ID set to 0 and read the 2 events
-	sink3, err := s.NewSink(ctx, "sink3", WithSinkLastEventID("0"), WithSinkBlockDuration(testBlockDuration))
+	sink3, err := s.NewSink(ctx, "sink3",
+		WithSinkStartAfter("0"),
+		WithSinkBlockDuration(testBlockDuration))
 	require.NoError(t, err)
 	defer sink3.Stop()
 	read = readOneEvent(t, sink3)
@@ -91,9 +102,11 @@ func TestReadSinceLastEvent(t *testing.T) {
 func TestCleanup(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	ctx = testContext(t)
-	s, err := NewStream(ctx, "testCleanup", rdb, WithLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(ctx, "testCleanup", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
-	sink, err := s.NewSink(ctx, "sink", WithSinkBlockDuration(testBlockDuration))
+	sink, err := s.NewSink(ctx, "sink",
+		WithSinkStartAtOldest(),
+		WithSinkBlockDuration(testBlockDuration))
 	require.NoError(t, err)
 
 	// Write and read 1 event
@@ -114,11 +127,13 @@ func TestCleanup(t *testing.T) {
 func TestAddStream(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	ctx = testContext(t)
-	s, err := NewStream(ctx, "testAddStream", rdb, WithLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(ctx, "testAddStream", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
-	sink, err := s.NewSink(ctx, "sink", WithSinkStartAtOldest(), WithSinkBlockDuration(testBlockDuration))
+	sink, err := s.NewSink(ctx, "sink",
+		WithSinkStartAtOldest(),
+		WithSinkBlockDuration(testBlockDuration))
 	require.NoError(t, err)
-	s2, err := NewStream(ctx, "testAddStream2", rdb, WithLogger(ponos.ClueLogger(ctx)))
+	s2, err := NewStream(ctx, "testAddStream2", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	assert.NoError(t, sink.AddStream(ctx, s2))
 	assert.NoError(t, sink.AddStream(ctx, s2)) // Make sure it's idempotent
@@ -143,11 +158,13 @@ func TestAddStream(t *testing.T) {
 func TestRemoveStream(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	ctx = testContext(t)
-	s, err := NewStream(ctx, "testRemoveStream", rdb, WithLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(ctx, "testRemoveStream", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
-	sink, err := s.NewSink(ctx, "sink", WithSinkBlockDuration(testBlockDuration))
+	sink, err := s.NewSink(ctx, "sink",
+		WithSinkStartAtOldest(),
+		WithSinkBlockDuration(testBlockDuration))
 	require.NoError(t, err)
-	s2, err := NewStream(ctx, "testRemoveStream2", rdb, WithLogger(ponos.ClueLogger(ctx)))
+	s2, err := NewStream(ctx, "testRemoveStream2", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	err = sink.AddStream(ctx, s2)
 	assert.NoError(t, err)
@@ -169,14 +186,14 @@ func TestRemoveStream(t *testing.T) {
 	// Remove one stream and read again
 	err = sink.RemoveStream(ctx, s2)
 	assert.NoError(t, err)
-	_, err = s.Add(ctx, "event3", []byte("payload3"))
+	eventID, err := s.Add(ctx, "event3", []byte("payload3"))
 	assert.NoError(t, err)
 	read = readOneEvent(t, sink)
 	assert.Equal(t, "event3", read.EventName)
 	assert.Equal(t, []byte("payload3"), read.Payload)
 
 	// Add back and remove other stream
-	err = sink.AddStream(ctx, s2)
+	err = sink.AddStream(ctx, s2, WithAddStreamStartAfter(eventID))
 	assert.NoError(t, err)
 	err = sink.RemoveStream(ctx, s)
 	assert.NoError(t, err)
@@ -185,6 +202,110 @@ func TestRemoveStream(t *testing.T) {
 	read = readOneEvent(t, sink)
 	assert.Equal(t, "event4", read.EventName)
 	assert.Equal(t, []byte("payload4"), read.Payload)
+}
+
+func TestMultipleConsumers(t *testing.T) {
+	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+	ctx = testContext(t)
+	s, err := NewStream(ctx, "testClaimStaleMessages", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
+	assert.NoError(t, err)
+	sink, err := s.NewSink(ctx, "sink",
+		WithSinkStartAtOldest(),
+		WithSinkBlockDuration(testBlockDuration),
+		withSinkAckGracePeriod(testAckDuration))
+	require.NoError(t, err)
+	defer cleanup(t, s, sink)
+
+	// Create other sink
+	sink2, err := s.NewSink(ctx, "sink",
+		WithSinkStartAtOldest(),
+		WithSinkBlockDuration(testBlockDuration),
+		withSinkAckGracePeriod(testAckDuration))
+	require.NoError(t, err)
+	defer func() {
+		sink2.Stop()
+		assert.Eventually(t, func() bool { return sink2.Stopped() }, wf, tck)
+	}()
+
+	// Add event
+	_, err = s.Add(ctx, "event", []byte("payload"))
+	assert.NoError(t, err)
+
+	// Read and ack event
+	var read *Event
+	select {
+	case read = <-sink.C:
+		sink.Ack(ctx, read)
+	case read = <-sink2.C:
+		sink2.Ack(ctx, read)
+	case <-time.After(testAckDuration):
+		t.Fatal("timeout waiting for initial event")
+	}
+	assert.Equal(t, "event", read.EventName)
+	assert.Equal(t, []byte("payload"), read.Payload)
+
+	// Make sure event is delivered only once
+	select {
+	case <-sink.C:
+		t.Error("event delivered twice")
+	case <-sink2.C:
+		t.Error("event delivered twice")
+	case <-time.After(2 * testAckDuration):
+	}
+}
+func TestClaimStaleMessages(t *testing.T) {
+	var origStalePeriod time.Duration
+	origStalePeriod, checkStalePeriod = checkStalePeriod, testStalePeriod
+	defer func() { checkStalePeriod = origStalePeriod }()
+
+	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+	ctx = testContext(t)
+	s, err := NewStream(ctx, "testClaimStaleMessages", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
+	assert.NoError(t, err)
+	sink, err := s.NewSink(ctx, "sink",
+		WithSinkStartAtOldest(),
+		WithSinkBlockDuration(testBlockDuration),
+		withSinkAckGracePeriod(testAckDuration))
+	require.NoError(t, err)
+	defer cleanup(t, s, sink)
+
+	// Add event
+	_, err = s.Add(ctx, "event", []byte("payload"))
+	assert.NoError(t, err)
+
+	// Read event but don't ack, could be read from any sink
+	var read *Event
+	select {
+	case read = <-sink.C:
+	case <-time.After(testAckDuration):
+		t.Fatal("timeout waiting for initial event")
+	}
+	assert.Equal(t, "event", read.EventName)
+	assert.Equal(t, []byte("payload"), read.Payload)
+
+	// Read stale claimed event and ack
+	select {
+	case read = <-sink.C:
+		sink.Ack(ctx, read)
+	case <-time.After(testAckDuration * 2):
+		t.Fatal("timeout waiting for claimed event")
+	}
+	assert.Equal(t, "event", read.EventName)
+	assert.Equal(t, []byte("payload"), read.Payload)
+
+	// Make sure event is delivered only once
+	select {
+	case <-sink.C:
+		t.Error("event delivered twice")
+	case <-time.After(2 * testAckDuration):
+	}
+}
+
+// Make it possible to set grace periods lower than 1s
+func withSinkAckGracePeriod(d time.Duration) SinkOption {
+	return func(o *sinkOptions) {
+		o.AckGracePeriod = d
+	}
 }
 
 func readOneEvent(t *testing.T, sink *Sink) *Event {

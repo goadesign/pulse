@@ -26,7 +26,7 @@ func TestStreamOptions(t *testing.T) {
 		},
 		{
 			name: "maxlen",
-			opts: []StreamOption{WithMaxLen(10)},
+			opts: []StreamOption{WithStreamMaxLen(10)},
 			want: streamOptions{
 				MaxLen: 10,
 				Logger: ponos.NoopLogger(),
@@ -34,7 +34,7 @@ func TestStreamOptions(t *testing.T) {
 		},
 		{
 			name: "custom logger",
-			opts: []StreamOption{WithLogger(ponos.StdLogger(log.Default()))},
+			opts: []StreamOption{WithStreamLogger(ponos.StdLogger(log.Default()))},
 			want: streamOptions{
 				MaxLen: 1000,
 				Logger: ponos.StdLogger(log.Default()),
@@ -134,7 +134,7 @@ func TestReaderOptions(t *testing.T) {
 		},
 		{
 			name: "last event ID",
-			opts: []ReaderOption{WithReaderLastEventID("foo")},
+			opts: []ReaderOption{WithReaderStartAfter("foo")},
 			want: readerOptions{
 				BlockDuration: 5 * time.Second,
 				MaxPolled:     1000,
@@ -244,7 +244,7 @@ func TestSinkOptions(t *testing.T) {
 		},
 		{
 			name: "last event ID",
-			opts: []SinkOption{WithSinkLastEventID("foo")},
+			opts: []SinkOption{WithSinkStartAfter("foo")},
 			want: sinkOptions{
 				BlockDuration:  5 * time.Second,
 				MaxPolled:      1000,
@@ -316,7 +316,7 @@ func TestAddStreamOptions(t *testing.T) {
 		},
 		{
 			name: "last event ID",
-			opts: []AddStreamOption{WithAddStreamLastEventID("foo")},
+			opts: []AddStreamOption{WithAddStreamStartAfter("foo")},
 			want: addStreamOptions{
 				LastEventID: "foo",
 			},

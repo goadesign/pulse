@@ -56,6 +56,26 @@ type (
 		// rdb is the redis connection.
 		rdb *redis.Client
 	}
+
+	// Event is a stream event.
+	Event struct {
+		// ID is the unique event ID.
+		ID string
+		// StreamName is the name of the stream the event belongs to.
+		StreamName string
+		// SinkName is the name of the sink the event belongs to.
+		SinkName string
+		// EventName is the producer-defined event name.
+		EventName string
+		// Topic is the producer-defined event topic if any, empty string if none.
+		Topic string
+		// Payload is the event payload.
+		Payload []byte
+		// streamKey is the Redis key of the stream.
+		streamKey string
+		// rdb is the redis client.
+		rdb *redis.Client
+	}
 )
 
 // newReader creates a new reader.
@@ -167,78 +187,72 @@ func (r *Reader) Stopped() bool {
 
 // read reads events from the streams and sends them to the reader channel.
 func (r *Reader) read() {
+	ctx := context.Background()
 	defer r.cleanup()
 	for {
-		events, err := readOnce(
-			context.Background(),
-			func(ctx context.Context) ([]redis.XStream, error) {
-				r.lock.Lock()
-				// force copy so no two goroutines can share the memory
-				readStreams := make([]string, len(r.streamKeys))
-				copy(readStreams, r.streamKeys)
-				readStreams = append(readStreams, r.streamCursors...)
-				r.lock.Unlock()
-				r.logger.Debug("reading", "streams", readStreams, "max", r.maxPolled, "block", r.blockDuration)
-				return r.rdb.XRead(ctx, &redis.XReadArgs{
-					Streams: readStreams,
-					Count:   r.maxPolled,
-					Block:   r.blockDuration,
-				}).Result()
-			},
-			r.streamschan,
-			r.donechan,
-			r.logger,
-		)
+		streamsEvents, err := readOnce(ctx, r.xread, r.streamschan, r.donechan, r.logger)
 		if r.isStopping() {
 			return
 		}
 		if err != nil {
-			handleReadEvent(err, r.logger)
+			handleReadError(err, r.logger)
 			continue
 		}
 
-		var evs []*Event
-		for _, streamEvents := range events {
-			if len(streamEvents.Messages) == 0 {
-				continue
-			}
-			for _, event := range streamEvents.Messages {
-				var topic string
-				if t, ok := event.Values["topic"]; ok {
-					topic = t.(string)
-				}
-				ev := newEvent(
-					r.rdb,
-					streamEvents.Stream,
-					"",
-					event.ID,
-					event.Values[nameKey].(string),
-					topic,
-					[]byte(event.Values[payloadKey].(string)),
-				)
-				if r.eventMatcher != nil && !r.eventMatcher(ev) {
-					r.logger.Debug("event did not match event matcher", "stream", streamEvents.Stream, "event", ev.ID)
-					continue
-				}
-				r.logger.Debug("event received", "stream", streamEvents.Stream, "event", ev.ID)
-				evs = append(evs, ev)
-			}
-			r.lock.Lock()
+		r.lock.Lock()
+		for _, events := range streamsEvents {
+			streamName := events.Stream[len(streamKeyPrefix):]
+			streamEvents(streamName, events.Stream, "", events.Messages, r.eventMatcher, r.c, r.rdb, r.logger)
 			for i := range r.streamKeys {
-				if r.streamKeys[i] == streamEvents.Stream {
-					r.streamCursors[i] = streamEvents.Messages[len(streamEvents.Messages)-1].ID
+				if r.streamKeys[i] == events.Stream {
+					r.streamCursors[i] = events.Messages[len(events.Messages)-1].ID
 					break
 				}
 			}
-			r.lock.Unlock()
-		}
-
-		r.lock.Lock()
-		for _, ev := range evs {
-			r.c <- ev
 		}
 		r.lock.Unlock()
 	}
+}
+
+func (r *Reader) xread(ctx context.Context) ([]redis.XStream, error) {
+	r.lock.Lock()
+	// force copy so no two goroutines can share the memory
+	readStreams := make([]string, len(r.streamKeys))
+	copy(readStreams, r.streamKeys)
+	readStreams = append(readStreams, r.streamCursors...)
+	r.lock.Unlock()
+
+	r.logger.Debug("reading", "streams", readStreams, "max", r.maxPolled, "block", r.blockDuration)
+	return r.rdb.XRead(ctx, &redis.XReadArgs{
+		Streams: readStreams,
+		Count:   r.maxPolled,
+		Block:   r.blockDuration,
+	}).Result()
+}
+
+// notifyStreamChange notifies the reader that the streams have changed.
+func (r *Reader) notifyStreamChange() {
+	select {
+	case r.streamschan <- struct{}{}:
+	default:
+	}
+}
+
+// cleanup removes the consumer from the consumer groups and removes the reader
+// from the readers map. This method is called automatically when the reader is
+// stopped.
+func (r *Reader) cleanup() {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	close(r.c)
+	r.wait.Done()
+}
+
+// isStopping returns true if the reader is stopping.
+func (r *Reader) isStopping() bool {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	return r.stopping
 }
 
 // readOnce calls the provided readFn and returns the events or error.
@@ -294,8 +308,51 @@ func readOnce(
 	}
 }
 
-// handleReadEvent retries retryable read errors and ignores non-retryable.
-func handleReadEvent(err error, logger ponos.Logger) {
+// streamEvents filters and streams the Redis messages as events to c.
+// The caller is responsible for locking c.
+func streamEvents(
+	streamName string,
+	streamKey string,
+	sinkName string,
+	msgs []redis.XMessage,
+	eventMatcher EventMatcherFunc,
+	c chan *Event,
+	rdb *redis.Client,
+	logger ponos.Logger,
+) {
+	if len(msgs) == 0 {
+		return
+	}
+	for _, event := range msgs {
+		var topic string
+		if t, ok := event.Values["topic"]; ok {
+			topic = t.(string)
+		}
+		ev := &Event{
+			ID:         event.ID,
+			StreamName: streamName,
+			SinkName:   sinkName,
+			EventName:  event.Values[nameKey].(string),
+			Topic:      topic,
+			Payload:    []byte(event.Values[payloadKey].(string)),
+			streamKey:  streamKey,
+			rdb:        rdb,
+		}
+		if eventMatcher != nil && !eventMatcher(ev) {
+			logger.Debug("event did not match event matcher", "stream", streamName, "event", ev.ID)
+			continue
+		}
+		if sinkName != "" {
+			logger.Debug("event received", "stream", streamName, "sink", sinkName, "event", ev.ID)
+		} else {
+			logger.Debug("event received", "stream", streamName, "event", ev.ID)
+		}
+		c <- ev
+	}
+}
+
+// handleReadError retries retryable read errors and ignores non-retryable.
+func handleReadError(err error, logger ponos.Logger) {
 	if err == redis.Nil {
 		return // No event at this time, just loop
 	}
@@ -305,29 +362,4 @@ func handleReadEvent(err error, logger ponos.Logger) {
 	d := time.Duration(rand.Intn(maxJitterMs)) * time.Millisecond
 	logger.Error(fmt.Errorf("failed to read events: %w, retrying in %v", err, d))
 	time.Sleep(d)
-}
-
-// notifyStreamChange notifies the reader that the streams have changed.
-func (r *Reader) notifyStreamChange() {
-	select {
-	case r.streamschan <- struct{}{}:
-	default:
-	}
-}
-
-// cleanup removes the consumer from the consumer groups and removes the reader
-// from the readers map. This method is called automatically when the reader is
-// stopped.
-func (r *Reader) cleanup() {
-	r.lock.Lock()
-	defer r.lock.Unlock()
-	close(r.c)
-	r.wait.Done()
-}
-
-// isStopping returns true if the reader is stopping.
-func (r *Reader) isStopping() bool {
-	r.lock.Lock()
-	defer r.lock.Unlock()
-	return r.stopping
 }
