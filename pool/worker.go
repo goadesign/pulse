@@ -25,7 +25,7 @@ type (
 		// CreatedAt is the time the worker was created.
 		CreatedAt time.Time
 
-		jobsStream        *streaming.Stream
+		stream            *streaming.Stream
 		reader            *streaming.Reader
 		c                 chan *Job
 		done              chan struct{}
@@ -67,7 +67,7 @@ func newWorker(ctx context.Context, p *Node, opts ...WorkerOption) (*Worker, err
 		Pool:              p,
 		C:                 c,
 		CreatedAt:         time.Now(),
-		jobsStream:        jobsStream,
+		stream:            jobsStream,
 		reader:            reader,
 		c:                 c,
 		done:              make(chan struct{}),
@@ -103,7 +103,7 @@ func (w *Worker) Stop(ctx context.Context) error {
 		err = fmt.Errorf("failed to remove worker %q from keep alive map: %w", w.ID, er)
 	}
 	w.reader.Stop()
-	if er := w.jobsStream.Destroy(ctx); er != nil {
+	if er := w.stream.Destroy(ctx); er != nil {
 		err = fmt.Errorf("failed to destroy stream for worker %q: %w", w.ID, er)
 	}
 	close(w.done)
@@ -144,7 +144,7 @@ func (w *Worker) handleEvents() {
 				}
 				w.logger.Info("received job", "key", job.Key)
 				w.c <- job
-			case evStop:
+			case evShutdown:
 				w.logger.Info("received stop", "node", string(msg.Payload))
 				if err := w.Stop(context.Background()); err != nil {
 					w.logger.Error(fmt.Errorf("failed to stop worker: %w", err))

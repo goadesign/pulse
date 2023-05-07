@@ -97,8 +97,7 @@ func TestTopic(t *testing.T) {
 	s, err := NewStream(ctx, "testTopic", rdb)
 	assert.NoError(t, err)
 
-	tp := s.NewTopic("foo")
-	_, err = tp.Add(ctx, "bar", []byte("baz"))
+	_, err = s.Add(ctx, "bar", []byte("baz"), WithTopic("foo"))
 	assert.NoError(t, err)
 
 	l, err := rdb.XLen(ctx, s.key).Result()

@@ -18,6 +18,7 @@ type (
 		leaseTTL            time.Duration
 		maxQueuedJobs       int
 		maxShutdownDuration time.Duration
+		clientOnly          bool
 		logger              ponos.Logger
 	}
 
@@ -56,6 +57,15 @@ func WithMaxQueuedJobs(max int) PoolOption {
 func WithMaxShutdownDuration(max time.Duration) PoolOption {
 	return func(o *poolOption) {
 		o.maxShutdownDuration = max
+	}
+}
+
+// WithClientOnly sets the pool to be client only. A client-only pool only
+// supports dispatching jobs to workers and does not start background goroutines
+// to route jobs.
+func WithClientOnly() PoolOption {
+	return func(o *poolOption) {
+		o.clientOnly = true
 	}
 }
 

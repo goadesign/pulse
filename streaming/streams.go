@@ -31,19 +31,6 @@ type (
 		// rdb is the redis connection.
 		rdb *redis.Client
 	}
-
-	// Topic represents a stream topic. A topic can be used to publish
-	// events to a stream.
-	Topic struct {
-		// Name is the topic name.
-		Name string
-		// Stream is the stream the topic belongs to.
-		Stream *Stream
-		// Pattern is the topic pattern if any, empty string if none.
-		Pattern string
-		// Matcher is the topic event matcher if any, nil if none.
-		Matcher EventMatcherFunc
-	}
 )
 
 const (
@@ -128,20 +115,31 @@ func (s *Stream) NewSink(ctx context.Context, name string, opts ...SinkOption) (
 	return sink, nil
 }
 
-// NewTopic creates a new topic with the given name.
-func (s *Stream) NewTopic(name string) *Topic {
-	return &Topic{
-		Name:   name,
-		Stream: s,
+// Add appends an event to the stream and returns its ID. If the option
+// WithOnlyIfStreamExists is used and the stream does not exist then no event is
+// added and the empty string is returned. The stream is created if the option
+// is omitted or when NewSink is called.
+func (s *Stream) Add(ctx context.Context, name string, payload []byte, opts ...AddEventOption) (string, error) {
+	options := defaultAddEventOptions()
+	for _, option := range opts {
+		option(&options)
 	}
-}
-
-// Add appends an event to the stream and returns its ID.
-func (s *Stream) Add(ctx context.Context, name string, payload []byte) (string, error) {
-	res, err := s.add(ctx, name, payload, nil)
+	values := []any{nameKey, name, payloadKey, payload}
+	if options.Topic != "" {
+		values = append(values, topicKey, options.Topic)
+	}
+	res, err := s.rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream:     s.key,
+		Values:     values,
+		MaxLen:     int64(s.MaxLen),
+		Approx:     true,
+		NoMkStream: options.OnlyIfStreamExists,
+	}).Result()
 	if err != nil {
-		err := fmt.Errorf("failed to add event: %w", err)
-		s.logger.Error(err, "event", name)
+		if err != redis.Nil {
+			err := fmt.Errorf("failed to add event: %w", err)
+			s.logger.Error(err, "event", name)
+		}
 		return "", err
 	}
 	s.logger.Debug("add", "event", name, "id", res)
@@ -172,32 +170,6 @@ func (s *Stream) Destroy(ctx context.Context) error {
 	}
 	s.logger.Info("stream deleted")
 	return nil
-}
-
-// Add appends an event to the topic and returns its id.
-func (t *Topic) Add(ctx context.Context, name string, payload []byte) (string, error) {
-	res, err := t.Stream.add(ctx, name, payload, &t.Name)
-	if err != nil {
-		err = fmt.Errorf("failed to add event %w", err)
-		t.Stream.logger.Error(err, "event", name, "topic", t.Name)
-		return "", err
-	}
-	t.Stream.logger.Debug("add", "event", name, "topic", t.Name, "id", res)
-	return res, nil
-}
-
-// add appends an event to the stream.
-func (s *Stream) add(ctx context.Context, name string, payload []byte, topic *string) (string, error) {
-	values := []any{nameKey, name, payloadKey, payload}
-	if topic != nil {
-		values = append(values, topicKey, *topic)
-	}
-	return s.rdb.XAdd(ctx, &redis.XAddArgs{
-		Stream: s.key,
-		Values: values,
-		MaxLen: int64(s.MaxLen),
-		Approx: true,
-	}).Result()
 }
 
 // redisKeyRegex is a regular expression that matches valid Redis keys.

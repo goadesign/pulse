@@ -17,8 +17,11 @@ type (
 	// SinkOption is a sink creation option.
 	SinkOption func(*sinkOptions)
 
-	// AddStreamOption is an option for adding an event to a stream.
+	// AddStreamOption is an option for adding a stream to a sink.
 	AddStreamOption func(*addStreamOptions)
+
+	// AddEventOption is an option for adding an event to a stream.
+	AddEventOption func(*addEventOptions)
 
 	// EventMatcherFunc is a function that matches an event.
 	EventMatcherFunc func(event *Event) bool
@@ -52,6 +55,11 @@ type (
 
 	addStreamOptions struct {
 		LastEventID string
+	}
+
+	addEventOptions struct {
+		Topic              string
+		OnlyIfStreamExists bool
 	}
 )
 
@@ -294,6 +302,20 @@ func WithAddStreamStartAt(startAt time.Time) AddStreamOption {
 	}
 }
 
+// WithTopic sets the topic for the added event.
+func WithTopic(topic string) AddEventOption {
+	return func(o *addEventOptions) {
+		o.Topic = topic
+	}
+}
+
+// WithOnlyIfStreamExists only adds the event if the stream exists.
+func WithOnlyIfStreamExists() AddEventOption {
+	return func(o *addEventOptions) {
+		o.OnlyIfStreamExists = true
+	}
+}
+
 // defaultStreamOptions returns the default options.
 func defaultStreamOptions() streamOptions {
 	return streamOptions{
@@ -326,4 +348,9 @@ func defaultSinkOptions() sinkOptions {
 // defaultAddStreamOptions returns the default options.
 func defaultAddStreamOptions() addStreamOptions {
 	return addStreamOptions{}
+}
+
+// defaultAddEventOptions returns the default options.
+func defaultAddEventOptions() addEventOptions {
+	return addEventOptions{}
 }

@@ -21,7 +21,7 @@ type (
 	// update it.
 	Map struct {
 		// C is the channel that receives notifications when the map
-		// changes. The channel is closed when the map is closed.  This
+		// changes. The channel is closed when the map is stopped. This
 		// channel simply notifies that the map has changed, it does not
 		// provide the actual changes, instead the Map method should be
 		// used to read the current content.  This allows the
@@ -395,7 +395,7 @@ func (sm *Map) run() {
 			sm.lock.Unlock()
 
 		case <-sm.done:
-			sm.logger.Info("closed")
+			sm.logger.Info("stopped")
 			return
 		}
 	}
@@ -413,7 +413,7 @@ func (sm *Map) runLuaScript(ctx context.Context, name string, script *redis.Scri
 	sm.lock.Lock()
 	defer sm.lock.Unlock()
 	if sm.stopped {
-		return nil, fmt.Errorf("ponos map: %s is closed", sm.name)
+		return nil, fmt.Errorf("ponos map: %s is stopped", sm.name)
 	}
 
 	res, err := script.Eval(
