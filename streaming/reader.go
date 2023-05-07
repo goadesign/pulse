@@ -195,7 +195,11 @@ func (r *Reader) read() {
 			return
 		}
 		if err != nil {
-			handleReadError(err, r.logger)
+			if err := handleReadError(err, r.logger); err != nil {
+				r.logger.Error(fmt.Errorf("fatal error while reading events: %w, stopping", err))
+				r.Stop()
+				return
+			}
 			continue
 		}
 
@@ -352,14 +356,19 @@ func streamEvents(
 }
 
 // handleReadError retries retryable read errors and ignores non-retryable.
-func handleReadError(err error, logger ponos.Logger) {
+func handleReadError(err error, logger ponos.Logger) error {
+	if strings.Contains(err.Error(), "stream key no longer exists") {
+		return err // Fatal error
+	}
 	if err == redis.Nil {
-		return // No event at this time, just loop
+		return nil // No event at this time, just loop
 	}
 	if strings.Contains(err.Error(), "NOGROUP") {
-		return // Consumer group was removed with RemoveStream, just loop (s.streamCursors will be updated)
+		return nil // Consumer group was removed with RemoveStream, just loop (s.streamCursors will be updated)
 	}
+	// Retryable error, sleep and loop
 	d := time.Duration(rand.Intn(maxJitterMs)) * time.Millisecond
 	logger.Error(fmt.Errorf("failed to read events: %w, retrying in %v", err, d))
 	time.Sleep(d)
+	return nil
 }

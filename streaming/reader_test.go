@@ -1,6 +1,7 @@
 package streaming
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -13,23 +14,23 @@ import (
 
 func TestNewReader(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
-	ctx = testContext(t)
+	ctx := testContext(t)
 	s, err := NewStream(ctx, "testNewReader", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	reader, err := s.NewReader(ctx)
 	assert.NoError(t, err)
 	assert.NotNil(t, reader)
-	cleanupReader(t, s, reader)
+	cleanupReader(t, ctx, s, reader)
 }
 
 func TestReaderReadOnce(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
-	ctx = testContext(t)
+	ctx := testContext(t)
 	s, err := NewStream(ctx, "testReadOnce", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	reader, err := s.NewReader(ctx, WithReaderStartAtOldest(), WithReaderBlockDuration(testBlockDuration))
 	require.NoError(t, err)
-	// defer cleanupReader(t, s, reader)
+	defer cleanupReader(t, ctx, s, reader)
 
 	_, err = s.Add(ctx, "event", []byte("payload"))
 	require.NoError(t, err)
@@ -40,14 +41,14 @@ func TestReaderReadOnce(t *testing.T) {
 
 func TestReaderReadSinceLastEvent(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
-	ctx = testContext(t)
+	ctx := testContext(t)
 	s, err := NewStream(ctx, "testReadSinceLastEvent", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 
 	// Add and read 2 events consecutively
 	reader, err := s.NewReader(ctx, WithReaderStartAtOldest(), WithReaderBlockDuration(testBlockDuration))
 	require.NoError(t, err)
-	defer cleanupReader(t, s, reader)
+	defer cleanupReader(t, ctx, s, reader)
 	_, err = s.Add(ctx, "event", []byte("payload"))
 	require.NoError(t, err)
 	read := readOneReaderEvent(t, reader)
@@ -82,7 +83,7 @@ func TestReaderReadSinceLastEvent(t *testing.T) {
 
 func TestCleanupReader(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
-	ctx = testContext(t)
+	ctx := testContext(t)
 	s, err := NewStream(ctx, "testCleanupReader", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	reader, err := s.NewReader(ctx, WithReaderStartAtOldest(), WithReaderBlockDuration(testBlockDuration))
@@ -105,7 +106,7 @@ func TestCleanupReader(t *testing.T) {
 
 func TestAddReaderStream(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
-	ctx = testContext(t)
+	ctx := testContext(t)
 	s, err := NewStream(ctx, "testAddStream", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	reader, err := s.NewReader(ctx, WithReaderStartAtOldest(), WithReaderBlockDuration(testBlockDuration))
@@ -115,7 +116,7 @@ func TestAddReaderStream(t *testing.T) {
 	assert.NoError(t, reader.AddStream(ctx, s2))
 	assert.NoError(t, reader.AddStream(ctx, s2)) // Make sure it's idempotent
 	defer s2.Destroy(ctx)
-	defer cleanupReader(t, s, reader)
+	defer cleanupReader(t, ctx, s, reader)
 
 	// Add events to both streams
 	_, err = s.Add(ctx, "event", []byte("payload"))
@@ -134,7 +135,7 @@ func TestAddReaderStream(t *testing.T) {
 
 func TestRemoveReaderStream(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
-	ctx = testContext(t)
+	ctx := testContext(t)
 	s, err := NewStream(ctx, "testRemoveStream", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	s2, err := NewStream(ctx, "testRemoveStream2", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
@@ -143,7 +144,7 @@ func TestRemoveReaderStream(t *testing.T) {
 	require.NoError(t, err)
 	assert.NoError(t, reader.AddStream(ctx, s2))
 	defer s2.Destroy(ctx)
-	defer cleanupReader(t, s, reader)
+	defer cleanupReader(t, ctx, s, reader)
 
 	// Read events from both streams
 	_, err = s.Add(ctx, "event", []byte("payload"))
@@ -187,7 +188,7 @@ func readOneReaderEvent(t *testing.T, reader *Reader) *Event {
 	return read
 }
 
-func cleanupReader(t *testing.T, s *Stream, reader *Reader) {
+func cleanupReader(t *testing.T, ctx context.Context, s *Stream, reader *Reader) {
 	t.Helper()
 	reader.Stop()
 	assert.Eventually(t, func() bool { return reader.Stopped() }, wf, tck)

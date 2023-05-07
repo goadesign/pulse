@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/oklog/ulid/v2"
 	redis "github.com/redis/go-redis/v9"
 
 	"goa.design/ponos/ponos"
@@ -113,7 +113,7 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...SinkOptio
 	if err != nil {
 		return nil, fmt.Errorf("failed to join replicated map for sink keep-alives %s: %w", name, err)
 	}
-	consumer := uuid.New().String()
+	consumer := ulid.Make().String()
 	if _, err := cm.AppendValues(ctx, name, consumer); err != nil {
 		return nil, fmt.Errorf("failed to append store consumer %s for sink %s: %w", consumer, name, err)
 	}
@@ -134,7 +134,7 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...SinkOptio
 		Name:                  name,
 		C:                     c,
 		consumer:              consumer,
-		staleLockKeyName:      fmt.Sprintf("ponos:sink:%s:stalelock", name),
+		staleLockKeyName:      staleLockName(name),
 		startID:               options.LastEventID,
 		noAck:                 options.NoAck,
 		streams:               []*Stream{stream},
@@ -276,9 +276,11 @@ func (s *Sink) Stopped() bool {
 // read reads events from the streams and sends them to the sink channel.
 func (s *Sink) read() {
 	ctx := context.Background()
-	defer s.wait.Done()
-	defer close(s.c)
-	defer s.removeConsumer(ctx, s.consumer)
+	defer func() {
+		s.removeConsumer(ctx, s.consumer)
+		close(s.c)
+		s.wait.Done()
+	}()
 	for {
 		streamsEvents, err := readOnce(ctx, s.readGroup, s.streamschan, s.donechan, s.logger)
 		if s.isStopping() {
@@ -306,12 +308,14 @@ func (s *Sink) read() {
 //  3. It leverages the consumers keep-alive map to detect when a consumer is
 //     no longer active and removes it from the consumer group.
 func (s *Sink) manageStaleMessages() {
-	defer s.wait.Done()
-	ctx := context.Background()
 	keepAliveTicker := time.NewTicker(s.ackGracePeriod / 2)
 	checkStaleTicker := time.NewTicker(checkStalePeriod)
-	defer keepAliveTicker.Stop()
-	defer checkStaleTicker.Stop()
+	defer func() {
+		checkStaleTicker.Stop()
+		keepAliveTicker.Stop()
+		s.wait.Done()
+	}()
+	ctx := context.Background()
 	ackSeconds := int64(s.ackGracePeriod.Seconds())
 	for {
 		select {
@@ -476,10 +480,15 @@ func isBusyGroupErr(err error) bool {
 
 // consumersMapName is the name of the replicated map that backs a sink.
 func consumersMapName(stream *Stream) string {
-	return fmt.Sprintf("%s:sinks", stream.Name)
+	return fmt.Sprintf("stream:%s:sinks", stream.Name)
 }
 
 // sinkKeepAliveMapName is the name of the replicated map that backs a sink keep-alives.
 func sinkKeepAliveMapName(sink string) string {
-	return fmt.Sprintf("ponos:sink:%s:keepalive", sink)
+	return fmt.Sprintf("sink:%s:keepalive", sink)
+}
+
+// staleLockName is the name of the lock used to check for stale messages.
+func staleLockName(sink string) string {
+	return fmt.Sprintf("sink:%s:stalelock", sink)
 }

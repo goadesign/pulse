@@ -20,7 +20,7 @@ func main() {
 	})
 
 	// Get pool named "fibonacci"
-	pool, err := pool.Pool(ctx, "fibonacci", rdb, pool.WithLogger(ponos.ClueLogger(ctx)))
+	pool, err := pool.AddNode(ctx, "fibonacci", rdb, pool.WithLogger(ponos.ClueLogger(ctx)))
 	if err != nil {
 		panic(err)
 	}

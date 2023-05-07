@@ -129,8 +129,11 @@ See the background job example for more details.
 
 ## Data Flows
 
+### Adding A New Job
+
 The following diagram illustrates the data flow involved in adding a new job to
 a Ponos worker pool:
+
 * The producer calls `DispatchJob` which adds an event to the pool job stream.
 * The pool job stream is read by the pool sink which creates an entry in the
    pending jobs map and adds the job to the dedicated worker stream.
@@ -195,6 +198,87 @@ are automatically re-queued. This is useful in case of worker failure or
 network partitioning. The pool sink applies the consistent hashing algorithm
 to the job key to determine which worker stream the job should be added to. This
 ensures that unhealthy workers are properly ignored when requeuing jobs.
+
+### Shutdown and Cleanup
+
+The following diagram illustrates the data flow involved in shutting down a
+Ponos worker pool:
+
+* The producer calls `Shutdown` which sets the shutdown flag in the pool
+  shutdown replicated map.
+* The pool nodes get notified and stop accepting new jobs (`DispatchJob`
+  returns an error if called).
+* The pool nodes add a stop event to the worker streams for all the workers
+  they own.
+* Upon receiving the stop event, the workers remove themselves from the pool
+  workers replicated map and exit.  Note that any job that was enqueued before
+  the stop event still gets processed.
+* Once the workers replicated map is empty, the producer that initiated the
+  shutdown cleans up the pool resources (jobs sink, jobs stream, replicated
+  maps) and the pool nodes exit.
+
+```mermaid
+%%{ init: { 'flowchart': { 'curve': 'monotoneX' } } }%%
+%%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
+
+flowchart LR
+    subgraph rdb[Redis]
+        sr[(Shutdown <br/> Replicated Map)]
+        wr[(Worker </br/> Replicated Map)]
+        ws1(["Worker 1 Stream"])
+        ws2(["Worker 2 Stream"])
+    end
+    subgraph pn1[Pool Node 1]
+        u[User code]
+        po1[Pool 1]
+        w1[Worker 1]
+    end
+    subgraph pn2[Pool Node 2]
+        po2[Pool 2]
+        w2[Worker 2]
+    end
+    u[User code] --1. Shutdown--> po1[Pool 1]
+    po1 --2. Set Shutdown Flag--> sr[(Shutdown <br/> Replicated Map)]
+    sr --3. Shutdown Flag--> po1
+    sr --3. Shutdown Flag--> po2
+    po1 --4. Add Stop--> ws1
+    po2 --4. Add Stop--> ws2
+    ws1 --5. Stop--> w1
+    ws2 --5. Stop--> w2
+    w1 --6. Remove Worker--> wr
+    w2 --6. Remove Worker--> wr
+    w1 --7. Delete--> ws1
+    w2 --7. Delete--> ws2
+    wr --8. Workers Empty--> po1
+    po1 --9. Delete --> sr
+    po1 --10. Delete --> wr
+    
+    classDef userCode fill:#9A6D1F, stroke:#D9B871, stroke-width:2px, color:#FFF2CC;
+    classDef producer fill:#2C5A9A, stroke:#6B96C1, stroke-width:2px, color:#CCE0FF;
+    classDef redis fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
+    classDef background fill:#7A7A7A, color:#F2F2F2;
+
+    class u userCode;
+    class wr,sr,ws1,ws2 redis;
+    class po1,po2,w1,w2 producer;
+    class rdb,pn1,pn2 background; 
+
+    linkStyle 0 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 1 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 2 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 3 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 4 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 5 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 6 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 7 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 8 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 9 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 10 stroke:#FF8888,color:#FF8888,stroke-width:3px;
+    linkStyle 11 stroke:#FF8888,color:#FF8888,stroke-width:3px;
+    linkStyle 12 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 13 stroke:#FF8888,color:#FF8888,stroke-width:3px;
+    linkStyle 14 stroke:#FF8888,color:#FF8888,stroke-width:3px;
+```
 
 ## Failure Modes And Recovery
 

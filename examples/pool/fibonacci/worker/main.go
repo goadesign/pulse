@@ -20,13 +20,13 @@ func main() {
 	})
 
 	// Connect to or create pool "fibonacci".
-	pool, err := pool.Pool(ctx, "fibonacci", rdb, pool.WithLogger(ponos.ClueLogger(ctx)))
+	pool, err := pool.AddNode(ctx, "fibonacci", rdb, pool.WithLogger(ponos.ClueLogger(ctx)))
 	if err != nil {
 		panic(err)
 	}
 
 	// Create a new worker for pool "fibonacci".
-	worker, err := pool.NewWorker(ctx)
+	worker, err := pool.AddWorker(ctx)
 	if err != nil {
 		panic(err)
 	}

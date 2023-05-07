@@ -69,7 +69,7 @@ func NewStream(ctx context.Context, name string, rdb *redis.Client, opts ...Stre
 	}
 	var logger, rootLogger ponos.Logger
 	if options.Logger != nil {
-		logger = options.Logger.WithPrefix("ponos:stream", name)
+		logger = options.Logger.WithPrefix("stream", name)
 		rootLogger = options.Logger
 	} else {
 		logger = ponos.NoopLogger()

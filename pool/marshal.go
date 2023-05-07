@@ -6,24 +6,6 @@ import (
 	"time"
 )
 
-// marshalWorker marshals w into a byte slice.
-func marshalWorker(w *poolWorker) []byte {
-	var buf bytes.Buffer
-	if err := binary.Write(&buf, binary.LittleEndian, w); err != nil {
-		panic(err)
-	}
-	return buf.Bytes()
-}
-
-// unmarshal unmarshals a poolWorker from a byte slice created by marshalWorker.
-func unmarshalWorker(b []byte) *poolWorker {
-	var w poolWorker
-	if err := binary.Read(bytes.NewReader(b), binary.LittleEndian, &w); err != nil {
-		panic(err)
-	}
-	return &w
-}
-
 // marshalJob marshals a job into a byte slice.
 func marshalJob(job *Job) []byte {
 	var buf bytes.Buffer

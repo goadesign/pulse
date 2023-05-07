@@ -3,7 +3,6 @@ package pool
 import (
 	"time"
 
-	"github.com/google/uuid"
 	"goa.design/ponos/ponos"
 )
 
@@ -15,14 +14,14 @@ type (
 	WorkerOption func(*workerOption)
 
 	poolOption struct {
-		workerTTL     time.Duration
-		leaseTTL      time.Duration
-		maxQueuedJobs int
-		logger        ponos.Logger
+		workerTTL           time.Duration
+		leaseTTL            time.Duration
+		maxQueuedJobs       int
+		maxShutdownDuration time.Duration
+		logger              ponos.Logger
 	}
 
 	workerOption struct {
-		group          string
 		jobChannelSize int
 	}
 )
@@ -52,6 +51,14 @@ func WithMaxQueuedJobs(max int) PoolOption {
 	}
 }
 
+// WithMaxShutdownDuration sets the maximum time to wait for workers to
+// shutdown.  The default is 2 minutes.
+func WithMaxShutdownDuration(max time.Duration) PoolOption {
+	return func(o *poolOption) {
+		o.maxShutdownDuration = max
+	}
+}
+
 // WithLogger sets the handler used to report temporary errors.
 func WithLogger(logger ponos.Logger) PoolOption {
 	return func(o *poolOption) {
@@ -62,18 +69,11 @@ func WithLogger(logger ponos.Logger) PoolOption {
 // defaultPoolOptions returns the default options.
 func defaultPoolOptions() *poolOption {
 	return &poolOption{
-		workerTTL:     10 * time.Second,
-		leaseTTL:      5 * time.Second,
-		maxQueuedJobs: 1000,
-		logger:        ponos.NoopLogger(),
-	}
-}
-
-// WithWorkerGroup sets the worker group.  Ponos generates a random group ID if
-// not set.
-func WithWorkerGroup(group string) WorkerOption {
-	return func(o *workerOption) {
-		o.group = group
+		workerTTL:           10 * time.Second,
+		leaseTTL:            5 * time.Second,
+		maxQueuedJobs:       1000,
+		maxShutdownDuration: 2 * time.Minute,
+		logger:              ponos.NoopLogger(),
 	}
 }
 
@@ -87,7 +87,6 @@ func WithJobChannelSize(size int) WorkerOption {
 // defaultWorkerOptions returns the default options.
 func defaultWorkerOptions() *workerOption {
 	return &workerOption{
-		group:          uuid.NewString(),
 		jobChannelSize: 100,
 	}
 }

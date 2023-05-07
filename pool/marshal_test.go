@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -47,42 +46,6 @@ func TestMarshalJob(t *testing.T) {
 			// Compare unmarshaled job key
 			key := unmarshalJobKey(marshaled)
 			assert.Equal(t, tc.job.Key, key)
-		})
-	}
-}
-
-func TestMarshalPoolWoker(t *testing.T) {
-	// Test cases
-	testCases := []struct {
-		name   string
-		worker poolWorker
-	}{
-		{
-			name: "simple worker",
-			worker: poolWorker{
-				ID:          uuid.New(),
-				CreatedAt:   time.Date(2022, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano(),
-				RefreshedAt: time.Date(2022, 1, 2, 0, 0, 0, 0, time.UTC).UnixNano(),
-			},
-		},
-		{
-			name:   "empty worker",
-			worker: poolWorker{},
-		},
-	}
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			marshaled := marshalWorker(&tc.worker)
-			worker := unmarshalWorker(marshaled)
-
-			// Compare original and unmarshaled poolWorker structs
-			assert.Equal(t, tc.worker.ID, worker.ID)
-			assert.Equal(t, tc.worker.CreatedAt, worker.CreatedAt)
-			assert.Equal(t, tc.worker.RefreshedAt, worker.RefreshedAt)
-
-			// Compare original and unmarshaled byte slices
-			marshaled2 := marshalWorker(worker)
-			assert.True(t, bytes.Equal(marshaled, marshaled2))
 		})
 	}
 }

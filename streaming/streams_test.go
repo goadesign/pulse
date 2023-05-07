@@ -1,7 +1,6 @@
 package streaming
 
 import (
-	"context"
 	"os"
 	"testing"
 
@@ -10,10 +9,7 @@ import (
 	"goa.design/ponos/ponos"
 )
 
-var (
-	redisPwd = "redispassword"
-	ctx      = context.Background()
-)
+var redisPwd = "redispassword"
 
 func init() {
 	if p := os.Getenv("REDIS_PASSWORD"); p != "" {
@@ -23,6 +19,7 @@ func init() {
 
 func TestDestroy(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+	ctx := testContext(t)
 
 	s, err := NewStream(ctx, "testDestroy", rdb)
 	assert.NoError(t, err)
@@ -42,6 +39,7 @@ func TestDestroy(t *testing.T) {
 }
 
 func TestOptions(t *testing.T) {
+	ctx := testContext(t)
 	s, err := NewStream(ctx, "testOptions", nil, WithStreamMaxLen(10), WithStreamLogger(nil))
 	assert.NoError(t, err)
 	assert.Equal(t, 10, s.MaxLen)
@@ -50,6 +48,7 @@ func TestOptions(t *testing.T) {
 
 func TestAdd(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+	ctx := testContext(t)
 	s, err := NewStream(ctx, "testAdd", rdb)
 	assert.NoError(t, err)
 
@@ -68,6 +67,7 @@ func TestAdd(t *testing.T) {
 
 func TestRemove(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+	ctx := testContext(t)
 	s, err := NewStream(ctx, "testRemove", rdb)
 	assert.NoError(t, err)
 
@@ -93,6 +93,7 @@ func TestRemove(t *testing.T) {
 
 func TestTopic(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+	ctx := testContext(t)
 	s, err := NewStream(ctx, "testTopic", rdb)
 	assert.NoError(t, err)
 
