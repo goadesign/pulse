@@ -165,7 +165,7 @@ func (s *Sink) Ack(ctx context.Context, e *Event) error {
 		s.logger.Error(err, "ack", e.ID, "stream", e.StreamName)
 		return err
 	}
-	s.logger.Debug("ack", "event", e.ID, "stream", e.StreamName)
+	s.logger.Debug("acked", "event", e.ID, "stream", e.StreamName)
 	return nil
 }
 
@@ -207,7 +207,7 @@ func (s *Sink) AddStream(ctx context.Context, stream *Stream, opts ...AddStreamO
 	}
 	s.consumersMap[stream.Name] = cm
 	s.notifyStreamChange()
-	s.logger.Info("added stream to sink", "stream", stream.Name)
+	s.logger.Info("added", "stream", stream.Name)
 	return nil
 }
 
@@ -246,7 +246,7 @@ func (s *Sink) RemoveStream(ctx context.Context, stream *Stream) error {
 		}
 	}
 	s.notifyStreamChange()
-	s.logger.Info("removed stream from sink", "stream", stream.Name)
+	s.logger.Info("removed", "stream", stream.Name)
 	return nil
 }
 
@@ -359,7 +359,7 @@ func (s *Sink) manageStaleMessages() {
 				// removing a consumer that still owns messages in the PEL.
 				if time.Now().Unix()-lastKeepAliveTime > 2*ackSeconds {
 					// Consumer is stale, remove it
-					s.logger.Info("removing stale consumer", "consumer", consumer)
+					s.logger.Info("removing", "stale-consumer", consumer)
 					s.removeConsumer(ctx, consumer)
 				}
 			}
@@ -402,7 +402,7 @@ func (s *Sink) claimStaleMessages(ctx context.Context, consumer string) error {
 func (s *Sink) claim(ctx context.Context, streamName string, args redis.XAutoClaimArgs) (string, error) {
 	messages, start, err := s.rdb.XAutoClaim(ctx, &args).Result()
 	if len(messages) > 0 {
-		s.logger.Info("stale messages", "stale-consumer", args.Consumer, "count", len(messages))
+		s.logger.Info("claimed", "stale-consumer", args.Consumer, "messages", len(messages))
 		streamEvents(streamName, args.Stream, s.Name, messages, s.eventMatcher, s.c, s.rdb, s.logger)
 	}
 	return start, err
@@ -414,7 +414,9 @@ func (s *Sink) readGroup(ctx context.Context) ([]redis.XStream, error) {
 	readStreams := make([]string, len(s.streamCursors))
 	copy(readStreams, s.streamCursors)
 	s.lock.Unlock()
-	s.logger.Debug("reading", "streams", readStreams, "max", s.maxPolled, "block", s.blockDuration)
+	if s.blockDuration > 4*time.Second {
+		s.logger.Debug("reading", "streams", readStreams, "max", s.maxPolled, "block", s.blockDuration)
+	}
 	return s.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
 		Group:    s.Name,
 		Consumer: s.consumer,

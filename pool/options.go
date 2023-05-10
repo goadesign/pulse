@@ -14,12 +14,13 @@ type (
 	WorkerOption func(*workerOption)
 
 	poolOption struct {
-		workerTTL           time.Duration
-		leaseTTL            time.Duration
-		maxQueuedJobs       int
-		maxShutdownDuration time.Duration
-		clientOnly          bool
-		logger              ponos.Logger
+		workerTTL            time.Duration
+		leaseTTL             time.Duration
+		maxQueuedJobs        int
+		maxShutdownDuration  time.Duration
+		clientOnly           bool
+		jobSinkBlockDuration time.Duration
+		logger               ponos.Logger
 	}
 
 	workerOption struct {
@@ -69,6 +70,14 @@ func WithClientOnly() PoolOption {
 	}
 }
 
+// WithJobSinkBlockDuration sets the duration to block when reading from the
+// job stream. The default is 5s. This option is mostly useful for testing.
+func WithJobSinkBlockDuration(d time.Duration) PoolOption {
+	return func(o *poolOption) {
+		o.jobSinkBlockDuration = d
+	}
+}
+
 // WithLogger sets the handler used to report temporary errors.
 func WithLogger(logger ponos.Logger) PoolOption {
 	return func(o *poolOption) {
@@ -79,11 +88,12 @@ func WithLogger(logger ponos.Logger) PoolOption {
 // defaultPoolOptions returns the default options.
 func defaultPoolOptions() *poolOption {
 	return &poolOption{
-		workerTTL:           10 * time.Second,
-		leaseTTL:            5 * time.Second,
-		maxQueuedJobs:       1000,
-		maxShutdownDuration: 2 * time.Minute,
-		logger:              ponos.NoopLogger(),
+		workerTTL:            10 * time.Second,
+		leaseTTL:             5 * time.Second,
+		maxQueuedJobs:        1000,
+		maxShutdownDuration:  2 * time.Minute,
+		jobSinkBlockDuration: 5 * time.Second,
+		logger:               ponos.NoopLogger(),
 	}
 }
 

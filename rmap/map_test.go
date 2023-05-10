@@ -256,7 +256,7 @@ func TestLogs(t *testing.T) {
 	assert.Contains(t, buf.String(), `foo=bar`)
 	assert.Contains(t, buf.String(), `msg=deleted key=foo`)
 	assert.Contains(t, buf.String(), `reset`)
-	assert.Contains(t, buf.String(), `closed`)
+	assert.Contains(t, buf.String(), `stopped`)
 }
 
 func TestJoinErrors(t *testing.T) {

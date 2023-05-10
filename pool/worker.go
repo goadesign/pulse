@@ -25,17 +25,17 @@ type (
 		// CreatedAt is the time the worker was created.
 		CreatedAt time.Time
 
-		stream            *streaming.Stream
-		reader            *streaming.Reader
-		c                 chan *Job
-		done              chan struct{}
-		workersMap        *rmap.Map
-		keepAliveMap      *rmap.Map
-		workerShutdownMap *rmap.Map
-		workerTTL         time.Duration
-		jobTTL            time.Duration
-		logger            ponos.Logger
-		wg                sync.WaitGroup
+		stream       *streaming.Stream
+		reader       *streaming.Reader
+		c            chan *Job
+		done         chan struct{}
+		workersMap   *rmap.Map
+		keepAliveMap *rmap.Map
+		shutdownMap  *rmap.Map
+		workerTTL    time.Duration
+		jobTTL       time.Duration
+		logger       ponos.Logger
+		wg           sync.WaitGroup
 
 		lock    sync.Mutex
 		stopped bool
@@ -63,36 +63,34 @@ func newWorker(ctx context.Context, p *Node, opts ...WorkerOption) (*Worker, err
 		return nil, fmt.Errorf("failed to create reader for worker %q: %w", wid, err)
 	}
 	w := &Worker{
-		ID:                wid,
-		Pool:              p,
-		C:                 c,
-		CreatedAt:         time.Now(),
-		stream:            jobsStream,
-		reader:            reader,
-		c:                 c,
-		done:              make(chan struct{}),
-		workersMap:        p.workersMap,
-		keepAliveMap:      p.keepAliveMap,
-		workerShutdownMap: p.shutdownMap,
-		workerTTL:         p.workerTTL,
-		logger:            p.logger.WithPrefix("worker", wid),
+		ID:           wid,
+		Pool:         p,
+		C:            c,
+		CreatedAt:    time.Now(),
+		stream:       jobsStream,
+		reader:       reader,
+		c:            c,
+		done:         make(chan struct{}),
+		workersMap:   p.workersMap,
+		keepAliveMap: p.keepAliveMap,
+		shutdownMap:  p.shutdownMap,
+		workerTTL:    p.workerTTL,
+		logger:       p.logger.WithPrefix("worker", wid),
 	}
 
-	w.wg.Add(3)
+	w.wg.Add(2)
 	go w.handleEvents()
 	go w.keepAlive()
-	go w.handlePoolShutdown()
 
 	return w, nil
 }
 
 // Stop stops the worker and removes it from the pool. It is safe to call Stop
 // multiple times.
-func (w *Worker) Stop(ctx context.Context) error {
+func (w *Worker) Stop(ctx context.Context) {
 	w.lock.Lock()
 	if w.stopped {
 		w.lock.Unlock()
-		return nil
 	}
 	w.stopped = true
 	var err error
@@ -113,7 +111,6 @@ func (w *Worker) Stop(ctx context.Context) error {
 	w.lock.Unlock()
 	w.wg.Wait()
 	w.logger.Info("stopped")
-	return err
 }
 
 // handleEvents is the worker loop.
@@ -142,13 +139,12 @@ func (w *Worker) handleEvents() {
 						job.Key, job.CreatedAt.Round(time.Second), w.jobTTL))
 					continue
 				}
-				w.logger.Info("received job", "key", job.Key)
+				w.logger.Info("job", "key", job.Key)
+				job.w = w
 				w.c <- job
 			case evShutdown:
-				w.logger.Info("received stop", "node", string(msg.Payload))
-				if err := w.Stop(context.Background()); err != nil {
-					w.logger.Error(fmt.Errorf("failed to stop worker: %w", err))
-				}
+				w.logger.Info("stop", "from", string(msg.Payload))
+				go w.Stop(context.Background())
 			}
 		case <-w.done:
 			return
@@ -179,21 +175,6 @@ func (w *Worker) keepAlive() {
 		select {
 		case <-ticker.C:
 			update()
-		case <-w.done:
-			return
-		}
-	}
-}
-
-// handlePoolShutdown handles the shutdown signal by stopping the worker.
-func (w *Worker) handlePoolShutdown() {
-	defer w.wg.Done()
-	ctx := context.Background()
-	for {
-		select {
-		case <-w.workerShutdownMap.C:
-			w.Stop(ctx)
-			return
 		case <-w.done:
 			return
 		}

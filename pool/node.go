@@ -118,7 +118,8 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...PoolOp
 		if err != nil {
 			return nil, fmt.Errorf("failed to join pool jobs replicated map %q: %w", jobsMapName(name), err)
 		}
-		jobSink, err = jobStream.NewSink(ctx, "jobs")
+		jobSink, err = jobStream.NewSink(ctx, "jobs",
+			streaming.WithSinkBlockDuration(options.jobSinkBlockDuration))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create jobs sink for stream %q: %w", jobStreamName(name), err)
 		}
@@ -215,29 +216,17 @@ func (p *Node) Shutdown(ctx context.Context) error {
 	if p.clientOnly {
 		return fmt.Errorf("pool %q is client-only", p.Name)
 	}
-	p.logger.Info("requesting shutdown")
+	p.logger.Info("shutting down")
 	if _, err := p.jobStream.Add(ctx, evShutdown, []byte(p.NodeID)); err != nil {
 		p.lock.Unlock()
 		return fmt.Errorf("failed to add shutdown event to stream %q: %w", p.jobStream.Name, err)
 	}
 	p.lock.Unlock()
-	// Now wait for all workers to stop
-	for {
-		done := false
-		select {
-		case <-p.workersMap.C:
-			if p.workersMap.Len() > 0 {
-				continue
-			}
-			close(p.done)
-			done = true
-		case <-time.After(p.maxShutdownDuration):
-			p.logger.Error(fmt.Errorf("failed to shutdown pool %q: timeout after %s", p.Name, p.maxShutdownDuration))
-		}
-		if done {
-			break
-		}
+	// No need to lock, p.shuttingDown is true so workers can't be added
+	for _, w := range p.workers {
+		w.wg.Wait()
 	}
+	close(p.done)
 	p.wg.Wait()
 	p.lock.Lock()
 	p.cleanup()
@@ -304,16 +293,45 @@ func (p *Node) handleEvents() {
 				p.logger.Info("ignoring job, pool is shutting down")
 				continue
 			}
-			p.logger.Debug("routing job", "event", ev.ID)
+			p.logger.Debug("routing", "event", ev.ID)
 			if err := p.routeJob(ctx, ev); err != nil {
 				p.logger.Error(fmt.Errorf("failed to route job: %w", err))
 			}
 		case evShutdown:
-			p.jobSink.Stop()
-			p.logger.Info("broadcasting shutdown to all nodes")
+			p.jobSink.Stop() // Will close p.jobSink.C
 			if _, err := p.shutdownMap.Set(ctx, "shutdown", p.NodeID); err != nil {
 				p.logger.Error(fmt.Errorf("failed to set shutdown status in shutdown map: %w", err))
 			}
+		}
+	}
+}
+
+// managePendingJobs received notifications from the pending jobs replicated map
+// and acks jobs the pool created that are done, it then removes the job from
+// the map.  Note: if a job is assigned to a worker that never processes it then
+// the job stream will redeliver the job to the pool. The pool will then route
+// the job to another worker. This is why we don't need to explicitely delete
+// jobs from the pending jobs map after some time.
+func (p *Node) managePendingJobs() {
+	defer p.wg.Done()
+	ctx := context.Background()
+	c := p.pendingJobsMap.Subscribe()
+	for {
+		select {
+		case <-c:
+			p.handlePendingJobs(ctx)
+		case <-p.done:
+			hasPendingJobs := p.handlePendingJobs(ctx) > 0
+			for hasPendingJobs {
+				select {
+				case <-c:
+					hasPendingJobs = p.handlePendingJobs(ctx) > 0
+				case <-time.After(p.maxShutdownDuration):
+					p.logger.Error(fmt.Errorf("failed to drain pending jobs: timeout after %s", p.maxShutdownDuration))
+					hasPendingJobs = false
+				}
+			}
+			return
 		}
 	}
 }
@@ -322,7 +340,7 @@ func (p *Node) handleEvents() {
 // owned by the node when it is updated.
 func (p *Node) handleShutdown() {
 	defer p.wg.Done()
-	<-p.shutdownMap.C
+	<-p.shutdownMap.Subscribe()
 	p.lock.Lock()
 	defer p.lock.Unlock()
 	if p.stopping {
@@ -345,7 +363,7 @@ func (p *Node) handleShutdown() {
 	}
 	p.logger.Info("shutdown", "requested-by", requestingNode)
 	for _, w := range p.workers {
-		w.stream.Add(context.Background(), evShutdown, []byte(requestingNode), streaming.WithOnlyIfStreamExists())
+		w.stream.Add(context.Background(), evShutdown, []byte(requestingNode))
 	}
 }
 
@@ -387,7 +405,7 @@ func (p *Node) routeJob(ctx context.Context, ev *streaming.Event) error {
 			if horizon.After(time.Now()) {
 				activeIDs = append(activeIDs, id)
 			} else {
-				p.logger.Info("deleting stale worker", "id", id, "last seen", t, "TTL", p.workerTTL)
+				p.logger.Info("deleting", "worker", id, "last seen", t, "TTL", p.workerTTL)
 				if err := p.deleteWorker(ctx, id); err != nil {
 					p.logger.Error(fmt.Errorf("failed to delete worker %q: %w", id, err))
 				}
@@ -420,41 +438,12 @@ func (p *Node) routeJob(ctx context.Context, ev *streaming.Event) error {
 	}
 	// Use OnlyIfStreamExists to avoid creating a stream for a worker that
 	// just stopped. Job will get requeued.
-	if _, err := stream.Add(ctx, evJob, ev.Payload, streaming.WithOnlyIfStreamExists()); err != nil {
+	if _, err := stream.Add(ctx, evJob, ev.Payload); err != nil {
 		return fmt.Errorf("failed to add job to worker stream %q: %w", workerJobsStreamName(wid), err)
 	}
 	p.pendingJobs[jid] = ev
 
 	return nil
-}
-
-// managePendingJobs received notifications from the pending jobs replicated map
-// and acks jobs the pool created that are done, it then removes the job from
-// the map.  Note: if a job is assigned to a worker that never processes it then
-// the job stream will redeliver the job to the pool. The pool will then route
-// the job to another worker. This is why we don't need to explicitely delete
-// jobs from the pending jobs map after some time.
-func (p *Node) managePendingJobs() {
-	defer p.wg.Done()
-	ctx := context.Background()
-	for {
-		select {
-		case <-p.pendingJobsMap.C:
-			p.handlePendingJobs(ctx)
-		case <-p.done:
-			hasPendingJobs := p.handlePendingJobs(ctx) > 0
-			for hasPendingJobs {
-				select {
-				case <-p.pendingJobsMap.C:
-					hasPendingJobs = p.handlePendingJobs(ctx) > 0
-				case <-time.After(p.maxShutdownDuration):
-					p.logger.Error(fmt.Errorf("failed to drain pending jobs: timeout after %s", p.maxShutdownDuration))
-					hasPendingJobs = false
-				}
-			}
-			return
-		}
-	}
 }
 
 // handlePengingJobs handles pending jobs notifications. It checks whether a job
@@ -480,7 +469,7 @@ func (p *Node) handlePendingJobs(ctx context.Context) int {
 		if err := p.jobSink.Ack(ctx, job); err != nil {
 			p.logger.Error(fmt.Errorf("failed to ack job %q: %w", id, err))
 		}
-		p.logger.Debug("job acked", "id", id)
+		p.logger.Debug("acked", "job", id)
 	}
 	return len(p.pendingJobs)
 }

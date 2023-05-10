@@ -107,7 +107,7 @@ func newReader(ctx context.Context, stream *Stream, opts ...ReaderOption) (*Read
 		donechan:      make(chan struct{}),
 		streamschan:   make(chan struct{}),
 		eventMatcher:  eventMatcher,
-		logger:        stream.logger,
+		logger:        stream.rootLogger,
 		rdb:           stream.rdb,
 	}
 
@@ -140,7 +140,7 @@ func (r *Reader) AddStream(ctx context.Context, stream *Stream, opts ...AddStrea
 	r.streamKeys = append(r.streamKeys, stream.key)
 	r.streamCursors = append(r.streamCursors, startID)
 	r.notifyStreamChange()
-	r.logger.Info("added stream to reader", "stream", stream.Name)
+	r.logger.Info("added", "stream", stream.Name)
 	return nil
 }
 
@@ -157,7 +157,7 @@ func (r *Reader) RemoveStream(ctx context.Context, stream *Stream) error {
 		}
 	}
 	r.notifyStreamChange()
-	r.logger.Info("removed stream from reader", "stream", stream.Name)
+	r.logger.Info("removed", "stream", stream.Name)
 	return nil
 }
 
@@ -226,7 +226,9 @@ func (r *Reader) xread(ctx context.Context) ([]redis.XStream, error) {
 	readStreams = append(readStreams, r.streamCursors...)
 	r.lock.Unlock()
 
-	r.logger.Debug("reading", "streams", readStreams, "max", r.maxPolled, "block", r.blockDuration)
+	if r.blockDuration > 4*time.Second {
+		r.logger.Debug("reading", "streams", readStreams, "max", r.maxPolled, "block", r.blockDuration)
+	}
 	return r.rdb.XRead(ctx, &redis.XReadArgs{
 		Streams: readStreams,
 		Count:   r.maxPolled,
@@ -346,11 +348,7 @@ func streamEvents(
 			logger.Debug("event did not match event matcher", "stream", streamName, "event", ev.ID)
 			continue
 		}
-		if sinkName != "" {
-			logger.Debug("event received", "stream", streamName, "sink", sinkName, "event", ev.ID)
-		} else {
-			logger.Debug("event received", "stream", streamName, "event", ev.ID)
-		}
+		logger.Debug("event", "stream", streamName, "event", ev.ID)
 		c <- ev
 	}
 }

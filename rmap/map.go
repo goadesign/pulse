@@ -20,22 +20,13 @@ type (
 	// change. Multiple processes can join the same replicated map and
 	// update it.
 	Map struct {
-		// C is the channel that receives notifications when the map
-		// changes. The channel is closed when the map is stopped. This
-		// channel simply notifies that the map has changed, it does not
-		// provide the actual changes, instead the Map method should be
-		// used to read the current content.  This allows the
-		// notification to be sent without blocking. Multiple remote
-		// updates may result in a single notification.
-		C <-chan struct{}
-
 		stopping bool // true if Stop was called
 		stopped  bool // stopped is true once Stop finishes.
 		name     string
 		chankey  string                // Redis pubsub channel name
 		hashkey  string                // Redis hash key
 		msgch    <-chan *redis.Message // channel to receive map updates
-		notifych chan struct{}         // channel to send notifications
+		chans    []chan struct{}       // channels to send notifications
 		done     chan struct{}         // channel to signal shutdown
 		wait     sync.WaitGroup        // wait for read goroutine to exit
 		logger   ponos.Logger          // logger
@@ -153,23 +144,20 @@ func Join(ctx context.Context, name string, rdb *redis.Client, options ...MapOpt
 	for _, o := range options {
 		o(opts)
 	}
-	c := make(chan struct{}, 1) // Buffer 1 notification so we don't have to block.
 	sm := &Map{
-		C:        c,
-		name:     name,
-		chankey:  fmt.Sprintf("map:%s:updates", name),
-		hashkey:  fmt.Sprintf("map:%s:content", name),
-		notifych: c,
-		done:     make(chan struct{}),
-		logger:   opts.Logger.WithPrefix("map", name),
-		rdb:      rdb,
-		set:      redis.NewScript(luaSet),
-		incr:     redis.NewScript(luaIncr),
-		append:   redis.NewScript(luaAppend),
-		remove:   redis.NewScript(luaRemove),
-		del:      redis.NewScript(luaDelete),
-		reset:    redis.NewScript(luaReset),
-		content:  make(map[string]string),
+		name:    name,
+		chankey: fmt.Sprintf("map:%s:updates", name),
+		hashkey: fmt.Sprintf("map:%s:content", name),
+		done:    make(chan struct{}),
+		logger:  opts.Logger.WithPrefix("map", name),
+		rdb:     rdb,
+		set:     redis.NewScript(luaSet),
+		incr:    redis.NewScript(luaIncr),
+		append:  redis.NewScript(luaAppend),
+		remove:  redis.NewScript(luaRemove),
+		del:     redis.NewScript(luaDelete),
+		reset:   redis.NewScript(luaReset),
+		content: make(map[string]string),
 	}
 	if err := sm.init(ctx); err != nil {
 		return nil, err
@@ -207,11 +195,28 @@ func (sm *Map) Keys() []string {
 	return keys
 }
 
+// Subscribe returns a channel that receives notifications when the map
+// changes. The channel is closed when the map is stopped. This channel simply
+// notifies that the map has changed, it does not provide the actual changes,
+// instead the Map method should be used to read the current content.  This
+// allows the notification to be sent without blocking. Multiple remote updates
+// may result in a single notification.
+// Subscribe returns nil if the map is stopped.
+func (sm *Map) Subscribe() <-chan struct{} {
+	sm.lock.Lock()
+	defer sm.lock.Unlock()
+	if sm.stopping {
+		return nil
+	}
+	c := make(chan struct{}, 1) // Buffer 1 notification so we don't have to block.
+	sm.chans = append(sm.chans, c)
+	return c
+}
+
 // Len returns the number of items in the replicated map.
 func (sm *Map) Len() int {
 	sm.lock.Lock()
 	defer sm.lock.Unlock()
-
 	return len(sm.content)
 }
 
@@ -219,7 +224,6 @@ func (sm *Map) Len() int {
 func (sm *Map) Get(key string) (string, bool) {
 	sm.lock.Lock()
 	defer sm.lock.Unlock()
-
 	res, ok := sm.content[key]
 	return res, ok
 }
@@ -227,6 +231,11 @@ func (sm *Map) Get(key string) (string, bool) {
 // Set sets the value for the given key and returns the previous value. An error
 // is returned if the key is empty or contains an equal sign.
 func (sm *Map) Set(ctx context.Context, key, value string) (string, error) {
+	sm.lock.Lock()
+	defer sm.lock.Unlock()
+	if sm.stopping {
+		return "", fmt.Errorf("ponos map: %s is stopped", sm.name)
+	}
 	prev, err := sm.runLuaScript(ctx, "set", sm.set, key, value)
 	if err != nil {
 		return "", err
@@ -241,6 +250,11 @@ func (sm *Map) Set(ctx context.Context, key, value string) (string, error) {
 // value must represent an integer. An error is returned if the key is empty,
 // contains an equal sign or if the value does not represent an integer.
 func (sm *Map) Increment(ctx context.Context, key string, delta int) (int, error) {
+	sm.lock.Lock()
+	defer sm.lock.Unlock()
+	if sm.stopping {
+		return 0, fmt.Errorf("ponos map: %s is stopped", sm.name)
+	}
 	res, err := sm.runLuaScript(ctx, "incr", sm.incr, key, delta)
 	if err != nil {
 		return 0, err
@@ -257,6 +271,11 @@ func (sm *Map) Increment(ctx context.Context, key string, delta int) (int, error
 // (so items should not have commas in them). An error is returned if the key is
 // empty or contains an equal sign.
 func (sm *Map) AppendValues(ctx context.Context, key string, items ...string) ([]string, error) {
+	sm.lock.Lock()
+	defer sm.lock.Unlock()
+	if sm.stopping {
+		return nil, fmt.Errorf("ponos map: %s is stopped", sm.name)
+	}
 	sitems := strings.Join(items, ",")
 	res, err := sm.runLuaScript(ctx, "append", sm.append, key, sitems)
 	if err != nil {
@@ -273,6 +292,11 @@ func (sm *Map) AppendValues(ctx context.Context, key string, items ...string) ([
 // If the removal results in an empty slice then the key is automatically
 // deleted. An error is returned if key is empty or contains an equal sign.
 func (sm *Map) RemoveValues(ctx context.Context, key string, items ...string) ([]string, error) {
+	sm.lock.Lock()
+	defer sm.lock.Unlock()
+	if sm.stopping {
+		return nil, fmt.Errorf("ponos map: %s is stopped", sm.name)
+	}
 	sitems := strings.Join(items, ",")
 	res, err := sm.runLuaScript(ctx, "remove", sm.remove, key, sitems)
 	if err != nil {
@@ -289,6 +313,11 @@ func (sm *Map) RemoveValues(ctx context.Context, key string, items ...string) ([
 
 // Delete deletes the value for the given key and returns the previous value.
 func (sm *Map) Delete(ctx context.Context, key string) (string, error) {
+	sm.lock.Lock()
+	defer sm.lock.Unlock()
+	if sm.stopping {
+		return "", fmt.Errorf("ponos map: %s is stopped", sm.name)
+	}
 	prev, err := sm.runLuaScript(ctx, "delete", sm.del, key)
 	if err != nil {
 		return "", err
@@ -301,6 +330,11 @@ func (sm *Map) Delete(ctx context.Context, key string) (string, error) {
 
 // Reset clears the map content.
 func (sm *Map) Reset(ctx context.Context) error {
+	sm.lock.Lock()
+	defer sm.lock.Unlock()
+	if sm.stopping {
+		return fmt.Errorf("ponos map: %s is stopped", sm.name)
+	}
 	_, err := sm.runLuaScript(ctx, "reset", sm.reset, "*")
 	return err
 }
@@ -357,7 +391,10 @@ func (sm *Map) init(ctx context.Context) error {
 // received and sends notifications when needed.
 func (sm *Map) run() {
 	defer func() {
-		close(sm.notifych)
+		// no need to lock, stopping is true
+		for _, c := range sm.chans {
+			close(c)
+		}
 		sm.sub.Close()
 		sm.wait.Done()
 	}()
@@ -386,11 +423,13 @@ func (sm *Map) run() {
 				sm.logger.Debug("deleted", "key", key)
 			default:
 				sm.content[key] = val
-				sm.logger.Debug("set", key, val)
+				// sm.logger.Debug("set", key, val)
 			}
-			select {
-			case sm.notifych <- struct{}{}:
-			default:
+			for _, c := range sm.chans {
+				select {
+				case c <- struct{}{}:
+				default:
+				}
 			}
 			sm.lock.Unlock()
 
@@ -410,12 +449,6 @@ func (sm *Map) runLuaScript(ctx context.Context, name string, script *redis.Scri
 	if strings.Contains(key, "=") {
 		return nil, fmt.Errorf("ponos map: %s key %q cannot contain '=' in %q", sm.name, key, name)
 	}
-	sm.lock.Lock()
-	defer sm.lock.Unlock()
-	if sm.stopped {
-		return nil, fmt.Errorf("ponos map: %s is stopped", sm.name)
-	}
-
 	res, err := script.Eval(
 		ctx,
 		sm.rdb,

@@ -43,11 +43,12 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		c := m.Subscribe()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-m.C:
+			case <-c:
 				if len(m.Map()) == numitems {
 					return
 				}

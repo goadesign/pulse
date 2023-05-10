@@ -41,5 +41,7 @@ func (job *Job) Ack(ctx context.Context) {
 	mjob := string(marshalPendingJob(pendingJob))
 	if _, err := job.w.Pool.pendingJobsMap.Set(ctx, pendingJobID, mjob); err != nil {
 		job.w.logger.Error(fmt.Errorf("failed to ack job %s (will be redelivered): %w", job.Key, err))
+	} else {
+		job.w.logger.Info("acked", "job", job.Key)
 	}
 }

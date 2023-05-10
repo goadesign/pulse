@@ -136,7 +136,10 @@ func (s *Stream) Add(ctx context.Context, name string, payload []byte, opts ...A
 		NoMkStream: options.OnlyIfStreamExists,
 	}).Result()
 	if err != nil {
-		if err != redis.Nil {
+		if err == redis.Nil {
+			// Stream does not exist and OnlyIfStreamExists option was used.
+			err = nil
+		} else {
 			err := fmt.Errorf("failed to add event: %w", err)
 			s.logger.Error(err, "event", name)
 		}
