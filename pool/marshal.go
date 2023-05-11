@@ -76,6 +76,9 @@ func unmarshalJobKey(data []byte) string {
 // marshalPendingJob marshals j into a string.
 func marshalPendingJob(job *pendingJob) string {
 	var buf bytes.Buffer
+	if err := binary.Write(&buf, binary.LittleEndian, job.Done); err != nil {
+		panic(err)
+	}
 	if err := binary.Write(&buf, binary.LittleEndian, int32(len(job.Key))); err != nil {
 		panic(err)
 	}
@@ -85,16 +88,17 @@ func marshalPendingJob(job *pendingJob) string {
 	if err := binary.Write(&buf, binary.LittleEndian, job.CreatedAt); err != nil {
 		panic(err)
 	}
-	if err := binary.Write(&buf, binary.LittleEndian, job.Done); err != nil {
-		panic(err)
-	}
 	return buf.String()
 }
 
-// unmarshalPendingJob unmarshals a poolJob from a byte slice created by marshalPoolJob.
+// unmarshalPendingJob unmarshals a pendingJob from a byte slice created by
+// marshalPendingJob.
 func unmarshalPendingJob(s string) *pendingJob {
 	var job pendingJob
 	reader := bytes.NewReader([]byte(s))
+	if err := binary.Read(reader, binary.LittleEndian, &job.Done); err != nil {
+		panic(err)
+	}
 	var keyLength int32
 	if err := binary.Read(reader, binary.LittleEndian, &keyLength); err != nil {
 		panic(err)
@@ -107,8 +111,16 @@ func unmarshalPendingJob(s string) *pendingJob {
 	if err := binary.Read(reader, binary.LittleEndian, &job.CreatedAt); err != nil {
 		panic(err)
 	}
-	if err := binary.Read(reader, binary.LittleEndian, &job.Done); err != nil {
+	return &job
+}
+
+// unmarshalPendingJobDone unmarshals the Done field of a pendingJob from a byte
+// slice created by marshalPendingJob.
+func unmarshalPendingJobDone(s string) bool {
+	var done bool
+	reader := bytes.NewReader([]byte(s))
+	if err := binary.Read(reader, binary.LittleEndian, &done); err != nil {
 		panic(err)
 	}
-	return &job
+	return done
 }

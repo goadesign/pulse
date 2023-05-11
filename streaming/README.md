@@ -43,10 +43,10 @@ The code above creates a stream named "my-stream" and adds a new event to it.
 The event is then consumed by a reader. The reader is stopped after the event
 is consumed.
 
-Multiple readers can be created for the same stream. Readers are independent and
-each instance receives a copy of the same events. Readers can specify a start
-position for the stream cursor. The default start position is the last event in
-the stream.
+Multiple readers can be created for the same stream across many nodes. Readers
+are independent and each instance receives a copy of the same events. Readers
+can specify a start position for the stream cursor. The default start position
+is the last event in the stream.
 
 ```go
 // Create stream "my-stream"
@@ -62,8 +62,10 @@ reader := streaming.NewReader(context.Background(), streaming.WithReaderStartAtO
 // Read both events
 event := <-reader.C
 fmt.Printf("reader 1, event: %s, payload: %s\n", event.Name, event.Payload)
+// Prints "reader 1, event: event1, payload: payload1"
 event = <-reader.C
 fmt.Printf("reader 1, event: %s, payload: %s\n", event.Name, event.Payload)
+// Prints "reader 1, event: event2, payload: payload2"
 
 // Create another reader for stream "my-stream" and start reading after the
 // first event
@@ -78,7 +80,7 @@ fmt.Printf("reader 2, event: %s, payload: %s\n", event.Name, event.Payload)
 ## Event Sinks
 
 Event sinks enable concurrent processing of multiple events for better
-performance.  They also enable redundancy in case of node failure and network
+performance.  They also enable redundancy in case of node failure or network
 partitions.
 
 Event sinks make it possible for multiple nodes to share the same stream cursor.
@@ -87,9 +89,8 @@ same sink (i.e. a sink with the same name), then each node will receive a unique
 event from the sequence. Nodes using a different sink (or a reader) will receive
 copies of the same events.  
 
-Sink nodes maintain a keep-alive timestamp and Ponos automatically requeues
-events that have been read by a node but not yet acknowledged passed the ack
-grace period configured when creating the sink.
+Sink events must be acknowledged by the client. Ponos automatically requeues
+events added to a sink that have been read by a node but not acknowledged.
 
 Creating a sink is as simple as:
 

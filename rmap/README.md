@@ -1,7 +1,7 @@
 # Replicated Map
 
 Replicated maps provide a mechanism for sharing data across a fleet of
-microservices and receiving events when the data changes.
+microservices.
 
 ## Overview
 
@@ -11,14 +11,17 @@ automatically replicated to all nodes and results in a notification that can be
 used to trigger actions.
 
 Upon joining a replicated map the node receives an up-to-date snapshot of its
-content followed by updates as they occur.
+content. The replicated map then guarantees that any change to the map results
+in a notification no matter when the client calls the `Subscribe` method.
+
 
 ## Usage
 
 ### Creating a Replicated Map
 
 To create a replicated map you must provide a name and a Redis client. The name
-is used to namespace the Redis keys and pub/sub channels used by the map.
+is used to namespace the Redis keys and pub/sub channels used by the map. The
+map should later be closed to free up resources.
 
 ```go
 package main
@@ -41,6 +44,13 @@ func main() {
         if err != nil {
             panic(err)
         }
+
+        // ... use the map
+
+        // Cleanup when done
+        if err := m.Close(); err != nil {
+            panic(err)
+        }
 }
 ```
 
@@ -53,30 +63,39 @@ value for a given key. The `Set` method sets the value for a given key.
         // Print the current contents of the map
         fmt.Println(m.Map())
 
-        // Add a new key
-        m.Set(context.Background(), "foo", "bar")
+        // Add a new value, old contains the previous value for the key
+        old, err := m.Set(context.Background(), "foo", "bar")
 
-        // Keys set by the current process are available immediately
-        val, ok := m.Get("foo") // ok is true
+        // Retrieve a value
+        val, ok := m.Get("foo") // ok is true if the key exists
 ```
 
-### Cleaning Up
-
-When you are done with a replicated map you should cancel the context used to
-create it. This will cause the map to unsubscribe from the pub/sub channel and
-stop receiving updates.
+Additionally the `Map` struct exposes convenience methods to manage values that behave
+like slices and values that behave like counters:
 
 ```go
-        ctx, cancel := context.WithCancel(context.Background())
-        // Cleanup when done
-        defer cancel()
+        // Append new string values to the slice, returns the new slice
+        res, err := m.AppendValues(context.Background(), "my-array", "value1", "value2", "value3")
 
-        // Join or create a replicated map
-        m, err := rmap.Join(ctx, "my-map", client)
-        if err != nil {
-            panic(err)
-        }
+        // RemoveValues removes value from the slice, returns the new slice
+        res, err := m.RemoveValues(context.Background(), "my-array", "value1", "value2")
+
+        // Increment a counter by 42, they key must hold a valid string
+        // representation of an integer
+        res, err := m.Inc(context.Background(), "foo", 42)
 ```
+
+## When to Use Replicated Maps
+
+Replicated maps being stored in memory are not suitable for large data sets. They
+are also better suited for read-heavy workloads as reads are local but writes
+require a roundtrip to Redis.
+
+A good use case for replicated maps is metadata or configuration information that
+is shared across a fleet of microservices. For example a replicated map can be
+used to share the list of active users across a fleet of microservices. The
+microservices can then use the replicated map to check if a user is active
+without having to query a database.
 
 ## Example
 
@@ -104,35 +123,29 @@ func main() {
                 Password: os.Getenv("REDIS_PASSWORD"),
         })
     
-        ctx, cancel := context.WithCancel(context.Background())
-        // Cleanup when done
-        defer cancel()
-
         // Join or create a replicated map
+        ctx := context.Background()
         m, err := rmap.Join(ctx, "my-map", client)
         if err != nil {
                 panic(err)
         }
 
         // Start a goroutine to listen for updates
+        numUpdates := 100
         var wg sync.WaitGroup
         wg.Add(1)
         go func() {
-                for {
-                        select {
-                        case <-ctx.Done():
+                defer wg.Done()
+                for range m.C {
+                        if m.Len() == numUpdates {
+                                // We received all the updates
                                 return
-                        case <-m.C:
-                                if len(m.Map()) == 100 {
-                                        // We received all the updates
-                                        wg.Done()
-                                }
                         }
                 }
         }()
 
         // Send a few updates
-        for i := 0; i < 100; i++ {
+        for i := 0; i < numUpdates; i++ {
                 m.Set(ctx, "foo-" + strconv.Itoa(i+1), "bar")
         }
 

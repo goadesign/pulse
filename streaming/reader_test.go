@@ -64,7 +64,7 @@ func TestReaderReadSinceLastEvent(t *testing.T) {
 	// Create new reader with last event ID set to first event and read last event
 	reader2, err := s.NewReader(ctx, WithReaderStartAfter(eventID), WithReaderBlockDuration(testBlockDuration))
 	require.NoError(t, err)
-	defer reader2.Stop()
+	defer reader2.Close()
 	read = readOneReaderEvent(t, reader2)
 	assert.Equal(t, "event", read.EventName)
 	assert.Equal(t, []byte("payload2"), read.Payload)
@@ -72,7 +72,7 @@ func TestReaderReadSinceLastEvent(t *testing.T) {
 	// Create new reader with last event ID set to 0 and read the 2 events
 	reader3, err := s.NewReader(ctx, WithReaderStartAfter("0"), WithReaderBlockDuration(testBlockDuration))
 	require.NoError(t, err)
-	defer reader3.Stop()
+	defer reader3.Close()
 	read = readOneReaderEvent(t, reader3)
 	assert.Equal(t, "event", read.EventName)
 	assert.Equal(t, []byte("payload"), read.Payload)
@@ -97,8 +97,8 @@ func TestCleanupReader(t *testing.T) {
 	assert.Equal(t, []byte("payload"), read.Payload)
 
 	// Stop reader, destroy stream and check Redis keys are gone
-	reader.Stop()
-	assert.Eventually(t, func() bool { return reader.Stopped() }, wf, tck)
+	reader.Close()
+	assert.Eventually(t, func() bool { return reader.Closed() }, wf, tck)
 	assert.Equal(t, rdb.Exists(ctx, s.key).Val(), int64(1))
 	assert.NoError(t, s.Destroy(ctx))
 	assert.Eventually(t, func() bool { return rdb.Exists(ctx, s.key).Val() == 0 }, wf, tck)
@@ -190,7 +190,7 @@ func readOneReaderEvent(t *testing.T, reader *Reader) *Event {
 
 func cleanupReader(t *testing.T, ctx context.Context, s *Stream, reader *Reader) {
 	t.Helper()
-	reader.Stop()
-	assert.Eventually(t, func() bool { return reader.Stopped() }, wf, tck)
+	reader.Close()
+	assert.Eventually(t, func() bool { return reader.Closed() }, wf, tck)
 	assert.NoError(t, s.Destroy(ctx))
 }

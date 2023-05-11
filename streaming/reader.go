@@ -19,8 +19,8 @@ type (
 	Reader struct {
 		// C is the reader event channel.
 		C <-chan *Event
-		// stopped is true if Stop completed.
-		stopped bool
+		// closed is true if Close completed.
+		closed bool
 		// startID is the reader start event ID.
 		startID string
 		// lock is the reader mutex.
@@ -47,8 +47,8 @@ type (
 		streamschan chan struct{}
 		// wait is the reader cleanup wait group.
 		wait sync.WaitGroup
-		// stopping is true if Stop was called.
-		stopping bool
+		// closing is true if Close was called.
+		closing bool
 		// eventMatcher is the event matcher if any.
 		eventMatcher EventMatcherFunc
 		// logger is the logger used by the reader.
@@ -161,28 +161,29 @@ func (r *Reader) RemoveStream(ctx context.Context, stream *Stream) error {
 	return nil
 }
 
-// Stop stops event polling and closes the reader channel, it is idempotent.
-func (r *Reader) Stop() {
+// Close stops event polling and closes the reader channel. It is safe to call
+// Close multiple times.
+func (r *Reader) Close() {
 	r.lock.Lock()
-	if r.stopping {
+	if r.closing {
 		return
 	}
-	r.stopping = true
+	r.closing = true
 	close(r.donechan)
 	close(r.streamschan)
 	r.lock.Unlock()
 	r.wait.Wait()
 	r.lock.Lock()
 	defer r.lock.Unlock()
-	r.stopped = true
+	r.closed = true
 	r.logger.Info("stopped")
 }
 
-// Stopped returns true if the reader is stopped.
-func (r *Reader) Stopped() bool {
+// Closed returns true if the reader is stopped.
+func (r *Reader) Closed() bool {
 	r.lock.Lock()
 	defer r.lock.Unlock()
-	return r.stopped
+	return r.closed
 }
 
 // read reads events from the streams and sends them to the reader channel.
@@ -191,13 +192,13 @@ func (r *Reader) read() {
 	defer r.cleanup()
 	for {
 		streamsEvents, err := readOnce(ctx, r.xread, r.streamschan, r.donechan, r.logger)
-		if r.isStopping() {
+		if r.isClosing() {
 			return
 		}
 		if err != nil {
 			if err := handleReadError(err, r.logger); err != nil {
 				r.logger.Error(fmt.Errorf("fatal error while reading events: %w, stopping", err))
-				r.Stop()
+				r.Close()
 				return
 			}
 			continue
@@ -254,11 +255,11 @@ func (r *Reader) cleanup() {
 	r.wait.Done()
 }
 
-// isStopping returns true if the reader is stopping.
-func (r *Reader) isStopping() bool {
+// isClosing returns true if the reader is stopping.
+func (r *Reader) isClosing() bool {
 	r.lock.Lock()
 	defer r.lock.Unlock()
-	return r.stopping
+	return r.closing
 }
 
 // readOnce calls the provided readFn and returns the events or error.

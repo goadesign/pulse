@@ -137,8 +137,8 @@ func TestMapLocal(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "", old)
 	assert.Eventually(t, func() bool { return len(m.Map()) == 1 }, wf, tck)
-	assert.NoError(t, m.Stop())
-	assert.Eventually(t, func() bool { return m.stopped }, wf, tck)
+	assert.NoError(t, m.Close())
+	assert.Eventually(t, func() bool { return m.closed }, wf, tck)
 
 	// Check that we can still read the map after it has been closed.
 	assert.Equal(t, m.Len(), 1)
@@ -205,19 +205,19 @@ func TestIncrement(t *testing.T) {
 	defer cleanup(t, m)
 
 	const key = "foo"
-	res, err := m.Increment(ctx, key, 1)
+	res, err := m.Inc(ctx, key, 1)
 	assert.NoError(t, err)
 	assert.Equal(t, 1, res)
 	assert.Eventually(t, func() bool { return m.Map()[key] == "1" }, wf, tck)
-	res, err = m.Increment(ctx, key, 41)
+	res, err = m.Inc(ctx, key, 41)
 	assert.NoError(t, err)
 	assert.Equal(t, 42, res)
 	assert.Eventually(t, func() bool { return m.Map()[key] == "42" }, wf, tck)
-	res, err = m.Increment(ctx, key, -1)
+	res, err = m.Inc(ctx, key, -1)
 	assert.NoError(t, err)
 	assert.Equal(t, 41, res)
 	assert.Eventually(t, func() bool { return m.Map()[key] == "41" }, wf, tck)
-	res, err = m.Increment(ctx, key, -41)
+	res, err = m.Inc(ctx, key, -41)
 	assert.NoError(t, err)
 	assert.Equal(t, 0, res)
 	assert.Eventually(t, func() bool { return m.Map()[key] == "0" }, wf, tck)
@@ -248,8 +248,8 @@ func TestLogs(t *testing.T) {
 	assert.Eventually(t, func() bool { return len(m.Map()) == 1 }, wf, tck)
 	assert.NoError(t, m.Reset(ctx))
 	assert.Eventually(t, func() bool { return len(m.Map()) == 0 }, wf, tck)
-	assert.NoError(t, m.Stop())
-	assert.Eventually(t, func() bool { return m.stopped }, wf, tck)
+	assert.NoError(t, m.Close())
+	assert.Eventually(t, func() bool { return m.closed }, wf, tck)
 
 	// Check that the logs contain the expected messages
 	assert.Contains(t, buf.String(), `joined`)
@@ -360,8 +360,8 @@ func TestReconnect(t *testing.T) {
 func cleanup(t *testing.T, m *Map) {
 	t.Helper()
 	assert.NoError(t, m.Reset(context.Background()))
-	assert.NoError(t, m.Stop())
-	assert.Eventually(t, func() bool { return m.stopped }, wf, tck)
+	assert.NoError(t, m.Close())
+	assert.Eventually(t, func() bool { return m.closed }, wf, tck)
 }
 
 // Buffer is a goroutine safe bytes.Buffer

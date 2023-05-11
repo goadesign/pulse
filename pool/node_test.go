@@ -45,6 +45,39 @@ func TestDispatchJobOneWorker(t *testing.T) {
 	assert.Len(t, ln, 0)
 }
 
+func TestDispatchJobTwoWorkers(t *testing.T) {
+	var (
+		key     = "differentHash"
+		key2    = "testDispatchJobTwoWorkers"
+		payload = []byte("payload")
+		ctx     = testContext(t)
+		rdb     = redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+		node    = newTestNode(t, ctx, rdb)
+		worker1 = newTestWorker(t, ctx, node)
+		worker2 = newTestWorker(t, ctx, node)
+	)
+	err := node.DispatchJob(ctx, key, payload)
+	assert.NoError(t, err)
+	err = node.DispatchJob(ctx, key2, payload)
+	assert.NoError(t, err)
+	job1 := readOneWorkerJob(t, worker1)
+	job2 := readOneWorkerJob(t, worker2)
+	if job1 != nil {
+		job1.Ack(ctx)
+		assert.Equal(t, payload, job1.Payload)
+		assert.Equal(t, key, job1.Key)
+	}
+	if job2 != nil {
+		job2.Ack(ctx)
+		assert.Equal(t, payload, job2.Payload)
+		assert.Equal(t, key2, job2.Key)
+	}
+	assert.NoError(t, node.Shutdown(ctx))
+	ln, err := rdb.Keys(ctx, "*").Result()
+	assert.NoError(t, err)
+	assert.Len(t, ln, 0)
+}
+
 func TestStopThenShutdown(t *testing.T) {
 	var (
 		ctx    = testContext(t)
@@ -52,8 +85,11 @@ func TestStopThenShutdown(t *testing.T) {
 		node   = newTestNode(t, ctx, rdb)
 		worker = newTestWorker(t, ctx, node)
 	)
-	worker.Stop(ctx)
+	assert.NoError(t, node.RemoveWorker(ctx, worker))
 	assert.NoError(t, node.Shutdown(ctx))
+	ln, err := rdb.Keys(ctx, "*").Result()
+	assert.NoError(t, err)
+	assert.Len(t, ln, 0)
 }
 
 func newTestNode(t *testing.T, ctx context.Context, rdb *redis.Client) *Node {

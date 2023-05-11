@@ -20,26 +20,26 @@ type (
 	// change. Multiple processes can join the same replicated map and
 	// update it.
 	Map struct {
-		stopping bool // true if Stop was called
-		stopped  bool // stopped is true once Stop finishes.
-		name     string
-		chankey  string                // Redis pubsub channel name
-		hashkey  string                // Redis hash key
-		msgch    <-chan *redis.Message // channel to receive map updates
-		chans    []chan struct{}       // channels to send notifications
-		done     chan struct{}         // channel to signal shutdown
-		wait     sync.WaitGroup        // wait for read goroutine to exit
-		logger   ponos.Logger          // logger
-		sub      *redis.PubSub         // subscription to map updates
-		set      *redis.Script
-		append   *redis.Script
-		remove   *redis.Script
-		incr     *redis.Script
-		del      *redis.Script
-		reset    *redis.Script
-		rdb      *redis.Client
-		lock     sync.Mutex
-		content  map[string]string
+		closing bool // true if Close was called
+		closed  bool // stopped is true once Close finishes.
+		name    string
+		chankey string                // Redis pubsub channel name
+		hashkey string                // Redis hash key
+		msgch   <-chan *redis.Message // channel to receive map updates
+		chans   []chan struct{}       // channels to send notifications
+		done    chan struct{}         // channel to signal shutdown
+		wait    sync.WaitGroup        // wait for read goroutine to exit
+		logger  ponos.Logger          // logger
+		sub     *redis.PubSub         // subscription to map updates
+		set     *redis.Script
+		append  *redis.Script
+		remove  *redis.Script
+		incr    *redis.Script
+		del     *redis.Script
+		reset   *redis.Script
+		rdb     *redis.Client
+		lock    sync.Mutex
+		content map[string]string
 	}
 )
 
@@ -131,8 +131,8 @@ const luaRemove = `
 // content changes (note that multiple remote changes may result in a single
 // notification). The returned Map is safe for concurrent use.
 //
-// Call Close to stop updates and release resources resulting in a read-only
-// point-in-time copy.
+// Clients should call Close before exiting to stop updates and release
+// resources resulting in a read-only point-in-time copy.
 func Join(ctx context.Context, name string, rdb *redis.Client, options ...MapOption) (*Map, error) {
 	if !isValidRedisKeyName(name) {
 		return nil, fmt.Errorf("ponos map: not a valid map name %q", name)
@@ -205,7 +205,7 @@ func (sm *Map) Keys() []string {
 func (sm *Map) Subscribe() <-chan struct{} {
 	sm.lock.Lock()
 	defer sm.lock.Unlock()
-	if sm.stopping {
+	if sm.closing {
 		return nil
 	}
 	c := make(chan struct{}, 1) // Buffer 1 notification so we don't have to block.
@@ -233,7 +233,7 @@ func (sm *Map) Get(key string) (string, bool) {
 func (sm *Map) Set(ctx context.Context, key, value string) (string, error) {
 	sm.lock.Lock()
 	defer sm.lock.Unlock()
-	if sm.stopping {
+	if sm.closing {
 		return "", fmt.Errorf("ponos map: %s is stopped", sm.name)
 	}
 	prev, err := sm.runLuaScript(ctx, "set", sm.set, key, value)
@@ -246,13 +246,13 @@ func (sm *Map) Set(ctx context.Context, key, value string) (string, error) {
 	return prev.(string), nil
 }
 
-// Increment increments the value for the given key and returns the result, the
-// value must represent an integer. An error is returned if the key is empty,
-// contains an equal sign or if the value does not represent an integer.
-func (sm *Map) Increment(ctx context.Context, key string, delta int) (int, error) {
+// Inc increments the value for the given key and returns the result, the value
+// must represent an integer. An error is returned if the key is empty, contains
+// an equal sign or if the value does not represent an integer.
+func (sm *Map) Inc(ctx context.Context, key string, delta int) (int, error) {
 	sm.lock.Lock()
 	defer sm.lock.Unlock()
-	if sm.stopping {
+	if sm.closing {
 		return 0, fmt.Errorf("ponos map: %s is stopped", sm.name)
 	}
 	res, err := sm.runLuaScript(ctx, "incr", sm.incr, key, delta)
@@ -273,7 +273,7 @@ func (sm *Map) Increment(ctx context.Context, key string, delta int) (int, error
 func (sm *Map) AppendValues(ctx context.Context, key string, items ...string) ([]string, error) {
 	sm.lock.Lock()
 	defer sm.lock.Unlock()
-	if sm.stopping {
+	if sm.closing {
 		return nil, fmt.Errorf("ponos map: %s is stopped", sm.name)
 	}
 	sitems := strings.Join(items, ",")
@@ -294,7 +294,7 @@ func (sm *Map) AppendValues(ctx context.Context, key string, items ...string) ([
 func (sm *Map) RemoveValues(ctx context.Context, key string, items ...string) ([]string, error) {
 	sm.lock.Lock()
 	defer sm.lock.Unlock()
-	if sm.stopping {
+	if sm.closing {
 		return nil, fmt.Errorf("ponos map: %s is stopped", sm.name)
 	}
 	sitems := strings.Join(items, ",")
@@ -315,7 +315,7 @@ func (sm *Map) RemoveValues(ctx context.Context, key string, items ...string) ([
 func (sm *Map) Delete(ctx context.Context, key string) (string, error) {
 	sm.lock.Lock()
 	defer sm.lock.Unlock()
-	if sm.stopping {
+	if sm.closing {
 		return "", fmt.Errorf("ponos map: %s is stopped", sm.name)
 	}
 	prev, err := sm.runLuaScript(ctx, "delete", sm.del, key)
@@ -332,27 +332,27 @@ func (sm *Map) Delete(ctx context.Context, key string) (string, error) {
 func (sm *Map) Reset(ctx context.Context) error {
 	sm.lock.Lock()
 	defer sm.lock.Unlock()
-	if sm.stopping {
+	if sm.closing {
 		return fmt.Errorf("ponos map: %s is stopped", sm.name)
 	}
 	_, err := sm.runLuaScript(ctx, "reset", sm.reset, "*")
 	return err
 }
 
-// Stop closes the connection to the map, freeing resources. It is safe to
-// call Stop multiple times.
-func (sm *Map) Stop() error {
+// Close closes the connection to the map, freeing resources. It is safe to
+// call Close multiple times.
+func (sm *Map) Close() error {
 	sm.lock.Lock()
-	if sm.stopping {
+	if sm.closing {
 		return nil
 	}
-	sm.stopping = true
+	sm.closing = true
 	close(sm.done)
 	sm.lock.Unlock()
 	sm.wait.Wait()
 	sm.lock.Lock()
 	defer sm.lock.Unlock()
-	sm.stopped = true
+	sm.closed = true
 	return nil
 }
 
@@ -395,7 +395,12 @@ func (sm *Map) run() {
 		for _, c := range sm.chans {
 			close(c)
 		}
-		sm.sub.Close()
+		if err := sm.sub.Unsubscribe(context.Background(), sm.chankey); err != nil {
+			sm.logger.Error(fmt.Errorf("failed to unsubscribe: %w", err))
+		}
+		if err := sm.sub.Close(); err != nil {
+			sm.logger.Error(fmt.Errorf("failed to close subscription: %w", err))
+		}
 		sm.wait.Done()
 	}()
 	for {
@@ -469,7 +474,7 @@ func (sm *Map) reconnect() {
 		count++
 		sm.logger.Info("reconnect", "attempt", count)
 		sm.lock.Lock()
-		if sm.stopping {
+		if sm.closing {
 			sm.lock.Unlock()
 			return
 		}

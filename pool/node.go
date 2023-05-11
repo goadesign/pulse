@@ -45,9 +45,9 @@ type (
 		workerStreams map[string]*streaming.Stream // worker streams indexed by ID
 		pendingJobs   map[string]*streaming.Event  // pending jobs indexed by unique ID
 		clientOnly    bool
-		stopping      bool
+		closing       bool
 		shuttingDown  bool
-		stopped       bool
+		closed        bool
 		shutdown      bool
 	}
 
@@ -167,8 +167,8 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...PoolOp
 func (p *Node) AddWorker(ctx context.Context, opts ...WorkerOption) (*Worker, error) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
-	if p.stopping || p.shuttingDown {
-		return nil, fmt.Errorf("pool %q is stopped", p.Name)
+	if p.closing || p.shuttingDown {
+		return nil, fmt.Errorf("pool %q is closed", p.Name)
 	}
 	if p.clientOnly {
 		return nil, fmt.Errorf("pool %q is client-only", p.Name)
@@ -182,12 +182,27 @@ func (p *Node) AddWorker(ctx context.Context, opts ...WorkerOption) (*Worker, er
 	return w, nil
 }
 
+// RemoveWorker stops the worker and removes it from the pool.
+func (p *Node) RemoveWorker(ctx context.Context, w *Worker) error {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	w.stop(ctx)
+	delete(p.workerStreams, w.ID)
+	for i, w2 := range p.workers {
+		if w2 == w {
+			p.workers = append(p.workers[:i], p.workers[i+1:]...)
+			break
+		}
+	}
+	return nil
+}
+
 // DispatchJob dispatches a job to the proper worker in the pool.
 func (p *Node) DispatchJob(ctx context.Context, key string, payload []byte) error {
 	p.lock.Lock()
 	defer p.lock.Unlock()
-	if p.stopping || p.shuttingDown {
-		return fmt.Errorf("pool %q is stopped", p.Name)
+	if p.closing || p.shuttingDown {
+		return fmt.Errorf("pool %q is closed", p.Name)
 	}
 	job := &Job{
 		Key:       key,
@@ -200,20 +215,21 @@ func (p *Node) DispatchJob(ctx context.Context, key string, payload []byte) erro
 	return nil
 }
 
-// Shutdown causes all nodes to stop accepting new jobs. Workers handle pending
-// jobs until they are processed or expire. Shutdown returns once all workers in
-// all nodes have stopped.
+// Shutdown stops the pool workers gracefully across all nodes. Workers handle
+// pending jobs until they are processed or expire and reject new jobs. Shutdown
+// returns once all workers in all nodes have stopped.
 func (p *Node) Shutdown(ctx context.Context) error {
 	p.lock.Lock()
-	if p.stopping {
+	if p.closing {
 		p.lock.Unlock()
-		return fmt.Errorf("pool %q is stopped", p.Name)
+		return fmt.Errorf("pool %q is closed", p.Name)
 	}
 	if p.shuttingDown {
 		p.lock.Unlock()
 		return nil
 	}
 	if p.clientOnly {
+		p.lock.Unlock()
 		return fmt.Errorf("pool %q is client-only", p.Name)
 	}
 	p.logger.Info("shutting down")
@@ -221,48 +237,52 @@ func (p *Node) Shutdown(ctx context.Context) error {
 		p.lock.Unlock()
 		return fmt.Errorf("failed to add shutdown event to stream %q: %w", p.jobStream.Name, err)
 	}
-	p.lock.Unlock()
-	// No need to lock, p.shuttingDown is true so workers can't be added
+	// Copy to avoid races
+	wgs := make([]*sync.WaitGroup, 0, len(p.workers))
 	for _, w := range p.workers {
-		w.wg.Wait()
+		wgs = append(wgs, &w.wg)
+	}
+	p.lock.Unlock()
+	for _, wg := range wgs {
+		wg.Wait()
 	}
 	close(p.done)
 	p.wg.Wait()
 	p.lock.Lock()
 	p.cleanup()
-	p.stopMaps()
+	p.closeMaps()
 	p.shutdown = true
 	p.lock.Unlock()
 	p.logger.Info("shutdown")
 	return nil
 }
 
-// Stop stops the pool node but does not stop workers running in other nodes.
-// One of Shutdown or Stop must be called before the node is garbage collected
-// unless it is client-only.
-func (p *Node) Stop(ctx context.Context) error {
+// Close stops the pool node but does not stop workers running in other nodes.
+// One of Shutdown or Close should be called before the node is garbage
+// collected unless it is client-only.
+func (p *Node) Close(ctx context.Context) error {
 	p.lock.Lock()
 	if p.shuttingDown {
 		p.lock.Unlock()
 		return fmt.Errorf("pool %q is shutdown", p.Name)
 	}
-	if p.stopping {
+	if p.closing {
 		p.lock.Unlock()
 		return nil
 	}
-	p.stopping = true
-	p.logger.Info("stopping")
+	p.closing = true
+	p.logger.Info("closing")
 	if !p.clientOnly {
-		p.jobSink.Stop()
+		p.jobSink.Close()
 	}
 	close(p.done)
 	p.lock.Unlock()
 	p.wg.Wait()
 	p.lock.Lock()
-	p.stopMaps()
-	p.stopped = true
+	p.closeMaps()
+	p.closed = true
 	p.lock.Unlock()
-	p.logger.Info("stopped")
+	p.logger.Info("closed")
 	return nil
 }
 
@@ -273,11 +293,11 @@ func (p *Node) IsShutdown() bool {
 	return p.shuttingDown
 }
 
-// IsStopped returns true if the node is stopped.
-func (p *Node) IsStopped() bool {
+// IsClosed returns true if the node is closed.
+func (p *Node) IsClosed() bool {
 	p.lock.Lock()
 	defer p.lock.Unlock()
-	return p.stopped
+	return p.closed
 }
 
 // handleEvents reads events from the pool job stream. If the event is a
@@ -298,7 +318,7 @@ func (p *Node) handleEvents() {
 				p.logger.Error(fmt.Errorf("failed to route job: %w", err))
 			}
 		case evShutdown:
-			p.jobSink.Stop() // Will close p.jobSink.C
+			p.jobSink.Close() // Will close p.jobSink.C
 			if _, err := p.shutdownMap.Set(ctx, "shutdown", p.NodeID); err != nil {
 				p.logger.Error(fmt.Errorf("failed to set shutdown status in shutdown map: %w", err))
 			}
@@ -307,11 +327,10 @@ func (p *Node) handleEvents() {
 }
 
 // managePendingJobs received notifications from the pending jobs replicated map
-// and acks jobs the pool created that are done, it then removes the job from
+// and acks jobs the node created that are done, it then removes the job from
 // the map.  Note: if a job is assigned to a worker that never processes it then
-// the job stream will redeliver the job to the pool. The pool will then route
-// the job to another worker. This is why we don't need to explicitely delete
-// jobs from the pending jobs map after some time.
+// the job stream will redeliver the job. A node will then route the job to
+// another worker.
 func (p *Node) managePendingJobs() {
 	defer p.wg.Done()
 	ctx := context.Background()
@@ -343,13 +362,13 @@ func (p *Node) handleShutdown() {
 	<-p.shutdownMap.Subscribe()
 	p.lock.Lock()
 	defer p.lock.Unlock()
-	if p.stopping {
+	if p.closing {
 		return
 	}
 	if p.clientOnly {
 		p.shuttingDown = true
 		p.shutdown = true
-		if err := p.shutdownMap.Stop(); err != nil {
+		if err := p.shutdownMap.Close(); err != nil {
 			p.logger.Error(fmt.Errorf("failed to stop shutdown map: %w", err))
 		}
 		return
@@ -367,13 +386,24 @@ func (p *Node) handleShutdown() {
 	}
 }
 
+const (
+	// maxRouteRetries is the maximum number of times a node retries to route a
+	// job to a worker. The retries are necessary to handle the case where a
+	// worker is added to the pool and the workers and keep-alive maps have not
+	// been replicated yet.
+	maxRouteRetries = 10
+
+	// retryRouteDelay is the delay between route retries.
+	retryRouteDelay = 100 * time.Millisecond
+)
+
 // routeJob routes a dispatched job to the proper worker. It records the job status as routed.
 func (p *Node) routeJob(ctx context.Context, ev *streaming.Event) error {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 	var activeIDs []string
 	retries := 0
-	for len(activeIDs) == 0 && retries < 10 {
+	for len(activeIDs) == 0 && retries < maxRouteRetries {
 		// First, retrieve workers and sort IDs by creation time.
 		workers := p.workersMap.Map()
 		workerCreatedAtByID := make(map[string]int64, len(workers))
@@ -416,7 +446,7 @@ func (p *Node) routeJob(ctx context.Context, ev *streaming.Event) error {
 			// and/or keep-alive maps has not been replicated yet.
 			p.logger.Info("no active worker in pool, waiting...")
 			retries++
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(retryRouteDelay)
 		}
 	}
 	if len(activeIDs) == 0 {
@@ -453,7 +483,7 @@ func (p *Node) handlePendingJobs(ctx context.Context) int {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 	if p.shuttingDown {
-		return 0 // job sink might be gone
+		return 0 // job sink might be gone, not point in acking
 	}
 	pending := p.pendingJobsMap.Map()
 	for id, job := range p.pendingJobs {
@@ -461,8 +491,7 @@ func (p *Node) handlePendingJobs(ctx context.Context) int {
 		if !ok {
 			continue
 		}
-		pjob := unmarshalPendingJob(pj)
-		if !pjob.Done {
+		if !unmarshalPendingJobDone(pj) {
 			continue
 		}
 		delete(p.pendingJobs, id)
@@ -495,19 +524,19 @@ func (p *Node) cleanup() error {
 	return nil
 }
 
-// stopMaps stops all replicated maps.
-func (p *Node) stopMaps() {
-	if err := p.shutdownMap.Stop(); err != nil {
+// closeMaps stops all replicated maps.
+func (p *Node) closeMaps() {
+	if err := p.shutdownMap.Close(); err != nil {
 		p.logger.Error(fmt.Errorf("failed to stop shutdown map: %w", err))
 	}
 	if !p.clientOnly {
-		if err := p.keepAliveMap.Stop(); err != nil {
+		if err := p.keepAliveMap.Close(); err != nil {
 			p.logger.Error(fmt.Errorf("failed to stop keep-alive map: %w", err))
 		}
-		if err := p.workersMap.Stop(); err != nil {
+		if err := p.workersMap.Close(); err != nil {
 			p.logger.Error(fmt.Errorf("failed to stop workers map: %w", err))
 		}
-		if err := p.pendingJobsMap.Stop(); err != nil {
+		if err := p.pendingJobsMap.Close(); err != nil {
 			p.logger.Error(fmt.Errorf("failed to stop pending jobs map: %w", err))
 		}
 	}

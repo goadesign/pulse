@@ -85,9 +85,9 @@ func newWorker(ctx context.Context, p *Node, opts ...WorkerOption) (*Worker, err
 	return w, nil
 }
 
-// Stop stops the worker and removes it from the pool. It is safe to call Stop
-// multiple times.
-func (w *Worker) Stop(ctx context.Context) {
+// stop stops the reader, the worker goroutines and removes the worker from the
+// workers and keep-alive maps.
+func (w *Worker) stop(ctx context.Context) {
 	w.lock.Lock()
 	if w.stopped {
 		w.lock.Unlock()
@@ -100,7 +100,7 @@ func (w *Worker) Stop(ctx context.Context) {
 	if _, er := w.keepAliveMap.Delete(ctx, w.ID); er != nil {
 		err = fmt.Errorf("failed to remove worker %q from keep alive map: %w", w.ID, er)
 	}
-	w.reader.Stop()
+	w.reader.Close()
 	if er := w.stream.Destroy(ctx); er != nil {
 		err = fmt.Errorf("failed to destroy stream for worker %q: %w", w.ID, er)
 	}
@@ -144,7 +144,12 @@ func (w *Worker) handleEvents() {
 				w.c <- job
 			case evShutdown:
 				w.logger.Info("stop", "from", string(msg.Payload))
-				go w.Stop(context.Background())
+				go func() {
+					err := w.Pool.RemoveWorker(context.Background(), w)
+					if err != nil {
+						w.logger.Error(fmt.Errorf("failed to stop worker %q: %w", w.ID, err))
+					}
+				}()
 			}
 		case <-w.done:
 			return

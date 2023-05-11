@@ -80,7 +80,7 @@ func TestReadSinceLastEvent(t *testing.T) {
 		WithSinkStartAfter(eventID),
 		WithSinkBlockDuration(testBlockDuration))
 	require.NoError(t, err)
-	defer sink2.Stop()
+	defer sink2.Close()
 	read = readOneEvent(t, ctx, sink2)
 	assert.Equal(t, "event", read.EventName)
 	assert.Equal(t, []byte("payload2"), read.Payload)
@@ -90,7 +90,7 @@ func TestReadSinceLastEvent(t *testing.T) {
 		WithSinkStartAfter("0"),
 		WithSinkBlockDuration(testBlockDuration))
 	require.NoError(t, err)
-	defer sink3.Stop()
+	defer sink3.Close()
 	read = readOneEvent(t, ctx, sink3)
 	assert.Equal(t, "event", read.EventName)
 	assert.Equal(t, []byte("payload"), read.Payload)
@@ -117,8 +117,8 @@ func TestCleanup(t *testing.T) {
 	assert.Equal(t, []byte("payload"), read.Payload)
 
 	// Stop sink, destroy stream and check Redis keys are gone
-	sink.Stop()
-	assert.Eventually(t, func() bool { return sink.Stopped() }, wf, tck)
+	sink.Close()
+	assert.Eventually(t, func() bool { return sink.Closed() }, wf, tck)
 	assert.Equal(t, rdb.Exists(ctx, s.key).Val(), int64(1))
 	assert.NoError(t, s.Destroy(ctx))
 	assert.Eventually(t, func() bool { return rdb.Exists(ctx, s.key).Val() == 0 }, wf, tck)
@@ -223,8 +223,8 @@ func TestMultipleConsumers(t *testing.T) {
 		withSinkAckGracePeriod(testAckDuration))
 	require.NoError(t, err)
 	defer func() {
-		sink2.Stop()
-		assert.Eventually(t, func() bool { return sink2.Stopped() }, wf, tck)
+		sink2.Close()
+		assert.Eventually(t, func() bool { return sink2.Closed() }, wf, tck)
 	}()
 
 	// Add event
@@ -336,8 +336,8 @@ func testContext(t *testing.T) context.Context {
 func cleanup(t *testing.T, ctx context.Context, s *Stream, sink *Sink) {
 	t.Helper()
 	if sink != nil {
-		sink.Stop()
-		assert.Eventually(t, func() bool { return sink.Stopped() }, wf, tck)
+		sink.Close()
+		assert.Eventually(t, func() bool { return sink.Closed() }, wf, tck)
 	}
 	if s != nil {
 		assert.NoError(t, s.Destroy(ctx))

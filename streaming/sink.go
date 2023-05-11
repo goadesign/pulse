@@ -30,8 +30,8 @@ type (
 		Name string
 		// C is the sink event channel.
 		C <-chan *Event
-		// stopped is true if Stop completed.
-		stopped bool
+		// closed is true if Close completed.
+		closed bool
 		// consumer is the sink consumer name.
 		consumer string
 		// staleLockKeyName is the stale check lock key name.
@@ -61,8 +61,8 @@ type (
 		streamschan chan struct{}
 		// wait is the sink cleanup wait group.
 		wait sync.WaitGroup
-		// stopping is true if Stop was called.
-		stopping bool
+		// closing is true if Close was called.
+		closing bool
 		// eventMatcher is the event matcher if any.
 		eventMatcher EventMatcherFunc
 		// consumersMap are the replicated maps used to track sink
@@ -250,27 +250,28 @@ func (s *Sink) RemoveStream(ctx context.Context, stream *Stream) error {
 	return nil
 }
 
-// Stop stops event polling and closes the sink channel, it is idempotent.
-func (s *Sink) Stop() {
+// Close stops event polling and closes the sink channel. It is safe to call
+// Close multiple times.
+func (s *Sink) Close() {
 	s.lock.Lock()
-	if s.stopping {
+	if s.closing {
 		return
 	}
-	s.stopping = true
+	s.closing = true
 	close(s.donechan)
 	s.lock.Unlock()
 	s.wait.Wait()
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	s.stopped = true
-	s.logger.Info("stopped")
+	s.closed = true
+	s.logger.Info("closed")
 }
 
-// Stopped returns true if the sink is stopped.
-func (s *Sink) Stopped() bool {
+// Closed returns true if the sink was closed.
+func (s *Sink) Closed() bool {
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	return s.stopped
+	return s.closed
 }
 
 // read reads events from the streams and sends them to the sink channel.
@@ -283,7 +284,7 @@ func (s *Sink) read() {
 	}()
 	for {
 		streamsEvents, err := readOnce(ctx, s.readGroup, s.streamschan, s.donechan, s.logger)
-		if s.isStopping() {
+		if s.isClosing() {
 			return
 		}
 		if err != nil {
@@ -437,7 +438,7 @@ func (s *Sink) notifyStreamChange() {
 
 // removeConsumer removes the consumer from the consumer groups and removes the
 // sink from the sinks map. This method is called automatically when the sink is
-// stopped.
+// closed.
 func (s *Sink) removeConsumer(ctx context.Context, consumer string) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
@@ -445,9 +446,13 @@ func (s *Sink) removeConsumer(ctx context.Context, consumer string) {
 		if err := s.rdb.XGroupDelConsumer(ctx, stream.key, s.Name, consumer).Err(); err != nil {
 			s.logger.Error(fmt.Errorf("failed to delete Redis consumer: %w", err), "stream", stream.Name)
 		}
-		remains, err := s.consumersMap[stream.Name].RemoveValues(ctx, s.Name, consumer)
+		cm := s.consumersMap[stream.Name]
+		remains, err := cm.RemoveValues(ctx, s.Name, consumer)
 		if err != nil {
 			s.logger.Error(fmt.Errorf("failed to remove consumer from consumer map: %w", err), "stream", stream.Name)
+		}
+		if err := cm.Close(); err != nil {
+			s.logger.Error(fmt.Errorf("failed to close consumer map: %w", err), "stream", stream.Name)
 		}
 		if len(remains) == 0 {
 			if err := s.deleteConsumerGroup(ctx, stream); err != nil {
@@ -457,6 +462,9 @@ func (s *Sink) removeConsumer(ctx context.Context, consumer string) {
 	}
 	if _, err := s.consumersKeepAliveMap.Delete(ctx, consumer); err != nil {
 		s.logger.Error(fmt.Errorf("failed to remove consumer from keep-alive map: %w", err))
+	}
+	if err := s.consumersKeepAliveMap.Close(); err != nil {
+		s.logger.Error(fmt.Errorf("failed to close keep-alive map: %w", err))
 	}
 }
 
@@ -468,11 +476,11 @@ func (s *Sink) deleteConsumerGroup(ctx context.Context, stream *Stream) error {
 	return nil
 }
 
-// isStopping returns true if the sink is stopping.
-func (s *Sink) isStopping() bool {
+// isClosing returns true if the sink is closing.
+func (s *Sink) isClosing() bool {
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	return s.stopping
+	return s.closing
 }
 
 // isBusyGroupErr returns true if the error is a busy group error.
