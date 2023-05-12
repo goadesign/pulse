@@ -19,16 +19,51 @@ Ponos uses the [Jump Consistent Hash](https://arxiv.org/abs/1406.2294) algorithm
 to assign jobs to workers which provides a good balance between load balancing
 and worker assignment stability.
 
-## Usage and Trade-offs
+
+```mermaid
+%%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
+flowchart LR
+    A[Job Producer]
+    subgraph Pool[Pool Node]
+        Sink
+    end
+    subgraph Worker[Pool Node]
+        Reader
+        B[Worker]
+    end
+    A-->|Job+Key|Sink
+    Sink-.->|Job|Reader
+    Reader-.->|Job|B
+
+    classDef userCode fill:#9A6D1F, stroke:#D9B871, stroke-width:2px, color:#FFF2CC;
+    classDef ponos fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
+
+    class A,B userCode;
+    class Pool,Sink,Reader,Worker ponos;
+
+    linkStyle 0 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 1 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 2 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+```
+
+## Usage
 
 Ponos dedicated worker pools are generally valuable when workers require
-statefulness, and their state relies on the jobs they perform. For instance,
-such pools are beneficial when workers must sustain a connection to a remote
-service or maintain a local cache.
+statefulness, and their state relies on the jobs they perform.
 
-In particular, Ponos dedicated worker pools are not needed when workers are
-stateless and can be scaled horizontally. In such cases, a simple Redis list
-can be used to implement a scalable and reliable worker pool.
+To illustrate, let's consider the scenario of a multitenant system that requires
+managing a collection of background tasks for each tenant. In this case,
+utilizing a Ponos worker pool proves to be highly beneficial. The system can
+create a dedicated worker pool and create one job per tenant, utilizing the
+unique tenant identifier as the job key. This approach ensures that only one
+worker handles the background task for a specific tenant at any given time. As
+new tenants are added or old ones are removed, jobs can be created to start or
+stop the background tasks accordingly. Similarly, workers can be added or
+removed based on performance requirements.
+
+Ponos dedicated worker pools are not needed when workers are stateless and can
+be scaled horizontally. In such cases, any standard load balancing solution can
+be used.
 
 ## Example
 
@@ -98,6 +133,7 @@ func main() {
     rdb := redis.NewClient(&redis.Options{ Addr: "localhost:6379" })
 
     // Add client-only node
+    ctx := context.Background()
     node, err := pool.AddNode(ctx, "fibonacci", rdb, pool.WithClientOnly())
     if err != nil {
         panic(err)
@@ -106,7 +142,7 @@ func main() {
     // Queue new job with key "key" and payload 42 
     payload := make([]byte, 8)
     binary.BigEndian.PutUint64(payload, 42)
-    if err := pool.NewJob(context.Background(), "key", payload); err != nil {
+    if err := node.DispatchJob(ctx, "key", payload); err != nil {
         panic(err)
     }
 
@@ -117,20 +153,11 @@ func main() {
 }
 ```
 
-## Use Cases
-
-
-### Multitenant Background Jobs
-
-In this use case a multitenant system needs to maintain a set of background
-jobs that run in each tenant. Such a system can create a Ponos worker pool and
-create one job per tenant using the unique tenant identifier as job key. This
-guarantees that one and only one worker performs the background job for a given
-tenant at a given time. Jobs can be added or removed as new tenants are
-created or old tenants are deprovisioned. Workers can be added or removed as
-well depending on performance requirements. 
-
 ## Data Flows
+
+The following sections provide additional details on the internal data flows
+involved in creating and using a Ponos worker pool. They are provided for
+informational purposes only and are not required to use the package.
 
 ### Adding A New Job
 

@@ -17,7 +17,6 @@ flowchart LR
     Map[Replicated Map]
     A-->|Set|Map
     Map-.->|Update|B
-    B-->|Get|Map
 
     classDef userCode fill:#9A6D1F, stroke:#D9B871, stroke-width:2px, color:#FFF2CC;
     classDef ponos fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
@@ -27,12 +26,11 @@ flowchart LR
 
     linkStyle 0 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
     linkStyle 1 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
-    linkStyle 2 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
 ```
 
 See the [replicated package README](replicated/README.md) for more details.
 
-## Streams
+## Streaming
 
 Ponos streams provide a flexible mechanism for routing events across a fleet of
 microservices. Streams can be used to implement pub/sub, fan-out and fan-in
@@ -41,14 +39,14 @@ topologies.
 ```mermaid
 %%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
 flowchart LR
-    A[Node A]
+    A[Event Producer]
     subgraph SA[Stream A]
         TA[Topic]
     end
     subgraph SB[Stream B]
         TB[Topic]
     end
-    B[Node B]
+    B[Event Consumer]
     A-->|Add|TA
     A-->|Add|TB
     TA-.->|Event|B
@@ -66,32 +64,38 @@ flowchart LR
     linkStyle 3 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
 ```
 
-See the [streams package README](streams/README.md) for more details.
+See the [streaming package README](streaming/README.md) for more details.
 
-## Replicated Worker Pool
+## Dedicated Worker Pool
 
 Ponos builds on top of [replicated maps](rmap/README.md) and
-[streaming](streaming/README.md) to implement a tenanted worker pool where
-jobs are distributed to worker groups based on a key.
+[streaming](streaming/README.md) to implement a dedicated worker pool where jobs
+are dipatched to workers based on their key and a consistent hashing algorithm.
 
 ```mermaid
-flowchart TD
-    subgraph Producers
-        direction LR
-        H[fa:fa-microchip Process]-.-G[fa:fa-microchip Process]
+%%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
+flowchart LR
+    A[Job Producer]
+    subgraph Pool[Pool Node]
+        Sink
     end
-    subgraph Pool
-        direction TB
-        subgraph Worker [Worker Group A]
-            direction TB
-            A[fa:fa-tasks Job keyed 1]-.-B[fa:fa-tasks Job keyed n]
-        end
-        subgraph Worker2 [Worker Group B]
-            direction TB
-            A2[fa:fa-tasks Job keyed n+1]-.-B2[fa:fa-tasks Job keyed m]
-        end
+    subgraph Worker[Pool Node]
+        Reader
+        B[Worker]
     end
-    Producers-->|fa:fa-tasks Add keyed job|Pool
+    A-->|Job+Key|Sink
+    Sink-.->|Job|Reader
+    Reader-.->|Job|B
+
+    classDef userCode fill:#9A6D1F, stroke:#D9B871, stroke-width:2px, color:#FFF2CC;
+    classDef ponos fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
+
+    class A,B userCode;
+    class Pool,Sink,Reader,Worker ponos;
+
+    linkStyle 0 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 1 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 2 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
 ```
 
 See the [pool package README](pool/README.md) for more details.

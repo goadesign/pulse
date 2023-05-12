@@ -4,40 +4,7 @@ Ponos leverages Redis streams to provide scalable and reliable event streams
 that can be used to implement distributed architectures. Ponos provides a simple
 API to create and consume streams, for example:
 
-```go
-package main
-
-import (
-    redis "github.com/redis/go-redis/v9"
-    "goa.design/ponos/streams"
-)
-
-func main() {
-    // Connect to Redis
-    rdb := redis.NewClient(&redis.Options{ Addr: "localhost:6379" })
-
-    // Create stream "my-stream"
-    stream, err := streaming.NewStream(context.Background(), "my-stream", rdb)
-    if err != nil {
-        panic(err)
-    }
-
-    // Add a new event to the stream
-    if err := stream.Add(context.Background(), "event", "payload"); err != nil {
-        panic(err)
-    }
-
-    // Create event reader
-    reader := stream.NewReader()
-
-    // Consume event
-    event := <-reader.C 
-    fmt.Printf("event: %s, payload: %s\n", event.Name, event.Payload)
-
-    // Cleanup
-    reader.Stop()
-}
-```
+https://github.com/goadesign/ponos/blob/0a9e0ee113a66fbbab5773db5cbd994589acc287/examples/streaming/single-node/main.go#L1-L38
 
 The code above creates a stream named "my-stream" and adds a new event to it.
 The event is then consumed by a reader. The reader is stopped after the event
