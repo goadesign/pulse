@@ -1,7 +1,8 @@
-# Tenanted Worker Pools
+# Dedicated Worker Pool
 
-The `pool` package builds on top of the Ponos `streams` and `replicated`
-packages to provide a scalable and reliable dedicated worker pools.
+The `pool` package builds on top of the Ponos [rmap](../rmap/README.md) and
+[streaming](../streaming/README.md) packages to provide scalable and reliable
+dedicated worker pools.
 
 ## Overview
 
@@ -20,13 +21,14 @@ and worker assignment stability.
 
 ## Usage and Trade-offs
 
-In general Ponos dedicated worker pools are useful whenever workers need to be
-stateful and their state is dependent on the jobs. For example when workers need
-to maintain a connection to a remote service or when they need to maintain a
-local cache.
+Ponos dedicated worker pools are generally valuable when workers require
+statefulness, and their state relies on the jobs they perform. For instance,
+such pools are beneficial when workers must sustain a connection to a remote
+service or maintain a local cache.
 
-The target use case is one where the number of jobs is larger than the number of
-workers and where the job payloads should be small as they are stored in memory.
+In particular, Ponos dedicated worker pools are not needed when workers are
+stateless and can be scaled horizontally. In such cases, a simple Redis list
+can be used to implement a scalable and reliable worker pool.
 
 ## Example
 
@@ -44,29 +46,28 @@ import (
     "encoding/binary"
 
     redis "github.com/redis/go-redis/v9"
-    "goa.design/ponos"
+    "goa.design/ponos/pool"
 )
 
 func main() {
-    rdb := redis.NewClient()
+    // Connect to Redis
+    rdb := redis.NewClient(&redis.Options{ Addr: "localhost:6379" })
 
-    // Stop processing jobs after 5 seconds.
-    ctx := context.WithDeadline(context.Background(), time.Now().Add(5*time.Second))
-
-    // Connect to or create pool "fibonacci".
-    pool, err := ponos.Pool("fibonacci", rdb)
+    // Create node for pool "fibonacci".
+    ctx := context.Background()
+    node, err := pool.AddNode(ctx, "fibonacci", rdb)
     if err != nil {
         panic(err)
     }
 
     // Create a new worker for pool "fibonacci".
-    worker, err := pool.NewWorker(ctx)
+    worker, err := node.AddWorker(ctx)
     if err != nil {
         panic(err)
     }
 
     // Handle jobs
-    for job := range worker.Jobs(ctx) {
+    for job := range worker.C {
         n := binary.BigEndian.Uint64(job.Payload)
         fmt.Printf("fib(%d)=%d\n", n, fib(n))
     }
@@ -89,14 +90,15 @@ import (
     "encoding/binary"
 
     redis "github.com/redis/go-redis/v9"
-    "goa.design/ponos"
+    "goa.design/ponos/pool"
 )
 
 func main() {
-    rdb := redis.NewClient()
+    // Connect to Redis
+    rdb := redis.NewClient(&redis.Options{ Addr: "localhost:6379" })
 
-    // Get pool named "fibonacci"
-    pool, err := ponos.Pool("fibonacci", rdb)
+    // Add client-only node
+    node, err := pool.AddNode(ctx, "fibonacci", rdb, pool.WithClientOnly())
     if err != nil {
         panic(err)
     }
@@ -105,6 +107,11 @@ func main() {
     payload := make([]byte, 8)
     binary.BigEndian.PutUint64(payload, 42)
     if err := pool.NewJob(context.Background(), "key", payload); err != nil {
+        panic(err)
+    }
+
+    // Gracefully shutdown the pool
+    if err := node.Shutdown(ctx); err != nil {
         panic(err)
     }
 }
@@ -121,11 +128,7 @@ create one job per tenant using the unique tenant identifier as job key. This
 guarantees that one and only one worker performs the background job for a given
 tenant at a given time. Jobs can be added or removed as new tenants are
 created or old tenants are deprovisioned. Workers can be added or removed as
-well depending on performance requirements. A "controller" job can also be
-created which periodically ensures that all tenants have a dedicated job (and
-removes any stale job) for eventual consistency.
-
-See the background job example for more details.
+well depending on performance requirements. 
 
 ## Data Flows
 
@@ -279,18 +282,3 @@ flowchart LR
     linkStyle 13 stroke:#FF8888,color:#FF8888,stroke-width:3px;
     linkStyle 14 stroke:#FF8888,color:#FF8888,stroke-width:3px;
 ```
-
-## Failure Modes And Recovery
-
-### Worker Failure
-
-When a worker fails, the jobs it was processing are re-assigned to other
-workers. The worker will automatically reconnect to the pool and resume
-processing jobs.
-
-### Redis Failure
-
-When Redis fails, the worker pool will automatically reconnect to Redis and
-resume processing jobs.
-
-

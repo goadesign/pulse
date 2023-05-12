@@ -1,29 +1,33 @@
 # Ponos
 
-Ponos enables event driven distributed architectures by providing scalable
-event streaming and tenanted worker pools based on Redis.
+Ponos consists of a set of packages that enable event driven distributed
+architectures at scale. Each package is designed to be used independently but
+they can also be combined to implement more complex architectures.
 
 ## Replicated Maps
 
-Replicated maps provide a mechanism for sharing data across a fleet of
-microservices and receiving events when the data changes.
-
-Replicated maps consist of an in-memory map of strings with copies shared across
-all participating processes. Any process can update the replicated map, updates
-are propagated within milliseconds across all processes. Replicated maps are
-implemented using Redis hashes and pub/sub.
+Replicated maps provide a mechanism for sharing data across distributed nodes
+and receiving events when the data changes.
 
 ```mermaid
-flowchart TD
-    subgraph Processes [Client Processes]
-        direction LR
-        H[fa:fa-microchip Process A]
-        G[fa:fa-microchip Process B]
-    end
-    Map[[fa:fa-map-o Replicated Map]]
-    H-->|fa:fa-map-o Set|Map
-    Map-.->|fa:fa-map-o Update|G
-    G-->|fa:fa-map-o Get|Map
+%%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
+flowchart LR
+    A[Node A]
+    B[Node B]
+    Map[Replicated Map]
+    A-->|Set|Map
+    Map-.->|Update|B
+    B-->|Get|Map
+
+    classDef userCode fill:#9A6D1F, stroke:#D9B871, stroke-width:2px, color:#FFF2CC;
+    classDef ponos fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
+
+    class A,B userCode;
+    class Map ponos;
+
+    linkStyle 0 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 1 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 2 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
 ```
 
 See the [replicated package README](replicated/README.md) for more details.
@@ -31,58 +35,43 @@ See the [replicated package README](replicated/README.md) for more details.
 ## Streams
 
 Ponos streams provide a flexible mechanism for routing events across a fleet of
-microservices. Event sinks can subscribe to multiple streams and consume events
-concurrently. Streams can be used to implement pub/sub, fan-out and fan-in
+microservices. Streams can be used to implement pub/sub, fan-out and fan-in
 topologies.
 
 ```mermaid
-flowchart TD
-    subgraph Producers
-        direction LR
-        H[fa:fa-microchip Process]-.-G[fa:fa-microchip Process]
+%%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
+flowchart LR
+    A[Node A]
+    subgraph SA[Stream A]
+        TA[Topic]
     end
-    subgraph Producers2 [Other producers]
-        direction LR
-        H2[fa:fa-microchip Process]-.-G2[fa:fa-microchip Process]
+    subgraph SB[Stream B]
+        TB[Topic]
     end
-    subgraph Stream
-        direction TB
-        subgraph Topic
-            direction TB
-            A[fa:fa-bolt Event 1]-.-B[fa:fa-bolt Event n]
-        end
-        subgraph Topic2 [Other topic]
-            direction TB
-            A2[fa:fa-bolt Event 1]-.-B2[fa:fa-bolt Event m]
-        end
-    end
-    subgraph Stream2 [Other stream]
-        direction TB
-        C[fa:fa-bolt Event 1]-.-D[fa:fa-bolt Event n]
-    end
-    subgraph Sink [Fan-in sink]
-        direction LR
-        E[fa:fa-microchip Process]-.-F[fa:fa-microchip Process]
-    end
-    subgraph Sink2 [Other sink]
-        direction LR
-        E2[fa:fa-microchip Process]-.-F2[fa:fa-microchip Process]
-    end
-    Producers-->|fa:fa-bolt Add event|Topic
-    Producers-->|fa:fa-bolt Add event|Topic2
-    Producers2-->|fa:fa-bolt Add event|Stream2
-    Topic-->|fa:fa-bolt Events|Sink
-    Topic2-->|fa:fa-bolt Events|Sink
-    Stream2-->|fa:fa-bolt Events|Sink
-    Topic2-->|fa:fa-bolt Events|Sink2
+    B[Node B]
+    A-->|Add|TA
+    A-->|Add|TB
+    TA-.->|Event|B
+    TB-.->|Event|B
+
+    classDef userCode fill:#9A6D1F, stroke:#D9B871, stroke-width:2px, color:#FFF2CC;
+    classDef ponos fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
+
+    class A,B userCode;
+    class SA,SB,TA,TB ponos;
+
+    linkStyle 0 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 1 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 2 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 3 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
 ```
 
 See the [streams package README](streams/README.md) for more details.
 
-## Tenanted Worker Pool
+## Replicated Worker Pool
 
-Ponos builds on top of the [replicated](replicated/README.md) and
-[streams](streams/README.md) packages to implement a tenanted worker pool where
+Ponos builds on top of [replicated maps](rmap/README.md) and
+[streaming](streaming/README.md) to implement a tenanted worker pool where
 jobs are distributed to worker groups based on a key.
 
 ```mermaid
