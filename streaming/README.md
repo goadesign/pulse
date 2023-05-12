@@ -4,50 +4,79 @@ Ponos leverages Redis streams to provide scalable and reliable event streams
 that can be used to implement distributed architectures. Ponos provides a simple
 API to create and consume streams, for example:
 
-https://github.com/goadesign/ponos/blob/0a9e0ee113a66fbbab5773db5cbd994589acc287/examples/streaming/single-node/main.go#L1-L38
+https://github.com/goadesign/ponos/tree/main/examples/streaming/single-reader/main.go#L1-L38
 
 The code above creates a stream named "my-stream" and adds a new event to it.
-The event is then consumed by a reader. The reader is stopped after the event
+The event is then consumed by a reader. The reader is closed after the event
 is consumed.
+
+```mermaid
+%%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
+flowchart LR
+    A[Event Producer]
+    subgraph SA[Stream A]
+        TA[Topic]
+    end
+    subgraph SB[Stream B]
+        TB[Topic]
+    end
+    B[Event Consumer]
+    A-->|Add|TA
+    A-->|Add|TB
+    TA-.->|Event|B
+    TB-.->|Event|B
+
+    classDef userCode fill:#9A6D1F, stroke:#D9B871, stroke-width:2px, color:#FFF2CC;
+    classDef ponos fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
+
+    class A,B userCode;
+    class SA,SB,TA,TB ponos;
+
+    linkStyle 0 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 1 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 2 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 3 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+```
 
 Multiple readers can be created for the same stream across many nodes. Readers
 are independent and each instance receives a copy of the same events. Readers
 can specify a start position for the stream cursor. The default start position
 is the last event in the stream.
 
-```go
-// Create stream "my-stream"
-stream, err := streaming.NewStream(context.Background(), "my-stream", rdb)
+https://github.com/goadesign/ponos/blob/main/examples/streaming/multi-reader/main.go#L18-L36
 
-// Write 2 events to the stream
-stream.Add(context.Background(), "event1", "payload1")
-stream.Add(context.Background(), "event2", "payload2")
+```mermaid
+%%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
+flowchart LR
+    A[Event Producer]
+    subgraph SA[Stream A]
+        TA[Topic]
+    end
+    subgraph SB[Stream B]
+        TB[Topic]
+    end
+    B[Event Consumer]
+    A-->|Add|TA
+    A-->|Add|TB
+    TA-.->|Event|B
+    TB-.->|Event|B
 
-// Create reader for stream "my-stream" and read from the beginning
-reader := streaming.NewReader(context.Background(), streaming.WithReaderStartAtOldest())
+    classDef userCode fill:#9A6D1F, stroke:#D9B871, stroke-width:2px, color:#FFF2CC;
+    classDef ponos fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
 
-// Read both events
-event := <-reader.C
-fmt.Printf("reader 1, event: %s, payload: %s\n", event.Name, event.Payload)
-// Prints "reader 1, event: event1, payload: payload1"
-event = <-reader.C
-fmt.Printf("reader 1, event: %s, payload: %s\n", event.Name, event.Payload)
-// Prints "reader 1, event: event2, payload: payload2"
+    class A,B userCode;
+    class SA,SB,TA,TB ponos;
 
-// Create another reader for stream "my-stream" and start reading after the
-// first event
-otherReader := streaming.NewReader(context.Background(), streaming.WithReaderStartAt(event.ID))
-
-// Read second event
-event = <-otherReader.C
-fmt.Printf("reader 2, event: %s, payload: %s\n", event.Name, event.Payload)
-// Prints "reader 2, event: event2, payload: payload2"
+    linkStyle 0 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 1 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 2 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 3 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
 ```
 
 ## Event Sinks
 
 Event sinks enable concurrent processing of multiple events for better
-performance.  They also enable redundancy in case of node failure or network
+performance. They also enable redundancy in case of node failure or network
 partitions.
 
 Event sinks make it possible for multiple nodes to share the same stream cursor.
@@ -61,38 +90,20 @@ events added to a sink that have been read by a node but not acknowledged.
 
 Creating a sink is as simple as:
 
-```go
-// Create stream "my-stream"
-stream, err := streaming.NewStream(context.Background(), "my-stream", rdb)
-if err != nil {
-    panic(err)
-}
-
-// Create sink "my-sink" for stream "my-stream"
-sink := stream.NewSink(context.Background(), "my-sink")
-defer sink.Close()
-
-// Consume event
-event := <-sink.C
-fmt.Printf("event: %s, payload: %s\n", event.Name, event.Payload)
-event.Ack()
-```
+https://github.com/goadesign/ponos/blob/main/examples/streaming/single-sink/main.go#L1-L43
 
 Note a couple of differences with the reader example above:
 
-- The sink is created using `stream.NewSink(context.Background(), "my-sink")` instead of
-  `streaming.NewReader(context.Background())`. Each sink has a unique name, multiple nodes
-  using the same name will share the same stream cursor.
-- The event is acknowledged using `event.Ack()`. This is required to advance the stream cursor
-  and avoid reprocessing the same event.
+- The sink is created using `stream.NewSink` instead of `stream.NewReader`. Each
+  sink has a unique name, multiple nodes using the same name will share the same
+  stream cursor.
+- The event is acknowledged using `sink.Ack`. This provides an at-least-once
+  delivery guarantee where unacknowledged events are automatically re-queued.
 
 ```mermaid
-flowchart TD
-    subgraph Producers
-        direction LR
-        H[fa:fa-microchip Process]-.-G[fa:fa-microchip Process]
-    end
-    Producers-->|fa:fa-bolt Add event|Stream
+%%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
+flowchart LR
+    Producer-->|Add Event|Stream
     subgraph Stream ["Stream #quot;my-stream#quot;"]
         direction TB
         A[fa:fa-bolt Event 1]-.-B[fa:fa-bolt Event n]
@@ -102,6 +113,15 @@ flowchart TD
         C[fa:fa-microchip Process]-.-D[fa:fa-microchip Process]
     end
     Stream -->|fa:fa-bolt Event 1..n|Sink1
+
+    classDef userCode fill:#9A6D1F, stroke:#D9B871, stroke-width:2px, color:#FFF2CC;
+    classDef ponos fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
+
+    class A,B userCode;
+    class Map ponos;
+
+    linkStyle 0 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
+    linkStyle 1 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
 ```
 
 As with readers, multiple sinks can be created for the same stream. Copies of
