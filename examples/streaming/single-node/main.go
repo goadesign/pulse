@@ -6,44 +6,33 @@ import (
 	"os"
 
 	"github.com/redis/go-redis/v9"
-	"goa.design/clue/log"
-	"goa.design/ponos/ponos"
 	"goa.design/ponos/streaming"
 )
 
 func main() {
-	// Create a Redis client
-	pwd := os.Getenv("REDIS_PASSWORD")
-	if pwd == "" {
-		panic("REDIS_PASSWORD not set")
-	}
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: pwd,
-	})
-	ctx := log.Context(context.Background())
-	log.FlushAndDisableBuffering(ctx)
+	// Create Redis client
+	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: os.Getenv("REDIS_PASSWORD")})
 
-	// Create example stream
-	stream, err := streaming.NewStream(ctx, "my-stream", rdb, streaming.WithStreamLogger(ponos.ClueLogger(ctx)))
+	// Create stream
+	ctx := context.Background()
+	stream, err := streaming.NewStream(ctx, "my-stream", rdb)
 	if err != nil {
 		panic(err)
 	}
 
 	// Add a new event
-	if _, err := stream.Add(context.Background(), "event", []byte("payload")); err != nil {
+	if _, err := stream.Add(ctx, "event", []byte("payload")); err != nil {
 		panic(err)
 	}
 
-	// Create event sink
-	sink, err := stream.NewSink(ctx, "my-sink")
+	// Create reader
+	reader, err := stream.NewReader(ctx, streaming.WithReaderStartAtOldest())
 	if err != nil {
 		panic(err)
 	}
+	defer reader.Close()
 
-	// Consume all events
-	for event := range sink.C {
-		fmt.Printf("event: %s, payload: %s\n", event.EventName, event.Payload)
-		sink.Ack(ctx, event)
-	}
+	// Consume event
+	event := <-reader.C
+	fmt.Printf("event: %s, payload: %s\n", event.EventName, event.Payload)
 }
