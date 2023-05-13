@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+
+set -e
+
+GIT_ROOT=$(git rev-parse --show-toplevel)
+pushd ${GIT_ROOT}
+
+source ./scripts/utils/common.sh
+
+check_required_cmd "carbon-now" "carbon-now-cli"
+
+carbon-now examples/streaming/single-reader/main.go --start 21 --end 51 --config snippets/carbon-config.json --preset ponos --save-as "snippets/single-reader"
+
+popd

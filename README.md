@@ -28,7 +28,7 @@ flowchart LR
     linkStyle 1 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
 ```
 
-See the [replicated package README](replicated/README.md) for more details.
+See the [rmap package README](rmap/README.md) for more details.
 
 ## Streaming
 

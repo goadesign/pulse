@@ -4,7 +4,7 @@ Ponos leverages Redis streams to provide scalable and reliable event streams
 that can be used to implement distributed architectures. Ponos provides a simple
 API to create and consume streams, for example:
 
-https://github.com/goadesign/ponos/tree/main/examples/streaming/single-reader/main.go#L1-L46
+<img src="../snippets/single-reader.png" width="70%"/>
 
 The code above creates a stream named "my-stream" and adds a new event to it.
 The event is then consumed by a reader. The reader is closed after the event
@@ -184,6 +184,7 @@ sink.RemoveStream(otherStream)
 Streams supports a flexible pub/sub mechanism where events can be attached to
 topics and readers or sinks can define simple or custom matching logic.
 
+https://github.com/goadesign/ponos/blob/a23bf7cb3d77b336382e0991967224c5bdb9a35f/examples/streaming/pub-sub/main.go#L21-L40
 https://github.com/goadesign/ponos/tree/main/examples/streaming/pub-sub/main.go#L21-L40
 
 ```mermaid

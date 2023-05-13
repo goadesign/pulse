@@ -18,17 +18,21 @@ func main() {
 		panic(err)
 	}
 
-	// Create stream
+	// Create stream "my-stream"
 	stream, err := streaming.NewStream(ctx, "my-stream", rdb)
 	if err != nil {
 		panic(err)
 	}
+
+	// Don't forget to destroy the stream when done
 	defer stream.Destroy(ctx)
 
 	// Add a new event
-	if _, err := stream.Add(ctx, "event", []byte("payload")); err != nil {
+	id, err := stream.Add(ctx, "event", []byte("payload"))
+	if err != nil {
 		panic(err)
 	}
+	fmt.Printf("event id: %s\n", id)
 
 	// Create reader that reads from the beginning and waits for events for
 	// up to 100ms
@@ -38,6 +42,8 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+
+	// Don't forget to close the reader when done
 	defer reader.Close()
 
 	// Consume event
