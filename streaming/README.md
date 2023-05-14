@@ -173,10 +173,7 @@ flowchart LR
 `AddStream` can be called at any time to add new streams to a reader or a sink.
 Streams can also be removed using `RemoveStream`.
 
-```go
-// Remove stream "my-other-stream" from sink "my-sink"
-sink.RemoveStream(otherStream)
-```
+<a href="../examples/streaming/multi-stream/main.go#L85"><img src="../snippets/remove-stream.png" /></a>
 
 ## Pub/Sub
 
@@ -219,18 +216,11 @@ flowchart RL
 Topics can be matched using their name as in the example above or using complex
 patterns. For example:
 
-```go
-sink, err := stream.NewSink(ctx, "my-sink", ponos.WithSinkTopicPattern("my-topic.*"))
-```
+<a href="../examples/streaming/pub-sub/main.go#L73"><img src="../snippets/pub-sub-pattern.png" /></a>
 
 Custom matching logic can also be provided:
 
-```go
-sink, err := stream.NewSink(ctx, "my-sink", ponos.WithSinkEventMatcher(
-    func(event *ponos.Event) bool {
-        return event.Topic == "my-topic" && event.EventName == "event"
-    }))
-```
+<a href="../examples/streaming/pub-sub/main.go#L91"><img src="../snippets/pub-sub-matcher.png" /></a>
 
 > Note: Event filtering is done locally in the sink or reader and does not
 > affect the underlying stream. This means that events are still stored in the

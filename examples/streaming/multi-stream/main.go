@@ -80,4 +80,10 @@ func main() {
 	if err := sink.Ack(ctx, event); err != nil {
 		panic(err)
 	}
+
+	// Streams can be removed from a sink
+	err = sink.RemoveStream(ctx, otherStream)
+	if err != nil {
+		panic(err)
+	}
 }
