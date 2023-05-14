@@ -184,8 +184,7 @@ sink.RemoveStream(otherStream)
 Streams supports a flexible pub/sub mechanism where events can be attached to
 topics and readers or sinks can define simple or custom matching logic.
 
-https://github.com/goadesign/ponos/blob/a23bf7cb3d77b336382e0991967224c5bdb9a35f/examples/streaming/pub-sub/main.go#L21-L40
-https://github.com/goadesign/ponos/tree/main/examples/streaming/pub-sub/main.go#L21-L40
+<a href="../examples/streaming/pub-sub/main.go"><img src="../snippets/pub-sub.png" /></a>
 
 ```mermaid
 %%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
