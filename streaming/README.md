@@ -32,7 +32,7 @@ are independent and each instance receives a copy of the same events. Readers
 can specify a start position for the stream cursor. The default start position
 is the last event in the stream.
 
-https://github.com/goadesign/ponos/tree/main/examples/streaming/multi-reader/main.go#L21-L45
+<a href="../examples/streaming/multi-reader/main.go"><img src="../snippets/multi-reader.png" /></a>
 
 ```mermaid
 %%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
