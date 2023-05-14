@@ -11,7 +11,7 @@ The event is then consumed by a reader. The reader is closed after the event
 is consumed.
 
 ```mermaid
-%%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
+%%{init: {'themeVariables': { 'background': '#282828', 'edgeLabelBackground': '#7A7A7A'}}}%%
 flowchart LR
     main-->|Add|Stream
     Stream-.->|Event|Reader
@@ -35,7 +35,7 @@ is the last event in the stream.
 <a href="../examples/streaming/multi-reader/main.go"><img src="../snippets/multi-reader.png" /></a>
 
 ```mermaid
-%%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
+%%{init: {'themeVariables': { 'background': '#282828', 'edgeLabelBackground': '#7A7A7A'}}}%%
 flowchart LR
     main-->|Add 1, 2|Stream
     Reader-.->|Events 1, 2|main
@@ -84,7 +84,7 @@ Note a couple of differences with the reader example above:
   delivery guarantee where unacknowledged events are automatically re-queued.
 
 ```mermaid
-%%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
+%%{init: {'themeVariables': { 'background': '#282828', 'edgeLabelBackground': '#7A7A7A'}}}%%
 flowchart LR
     main
     Stream
@@ -112,7 +112,7 @@ the same event are distributed among all sinks.
 <a href="../examples/streaming/multi-sink/main.go"><img src="../snippets/multi-sink.png" /></a>
 
 ```mermaid
-%%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
+%%{init: {'themeVariables': { 'background': '#282828', 'edgeLabelBackground': '#7A7A7A'}}}%%
 flowchart LR
     main-->|Add 1, 2|Stream
     Sink-.->|Events 1, 2|main
@@ -144,7 +144,7 @@ Readers and sinks can also read concurrently from multiple streams:
 <a href="../examples/streaming/multi-stream/main.go"><img src="../snippets/multi-stream.png" /></a>
 
 ```mermaid
-%%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
+%%{init: {'themeVariables': { 'background': '#282828', 'edgeLabelBackground': '#7A7A7A'}}}%%
 flowchart LR
     main-->|Add 1|Stream
     main-->|Add 2|Stream2[Other Stream]
@@ -183,7 +183,7 @@ topics and readers or sinks can define simple or custom matching logic.
 <a href="../examples/streaming/pub-sub/main.go"><img src="../snippets/pub-sub.png" /></a>
 
 ```mermaid
-%%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
+%%{init: {'themeVariables': { 'background': '#282828', 'edgeLabelBackground': '#7A7A7A'}}}%%
 flowchart RL
     main-->|Add 1|Topic
     main-->|Add 2|Topic2
