@@ -142,7 +142,7 @@ flowchart LR
 Readers and sinks can also read concurrently from multiple streams.  For
 example:
 
-https://github.com/goadesign/ponos/tree/main/examples/streaming/multi-stream/main.go#L20-L40
+<a href="../examples/streaming/multi-stream/main.go"><img src="../snippets/multi-stream.png" /></a>
 
 ```mermaid
 %%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
