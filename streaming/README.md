@@ -4,7 +4,7 @@ Ponos leverages Redis streams to provide scalable and reliable event streams
 that can be used to implement distributed architectures. Ponos provides a simple
 API to create and consume streams, for example:
 
-<a href="../examples/streaming/single-reader/main.go"><img src="../snippets/single-reader.png" /></a>
+<a href="../examples/streaming/single-reader/main.go"><img src="../snippets/single-reader.png" height="50%"/></a>
 
 The code above creates a stream named "my-stream" and adds a new event to it.
 The event is then consumed by a reader. The reader is closed after the event
