@@ -58,8 +58,8 @@ func main() {
 	event := <-reader.C
 	fmt.Printf("reader 1, event: %s, payload: %s\n", event.EventName, event.Payload)
 
-	event = <-reader.C
-	fmt.Printf("reader 1, event: %s, payload: %s\n", event.EventName, event.Payload)
+	event2 := <-reader.C
+	fmt.Printf("reader 1, event: %s, payload: %s\n", event2.EventName, event2.Payload)
 
 	// Create other reader for stream "my-stream" and start reading after
 	// first event

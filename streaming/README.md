@@ -74,7 +74,7 @@ acknowledged.
 
 Creating a sink is as simple as:
 
-https://github.com/goadesign/ponos/tree/main/examples/streaming/single-sink/main.go#L1-L51
+<a href="../examples/streaming/single-sink/main.go"><img src="../snippets/single-sink.png" /></a>
 
 Note a couple of differences with the reader example above:
 
