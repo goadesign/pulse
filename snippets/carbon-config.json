@@ -16,8 +16,9 @@
     "sl": "*",
     "t": "a11y-dark",
     "type": "png",
-    "wa": true,
+    "wa": false,
     "wc": false,
+    "width": "1000px",
     "wm": false,
     "wt": "none"
   }
