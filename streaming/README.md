@@ -4,14 +4,14 @@ Ponos leverages Redis streams to provide scalable and reliable event streams
 that can be used to implement distributed architectures. Ponos provides a simple
 API to create and consume streams, for example:
 
-<img src="../snippets/single-reader.png" width="70%"/>
+<a href="../examples/streaming/single-reader/main.go"><img src="../snippets/single-reader.png" /></a>
 
 The code above creates a stream named "my-stream" and adds a new event to it.
 The event is then consumed by a reader. The reader is closed after the event
 is consumed.
 
 ```mermaid
-%%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
+%%{init: {'themeVariables': { 'background': '#282828', 'mainBkg': '#282828', 'edgeLabelBackground': '#7A7A7A'}}}%%
 flowchart LR
     main-->|Add|Stream
     Stream-.->|Event|Reader
@@ -32,10 +32,10 @@ are independent and each instance receives a copy of the same events. Readers
 can specify a start position for the stream cursor. The default start position
 is the last event in the stream.
 
-https://github.com/goadesign/ponos/tree/main/examples/streaming/multi-reader/main.go#L21-L45
+<a href="../examples/streaming/multi-reader/main.go"><img src="../snippets/multi-reader.png" /></a>
 
 ```mermaid
-%%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
+%%{init: {'themeVariables': { 'background': '#282828', 'edgeLabelBackground': '#7A7A7A'}}}%%
 flowchart LR
     main-->|Add 1, 2|Stream
     Reader-.->|Events 1, 2|main
@@ -74,7 +74,7 @@ acknowledged.
 
 Creating a sink is as simple as:
 
-https://github.com/goadesign/ponos/tree/main/examples/streaming/single-sink/main.go#L1-L51
+<a href="../examples/streaming/single-sink/main.go"><img src="../snippets/single-sink.png" /></a>
 
 Note a couple of differences with the reader example above:
 
@@ -84,7 +84,7 @@ Note a couple of differences with the reader example above:
   delivery guarantee where unacknowledged events are automatically re-queued.
 
 ```mermaid
-%%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
+%%{init: {'themeVariables': { 'background': '#282828', 'edgeLabelBackground': '#7A7A7A'}}}%%
 flowchart LR
     main
     Stream
@@ -109,10 +109,10 @@ flowchart LR
 As with readers, multiple sinks can be created for the same stream. Copies of
 the same event are distributed among all sinks.
 
-https://github.com/goadesign/ponos/tree/main/examples/streaming/multi-sink/main.go#L21-L45
+<a href="../examples/streaming/multi-sink/main.go"><img src="../snippets/multi-sink.png" /></a>
 
 ```mermaid
-%%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
+%%{init: {'themeVariables': { 'background': '#282828', 'edgeLabelBackground': '#7A7A7A'}}}%%
 flowchart LR
     main-->|Add 1, 2|Stream
     Sink-.->|Events 1, 2|main
@@ -139,13 +139,12 @@ flowchart LR
 
 ## Reading from multiple streams
 
-Readers and sinks can also read concurrently from multiple streams.  For
-example:
+Readers and sinks can also read concurrently from multiple streams:
 
-https://github.com/goadesign/ponos/tree/main/examples/streaming/multi-stream/main.go#L20-L40
+<a href="../examples/streaming/multi-stream/main.go"><img src="../snippets/multi-stream.png" /></a>
 
 ```mermaid
-%%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
+%%{init: {'themeVariables': { 'background': '#282828', 'edgeLabelBackground': '#7A7A7A'}}}%%
 flowchart LR
     main-->|Add 1|Stream
     main-->|Add 2|Stream2[Other Stream]
@@ -174,21 +173,17 @@ flowchart LR
 `AddStream` can be called at any time to add new streams to a reader or a sink.
 Streams can also be removed using `RemoveStream`.
 
-```go
-// Remove stream "my-other-stream" from sink "my-sink"
-sink.RemoveStream(otherStream)
-```
+<a href="../examples/streaming/multi-stream/main.go#L85"><img src="../snippets/remove-stream.png" /></a>
 
 ## Pub/Sub
 
 Streams supports a flexible pub/sub mechanism where events can be attached to
 topics and readers or sinks can define simple or custom matching logic.
 
-https://github.com/goadesign/ponos/blob/a23bf7cb3d77b336382e0991967224c5bdb9a35f/examples/streaming/pub-sub/main.go#L21-L40
-https://github.com/goadesign/ponos/tree/main/examples/streaming/pub-sub/main.go#L21-L40
+<a href="../examples/streaming/pub-sub/main.go"><img src="../snippets/pub-sub.png" /></a>
 
 ```mermaid
-%%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
+%%{init: {'themeVariables': { 'background': '#282828', 'edgeLabelBackground': '#7A7A7A'}}}%%
 flowchart RL
     main-->|Add 1|Topic
     main-->|Add 2|Topic2
@@ -221,18 +216,11 @@ flowchart RL
 Topics can be matched using their name as in the example above or using complex
 patterns. For example:
 
-```go
-sink, err := stream.NewSink(ctx, "my-sink", ponos.WithSinkTopicPattern("my-topic.*"))
-```
+<a href="../examples/streaming/pub-sub/main.go#L73"><img src="../snippets/pub-sub-pattern.png" /></a>
 
 Custom matching logic can also be provided:
 
-```go
-sink, err := stream.NewSink(ctx, "my-sink", ponos.WithSinkEventMatcher(
-    func(event *ponos.Event) bool {
-        return event.Topic == "my-topic" && event.EventName == "event"
-    }))
-```
+<a href="../examples/streaming/pub-sub/main.go#L91"><img src="../snippets/pub-sub-matcher.png" /></a>
 
 > Note: Event filtering is done locally in the sink or reader and does not
 > affect the underlying stream. This means that events are still stored in the

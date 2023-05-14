@@ -332,7 +332,7 @@ func streamEvents(
 	}
 	for _, event := range msgs {
 		var topic string
-		if t, ok := event.Values["topic"]; ok {
+		if t, ok := event.Values[topicKey]; ok {
 			topic = t.(string)
 		}
 		ev := &Event{
