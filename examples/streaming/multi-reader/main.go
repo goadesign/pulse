@@ -44,9 +44,12 @@ func main() {
 
 	// Create reader for stream "my-stream" that reads from the beginning and
 	// waits for events for up to 100ms
-	reader, _ := stream.NewReader(ctx,
+	reader, err := stream.NewReader(ctx,
 		streaming.WithReaderStartAtOldest(),
 		streaming.WithReaderBlockDuration(100*time.Millisecond))
+	if err != nil {
+		panic(err)
+	}
 
 	// Don't forget to close the reader when done
 	defer reader.Close()

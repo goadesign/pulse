@@ -10,6 +10,6 @@ source ./scripts/utils/common.sh
 check_required_cmd "carbon-now" "carbon-now-cli"
 
 carbon-now examples/streaming/single-reader/main.go --start 21 --end 51 --config snippets/carbon-config.json --preset ponos --save-as "snippets/single-reader"
-carbon-now examples/streaming/multi-reader/main.go --start 45 --end 73 --config snippets/carbon-config.json --preset ponos --save-as "snippets/multi-reader"
+carbon-now examples/streaming/multi-reader/main.go --start 45 --end 76 --config snippets/carbon-config.json --preset ponos --save-as "snippets/multi-reader"
 
 popd
