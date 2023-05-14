@@ -109,7 +109,7 @@ flowchart LR
 As with readers, multiple sinks can be created for the same stream. Copies of
 the same event are distributed among all sinks.
 
-https://github.com/goadesign/ponos/tree/main/examples/streaming/multi-sink/main.go#L21-L45
+<a href="../examples/streaming/multi-sink/main.go"><img src="../snippets/multi-sink.png" /></a>
 
 ```mermaid
 %%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%

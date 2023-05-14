@@ -54,12 +54,9 @@ func main() {
 	// Don't forget to close the reader when done
 	defer reader.Close()
 
-	// Read both events
+	// Read event
 	event := <-reader.C
 	fmt.Printf("reader 1, event: %s, payload: %s\n", event.EventName, event.Payload)
-
-	event2 := <-reader.C
-	fmt.Printf("reader 1, event: %s, payload: %s\n", event2.EventName, event2.Payload)
 
 	// Create other reader for stream "my-stream" and start reading after
 	// first event

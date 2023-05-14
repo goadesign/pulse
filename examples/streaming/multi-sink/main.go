@@ -55,14 +55,8 @@ func main() {
 	// Don't forget to close the sink when done
 	defer sink.Close()
 
-	// Read and acknowlege both events
+	// Read and acknowlege event
 	event := <-sink.C
-	fmt.Printf("sink 1, event: %s, payload: %s\n", event.EventName, event.Payload)
-	if err := sink.Ack(ctx, event); err != nil {
-		panic(err)
-	}
-
-	event = <-sink.C
 	fmt.Printf("sink 1, event: %s, payload: %s\n", event.EventName, event.Payload)
 	if err := sink.Ack(ctx, event); err != nil {
 		panic(err)
