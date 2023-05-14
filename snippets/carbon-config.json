@@ -10,15 +10,14 @@
     "fs": "18px",
     "lh": "133%",
     "ln": false,
-    "ph": "10px",
-    "pv": "10px",
+    "ph": "20px",
+    "pv": "20px",
     "si": false,
     "sl": "*",
     "t": "a11y-dark",
     "type": "png",
     "wa": true,
     "wc": false,
-    "width": 1010,
     "wm": false,
     "wt": "none"
   }
