@@ -10,6 +10,7 @@ The code above creates a stream named "my-stream" and adds a new event to it.
 The event is then consumed by a reader. The reader is closed after the event
 is consumed.
 
+<div style="background-color: #282828;">
 ```mermaid
 %%{init: {'themeVariables': { 'background': '#282828', 'edgeLabelBackground': '#7A7A7A'}}}%%
 flowchart LR
@@ -26,6 +27,7 @@ flowchart LR
     linkStyle 0 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
     linkStyle 1 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
 ```
+</div>
 
 Multiple readers can be created for the same stream across many nodes. Readers
 are independent and each instance receives a copy of the same events. Readers
