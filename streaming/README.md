@@ -139,8 +139,7 @@ flowchart LR
 
 ## Reading from multiple streams
 
-Readers and sinks can also read concurrently from multiple streams.  For
-example:
+Readers and sinks can also read concurrently from multiple streams:
 
 <a href="../examples/streaming/multi-stream/main.go"><img src="../snippets/multi-stream.png" /></a>
 
