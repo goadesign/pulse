@@ -4,9 +4,9 @@
     "ds": true,
     "dsblur": "20px",
     "dsyoff": "10px",
-    "es": "2x",
+    "es": "1x",
     "fl": 1,
-    "fm": "Inconsolata",
+    "fm": "Fantasque Sans Mono",
     "fs": "18px",
     "lh": "133%",
     "ln": false,
@@ -16,9 +16,8 @@
     "sl": "*",
     "t": "a11y-dark",
     "type": "png",
-    "wa": false,
+    "wa": true,
     "wc": false,
-    "width": "1000px",
     "wm": false,
     "wt": "none"
   }
