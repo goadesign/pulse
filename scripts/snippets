@@ -10,13 +10,13 @@ source ./scripts/utils/common.sh
 check_required_cmd "carbon-now" "carbon-now-cli"
 
 carbon-now examples/streaming/single-reader/main.go --start 21 --end 51 --config snippets/carbon-config.json --preset ponos --save-as "snippets/single-reader"
-carbon-now examples/streaming/multi-reader/main.go --start 45 --end 73 --config snippets/carbon-config.json --preset ponos --save-as "snippets/multi-reader"
-carbon-now examples/streaming/single-sink/main.go --start 37 --end 56 --config snippets/carbon-config.json --preset ponos --save-as "snippets/single-sink"
-carbon-now examples/streaming/multi-sink/main.go --start 58 --end 77 --config snippets/carbon-config.json --preset ponos --save-as "snippets/multi-sink"
-carbon-now examples/streaming/multi-stream/main.go --start 58 --end 62 --config snippets/carbon-config.json --preset ponos --save-as "snippets/multi-stream"
-carbon-now examples/streaming/multi-stream/main.go --start 85 --end 85 --config snippets/carbon-config.json --preset ponos --save-as "snippets/remove-stream"
-carbon-now examples/streaming/pub-sub/main.go --start 31 --end 36 --config snippets/carbon-config.json --preset ponos --save-as "snippets/pub-sub"
-carbon-now examples/streaming/pub-sub/main.go --start 73 --end 76 --config snippets/carbon-config.json --preset ponos --save-as "snippets/pub-sub-pattern"
-carbon-now examples/streaming/pub-sub/main.go --start 91 --end 96 --config snippets/carbon-config.json --preset ponos --save-as "snippets/pub-sub-matcher"
+carbon-now examples/streaming/multi-reader/main.go  --start 45 --end 73 --config snippets/carbon-config.json --preset ponos --save-as "snippets/multi-reader"
+carbon-now examples/streaming/single-sink/main.go   --start 37 --end 56 --config snippets/carbon-config.json --preset ponos --save-as "snippets/single-sink"
+carbon-now examples/streaming/multi-sink/main.go    --start 58 --end 77 --config snippets/carbon-config.json --preset ponos --save-as "snippets/multi-sink"
+carbon-now examples/streaming/multi-stream/main.go  --start 58 --end 62 --config snippets/carbon-config.json --preset ponos --save-as "snippets/multi-stream"
+carbon-now examples/streaming/multi-stream/main.go  --start 85 --end 85 --config snippets/carbon-config.json --preset ponos --save-as "snippets/remove-stream"
+carbon-now examples/streaming/pub-sub/main.go       --start 31 --end 36 --config snippets/carbon-config.json --preset ponos --save-as "snippets/pub-sub"
+carbon-now examples/streaming/pub-sub/main.go       --start 73 --end 76 --config snippets/carbon-config.json --preset ponos --save-as "snippets/pub-sub-pattern"
+carbon-now examples/streaming/pub-sub/main.go       --start 91 --end 96 --config snippets/carbon-config.json --preset ponos --save-as "snippets/pub-sub-matcher"
 
 popd
