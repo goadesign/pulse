@@ -4,7 +4,7 @@ Ponos leverages Redis streams to provide scalable and reliable event streams
 that can be used to implement distributed architectures. Ponos provides a simple
 API to create and consume streams, for example:
 
-<a href="../examples/streaming/single-reader/main.go"><img src="../snippets/single-reader.png" /></a>
+[![Single Reader](../snippets/single-reader.png)](../examples/streaming/single-reader/main.go)
 
 The code above creates a stream named "my-stream" and adds a new event to it.
 The event is then consumed by a reader. The reader is closed after the event
@@ -32,7 +32,7 @@ are independent and each instance receives a copy of the same events. Readers
 can specify a start position for the stream cursor. The default start position
 is the last event in the stream.
 
-<a href="../examples/streaming/multi-reader/main.go"><img src="../snippets/multi-reader.png" /></a>
+[![Multi Reader](../snippets/multi-reader.png)](../examples/streaming/multi-reader/main.go)
 
 ```mermaid
 %%{init: {'themeVariables': { 'background': '#282828', 'edgeLabelBackground': '#7A7A7A'}}}%%
@@ -74,7 +74,7 @@ acknowledged.
 
 Creating a sink is as simple as:
 
-<a href="../examples/streaming/single-sink/main.go"><img src="../snippets/single-sink.png" /></a>
+[![Single Sink](../snippets/single-sink.png)](../examples/streaming/single-sink/main.go)
 
 Note a couple of differences with the reader example above:
 
@@ -109,7 +109,7 @@ flowchart LR
 As with readers, multiple sinks can be created for the same stream. Copies of
 the same event are distributed among all sinks.
 
-<a href="../examples/streaming/multi-sink/main.go"><img src="../snippets/multi-sink.png" /></a>
+[![Multi Sink](../snippets/multi-sink.png)](../examples/streaming/multi-sink/main.go)
 
 ```mermaid
 %%{init: {'themeVariables': { 'background': '#282828', 'edgeLabelBackground': '#7A7A7A'}}}%%
@@ -141,7 +141,7 @@ flowchart LR
 
 Readers and sinks can also read concurrently from multiple streams:
 
-<a href="../examples/streaming/multi-stream/main.go"><img src="../snippets/multi-stream.png" /></a>
+[![Multi Stream](../snippets/multi-stream.png)](../examples/streaming/multi-stream/main.go)
 
 ```mermaid
 %%{init: {'themeVariables': { 'background': '#282828', 'edgeLabelBackground': '#7A7A7A'}}}%%
@@ -173,14 +173,14 @@ flowchart LR
 `AddStream` can be called at any time to add new streams to a reader or a sink.
 Streams can also be removed using `RemoveStream`.
 
-<a href="../examples/streaming/multi-stream/main.go#L85"><img src="../snippets/remove-stream.png" /></a>
+[![Remove Stream](../snippets/remove-stream.png)](../examples/streaming/multi-stream/main.go#L85)
 
 ## Pub/Sub
 
 Streams supports a flexible pub/sub mechanism where events can be attached to
 topics and readers or sinks can define simple or custom matching logic.
 
-<a href="../examples/streaming/pub-sub/main.go"><img src="../snippets/pub-sub.png" /></a>
+[![Pub/Sub](../snippets/pub-sub.png)](../examples/streaming/pub-sub/main.go)
 
 ```mermaid
 %%{init: {'themeVariables': { 'background': '#282828', 'edgeLabelBackground': '#7A7A7A'}}}%%
@@ -216,12 +216,17 @@ flowchart RL
 Topics can be matched using their name as in the example above or using complex
 patterns. For example:
 
-<a href="../examples/streaming/pub-sub/main.go#L73"><img src="../snippets/pub-sub-pattern.png" /></a>
+[![Pub/Sub](../snippets/pub-sub-pattern.png)](../examples/streaming/pub-sub/main.go#L73)
 
 Custom matching logic can also be provided:
 
-<a href="../examples/streaming/pub-sub/main.go#L91"><img src="../snippets/pub-sub-matcher.png" /></a>
+[![Pub/Sub](../snippets/pub-sub-matcher.png)](../examples/streaming/pub-sub/main.go#L91)
 
 > Note: Event filtering is done locally in the sink or reader and does not
 > affect the underlying stream. This means that events are still stored in the
 > stream and can be consumed by other sinks.
+
+## Examples
+
+The [examples](../examples/streaming) directory contains a number of examples
+that demonstrate the basic usage of the `streaming` package.

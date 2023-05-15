@@ -12,8 +12,7 @@ used to trigger actions.
 
 Upon joining a replicated map the node receives an up-to-date snapshot of its
 content. The replicated map then guarantees that any change to the map results
-in a notification no matter when the client calls the `Subscribe` method.
-
+in a notification.
 
 ## Usage
 
@@ -23,67 +22,73 @@ To create a replicated map you must provide a name and a Redis client. The name
 is used to namespace the Redis keys and pub/sub channels used by the map. The
 map should later be closed to free up resources.
 
-```go
-package main
+[![Replicated Map Join](../snippets/rmap-join.png)](../examples/rmap/basics/main.go#L24-L29)
 
-import (
-        "context"
+The `Join` function creates a new replicated map or joins an existing one.  The
+`Close` function closes the subscription channels and the subscription to Redis.
 
-        "github.com/redis/go-redis/v9"
-        "goa.design/ponos/rmap"
-)
+### Writing to the Map
 
-func main() {
-        // Create a Redis client
-        client := redis.NewClient(&redis.Options{
-            Addr: "localhost:6379",
-        })
-    
-        // Join or create a replicated map
-        m, err := rmap.Join(context.Background(), "my-map", client)
-        if err != nil {
-            panic(err)
-        }
+* The `Set` method sets the value for a given key and returns the previous value. 
 
-        // ... use the map
+[![Replicated Map Set](../snippets/rmap-set.png)](../examples/rmap/basics/main.go#L41-L46)
 
-        // Cleanup when done
-        if err := m.Close(); err != nil {
-            panic(err)
-        }
-}
-```
+* The `AppendValues` and `RemoveValues` methods append or remove values to or from a list. 
 
-### Reading and Writing to the Map
+[![Replicated Map Append](../snippets/rmap-append.png)](../examples/rmap/basics/main.go#L60-L72)
 
-The `Map` method returns a copy of the current map. The `Get` method returns the
-value for a given key. The `Set` method sets the value for a given key. 
+Values are stored as strings. The `AppendValues` method converts the values to a
+comma separated string before storing them. 
 
-```go
-        // Print the current contents of the map
-        fmt.Println(m.Map())
+* The `Inc` method increments a counter by a given amount and returns the new value.
 
-        // Add a new value, old contains the previous value for the key
-        old, err := m.Set(context.Background(), "foo", "bar")
+[![Replicated Map Inc](../snippets/rmap-inc.png)](../examples/rmap/basics/main.go#L79-L84)
 
-        // Retrieve a value
-        val, ok := m.Get("foo") // ok is true if the key exists
-```
+* The `Delete` method deletes a key from the map and returns the previous value if any.
 
-Additionally the `Map` struct exposes convenience methods to manage values that behave
-like slices and values that behave like counters:
+[![Replicated Map Delete](../snippets/rmap-delete.png)](../examples/rmap/basics/main.go#L48-L53)
 
-```go
-        // Append new string values to the slice, returns the new slice
-        res, err := m.AppendValues(context.Background(), "my-array", "value1", "value2", "value3")
+* Finally `Reset` clears the entire map.
 
-        // RemoveValues removes value from the slice, returns the new slice
-        res, err := m.RemoveValues(context.Background(), "my-array", "value1", "value2")
+[![Replicated Map Reset](../snippets/rmap-reset.png)](../examples/rmap/basics/main.go#L31-L34)
 
-        // Increment a counter by 42, they key must hold a valid string
-        // representation of an integer
-        res, err := m.Inc(context.Background(), "foo", 42)
-```
+### Reading from the Map
+
+* The `Get` method retrieves the value associated with a specified key and
+  returns both the value itself and a boolean flag indicating whether the value
+  exists in the map.
+
+[![Replicated Map Get](../snippets/rmap-get.png)](../examples/rmap/basics/main.go#L86-L88)
+
+* The `Keys` method returns a list of all the keys in the map.
+
+[![Replicated Map Keys](../snippets/rmap-keys.png)](../examples/rmap/basics/main.go#L90-L92)
+
+* The `Len` method returns the number of keys in the map.
+
+[![Replicated Map Len](../snippets/rmap-len.png)](../examples/rmap/basics/main.go#L94-L96)
+
+* The `Map` method returns a snapshot of the current key-value pairs in the map.
+
+[![Replicated Map Read](../snippets/rmap-map.png)](../examples/rmap/basics/main.go#L98-100)
+
+### Subscribing to Map Updates
+
+* The `Subscribe` method returns a channel that can be used to receive notifications
+  when the map is updated. The channel is closed when the map is closed.
+
+[![Replicated Map Subscribe](../snippets/rmap-subscribe.png)](../examples/rmap/basics/main.go#L102-L03)
+
+> **Note:** Notifications do not include any information about the change that
+> triggered them. The application must query the map to retrieve the current
+> state. Multiple updates may result in a single notification however it is
+> guaranteed that the map is in the latest state when the notification is
+> received.
+
+* The `Unsubscribe` method unsubscribes from map updates. It also closes the
+  subscription channel.
+
+[![Replicated Map Unsubscribe](../snippets/rmap-unsubscribe.png)](../examples/rmap/basics/main.go#L104)
 
 ## When to Use Replicated Maps
 
@@ -97,59 +102,7 @@ used to share the list of active users across a fleet of microservices. The
 microservices can then use the replicated map to check if a user is active
 without having to query a database.
 
-## Example
+## Examples
 
-The following example creates a replicated map and then starts a goroutine that
-listens to notifications. The main goroutine then sets 100 keys and waits for
-the notifications to be received.
-
-```go
-package main
-
-import (
-        "context"
-        "fmt"
-        "strconv"
-        "sync"
-
-        "github.com/redis/go-redis/v9"
-        "goa.design/ponos/rmap"
-)
-
-func main() {
-        // Create a Redis client
-        client := redis.NewClient(&redis.Options{
-                Addr: "localhost:6379",
-                Password: os.Getenv("REDIS_PASSWORD"),
-        })
-    
-        // Join or create a replicated map
-        ctx := context.Background()
-        m, err := rmap.Join(ctx, "my-map", client)
-        if err != nil {
-                panic(err)
-        }
-
-        // Start a goroutine to listen for updates
-        numUpdates := 100
-        var wg sync.WaitGroup
-        wg.Add(1)
-        go func() {
-                defer wg.Done()
-                for range m.C {
-                        if m.Len() == numUpdates {
-                                // We received all the updates
-                                return
-                        }
-                }
-        }()
-
-        // Send a few updates
-        for i := 0; i < numUpdates; i++ {
-                m.Set(ctx, "foo-" + strconv.Itoa(i+1), "bar")
-        }
-
-        // Wait for the updates to be received
-        wg.Wait()
-}
-```
+The [examples/rmap](../examples/rmap) directory contains a few examples that
+demonstrate the basic usage of the `rmap` package.

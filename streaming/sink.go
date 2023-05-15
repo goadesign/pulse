@@ -451,9 +451,7 @@ func (s *Sink) removeConsumer(ctx context.Context, consumer string) {
 		if err != nil {
 			s.logger.Error(fmt.Errorf("failed to remove consumer from consumer map: %w", err), "stream", stream.Name)
 		}
-		if err := cm.Close(); err != nil {
-			s.logger.Error(fmt.Errorf("failed to close consumer map: %w", err), "stream", stream.Name)
-		}
+		cm.Close()
 		if len(remains) == 0 {
 			if err := s.deleteConsumerGroup(ctx, stream); err != nil {
 				s.logger.Error(err, "stream", stream.Name)
@@ -463,9 +461,7 @@ func (s *Sink) removeConsumer(ctx context.Context, consumer string) {
 	if _, err := s.consumersKeepAliveMap.Delete(ctx, consumer); err != nil {
 		s.logger.Error(fmt.Errorf("failed to remove consumer from keep-alive map: %w", err))
 	}
-	if err := s.consumersKeepAliveMap.Close(); err != nil {
-		s.logger.Error(fmt.Errorf("failed to close keep-alive map: %w", err))
-	}
+	s.consumersKeepAliveMap.Close()
 }
 
 func (s *Sink) deleteConsumerGroup(ctx context.Context, stream *Stream) error {

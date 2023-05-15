@@ -368,9 +368,7 @@ func (p *Node) handleShutdown() {
 	if p.clientOnly {
 		p.shuttingDown = true
 		p.shutdown = true
-		if err := p.shutdownMap.Close(); err != nil {
-			p.logger.Error(fmt.Errorf("failed to stop shutdown map: %w", err))
-		}
+		p.shutdownMap.Close()
 		return
 	}
 	p.shuttingDown = true
@@ -526,19 +524,11 @@ func (p *Node) cleanup() error {
 
 // closeMaps stops all replicated maps.
 func (p *Node) closeMaps() {
-	if err := p.shutdownMap.Close(); err != nil {
-		p.logger.Error(fmt.Errorf("failed to stop shutdown map: %w", err))
-	}
+	p.shutdownMap.Close()
 	if !p.clientOnly {
-		if err := p.keepAliveMap.Close(); err != nil {
-			p.logger.Error(fmt.Errorf("failed to stop keep-alive map: %w", err))
-		}
-		if err := p.workersMap.Close(); err != nil {
-			p.logger.Error(fmt.Errorf("failed to stop workers map: %w", err))
-		}
-		if err := p.pendingJobsMap.Close(); err != nil {
-			p.logger.Error(fmt.Errorf("failed to stop pending jobs map: %w", err))
-		}
+		p.keepAliveMap.Close()
+		p.workersMap.Close()
+		p.pendingJobsMap.Close()
 	}
 }
 

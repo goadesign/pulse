@@ -137,7 +137,7 @@ func TestMapLocal(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "", old)
 	assert.Eventually(t, func() bool { return len(m.Map()) == 1 }, wf, tck)
-	assert.NoError(t, m.Close())
+	m.Close()
 	assert.Eventually(t, func() bool { return m.closed }, wf, tck)
 
 	// Check that we can still read the map after it has been closed.
@@ -248,7 +248,7 @@ func TestLogs(t *testing.T) {
 	assert.Eventually(t, func() bool { return len(m.Map()) == 1 }, wf, tck)
 	assert.NoError(t, m.Reset(ctx))
 	assert.Eventually(t, func() bool { return len(m.Map()) == 0 }, wf, tck)
-	assert.NoError(t, m.Close())
+	m.Close()
 	assert.Eventually(t, func() bool { return m.closed }, wf, tck)
 
 	// Check that the logs contain the expected messages
@@ -360,7 +360,7 @@ func TestReconnect(t *testing.T) {
 func cleanup(t *testing.T, m *Map) {
 	t.Helper()
 	assert.NoError(t, m.Reset(context.Background()))
-	assert.NoError(t, m.Close())
+	m.Close()
 	assert.Eventually(t, func() bool { return m.closed }, wf, tck)
 }
 

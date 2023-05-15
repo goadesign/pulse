@@ -213,6 +213,22 @@ func (sm *Map) Subscribe() <-chan struct{} {
 	return c
 }
 
+// Unsubscribe removes the given channel from the list of subscribers and closes it.
+func (sm *Map) Unsubscribe(c <-chan struct{}) {
+	sm.lock.Lock()
+	defer sm.lock.Unlock()
+	if sm.closing {
+		return
+	}
+	for i, ch := range sm.chans {
+		if ch == c {
+			close(sm.chans[i])
+			sm.chans = append(sm.chans[:i], sm.chans[i+1:]...)
+			return
+		}
+	}
+}
+
 // Len returns the number of items in the replicated map.
 func (sm *Map) Len() int {
 	sm.lock.Lock()
@@ -341,10 +357,10 @@ func (sm *Map) Reset(ctx context.Context) error {
 
 // Close closes the connection to the map, freeing resources. It is safe to
 // call Close multiple times.
-func (sm *Map) Close() error {
+func (sm *Map) Close() {
 	sm.lock.Lock()
 	if sm.closing {
-		return nil
+		return
 	}
 	sm.closing = true
 	close(sm.done)
@@ -353,7 +369,6 @@ func (sm *Map) Close() error {
 	sm.lock.Lock()
 	defer sm.lock.Unlock()
 	sm.closed = true
-	return nil
 }
 
 // init initializes the map.

@@ -11,6 +11,19 @@ source ./scripts/utils/common.sh
 # https://github.com/mixn/carbon-now-cli/tree/v2
 check_required_cmd "carbon-now" "carbon-now-cli"
 
+carbon-now examples/rmap/basics/main.go --start 24 --end 29 --config snippets/carbon-config.json --preset ponos --save-as "snippets/rmap-join"
+carbon-now examples/rmap/basics/main.go --start 41 --end 46 --config snippets/carbon-config.json --preset ponos --save-as "snippets/rmap-set"
+carbon-now examples/rmap/basics/main.go --start 60 --end 72 --config snippets/carbon-config.json --preset ponos --save-as "snippets/rmap-append"
+carbon-now examples/rmap/basics/main.go --start 79 --end 84 --config snippets/carbon-config.json --preset ponos --save-as "snippets/rmap-inc"
+carbon-now examples/rmap/basics/main.go --start 48 --end 53 --config snippets/carbon-config.json --preset ponos --save-as "snippets/rmap-delete"
+carbon-now examples/rmap/basics/main.go --start 31 --end 34 --config snippets/carbon-config.json --preset ponos --save-as "snippets/rmap-reset"
+carbon-now examples/rmap/basics/main.go --start 86 --end 88 --config snippets/carbon-config.json --preset ponos --save-as "snippets/rmap-get"
+carbon-now examples/rmap/basics/main.go --start 90 --end 92 --config snippets/carbon-config.json --preset ponos --save-as "snippets/rmap-keys"
+carbon-now examples/rmap/basics/main.go --start 94 --end 96 --config snippets/carbon-config.json --preset ponos --save-as "snippets/rmap-len"
+carbon-now examples/rmap/basics/main.go --start 98 --end 100 --config snippets/carbon-config.json --preset ponos --save-as "snippets/rmap-map"
+carbon-now examples/rmap/basics/main.go --start 102 --end 103 --config snippets/carbon-config.json --preset ponos --save-as "snippets/rmap-subscribe"
+carbon-now examples/rmap/basics/main.go --start 104 --end 104 --config snippets/carbon-config.json --preset ponos --save-as "snippets/rmap-unsubscribe"
+
 carbon-now examples/streaming/single-reader/main.go --start 21 --end 51 --config snippets/carbon-config.json --preset ponos --save-as "snippets/single-reader"
 carbon-now examples/streaming/multi-reader/main.go  --start 45 --end 73 --config snippets/carbon-config.json --preset ponos --save-as "snippets/multi-reader"
 carbon-now examples/streaming/single-sink/main.go   --start 37 --end 56 --config snippets/carbon-config.json --preset ponos --save-as "snippets/single-sink"
