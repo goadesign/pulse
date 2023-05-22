@@ -118,7 +118,7 @@ func TestCleanup(t *testing.T) {
 
 	// Stop sink, destroy stream and check Redis keys are gone
 	sink.Close()
-	assert.Eventually(t, func() bool { return sink.Closed() }, wf, tck)
+	assert.Eventually(t, func() bool { return sink.IsClosed() }, wf, tck)
 	assert.Equal(t, rdb.Exists(ctx, s.key).Val(), int64(1))
 	assert.NoError(t, s.Destroy(ctx))
 	assert.Eventually(t, func() bool { return rdb.Exists(ctx, s.key).Val() == 0 }, wf, tck)
@@ -224,7 +224,7 @@ func TestMultipleConsumers(t *testing.T) {
 	require.NoError(t, err)
 	defer func() {
 		sink2.Close()
-		assert.Eventually(t, func() bool { return sink2.Closed() }, wf, tck)
+		assert.Eventually(t, func() bool { return sink2.IsClosed() }, wf, tck)
 	}()
 
 	// Add event
@@ -337,7 +337,7 @@ func cleanup(t *testing.T, ctx context.Context, s *Stream, sink *Sink) {
 	t.Helper()
 	if sink != nil {
 		sink.Close()
-		assert.Eventually(t, func() bool { return sink.Closed() }, wf, tck)
+		assert.Eventually(t, func() bool { return sink.IsClosed() }, wf, tck)
 	}
 	if s != nil {
 		assert.NoError(t, s.Destroy(ctx))

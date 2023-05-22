@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -107,7 +108,7 @@ func newReader(ctx context.Context, stream *Stream, opts ...ReaderOption) (*Read
 		donechan:      make(chan struct{}),
 		streamschan:   make(chan struct{}),
 		eventMatcher:  eventMatcher,
-		logger:        stream.rootLogger,
+		logger:        stream.rootLogger.WithPrefix("reader", stream.Name),
 		rdb:           stream.rdb,
 	}
 
@@ -227,9 +228,9 @@ func (r *Reader) xread(ctx context.Context) ([]redis.XStream, error) {
 	readStreams = append(readStreams, r.streamCursors...)
 	r.lock.Unlock()
 
-	if r.blockDuration > 4*time.Second {
-		r.logger.Debug("reading", "streams", readStreams, "max", r.maxPolled, "block", r.blockDuration)
-	}
+	// if r.blockDuration > 4*time.Second {
+	r.logger.Debug("reading", "streams", readStreams, "max", r.maxPolled, "block", r.blockDuration)
+	// }
 	return r.rdb.XRead(ctx, &redis.XReadArgs{
 		Streams: readStreams,
 		Count:   r.maxPolled,
@@ -260,6 +261,15 @@ func (r *Reader) isClosing() bool {
 	r.lock.Lock()
 	defer r.lock.Unlock()
 	return r.closing
+}
+
+// CreatedAt returns the event creation time (millisecond precision).
+func (e *Event) CreatedAt() time.Time {
+	tss := e.ID[:strings.IndexByte(e.ID, '-')]
+	ts, _ := strconv.ParseInt(tss, 10, 64)
+	seconds := ts / 1000
+	nanos := (ts % 1000) * 1_000_000
+	return time.Unix(seconds, nanos)
 }
 
 // readOnce calls the provided readFn and returns the events or error.

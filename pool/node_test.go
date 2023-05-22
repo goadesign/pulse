@@ -16,11 +16,25 @@ import (
 
 var redisPwd = "redispassword"
 
+const delay = 10 * time.Millisecond
+const max = 1000 * time.Millisecond
+
 func init() {
 	if p := os.Getenv("REDIS_PASSWORD"); p != "" {
 		redisPwd = p
 	}
 }
+
+type workerMock struct {
+	startFunc  func(ctx context.Context, job *Job) error
+	stopFunc   func(ctx context.Context, key string) error
+	notifyFunc func(ctx context.Context, payload []byte) error
+	jobs       map[string]*Job
+}
+
+func (w *workerMock) Start(ctx context.Context, job *Job) error  { return w.startFunc(ctx, job) }
+func (w *workerMock) Stop(ctx context.Context, key string) error { return w.stopFunc(ctx, key) }
+func (w *workerMock) Notify(ctx context.Context, p []byte) error { return w.notifyFunc(ctx, p) }
 
 func TestDispatchJobOneWorker(t *testing.T) {
 	var (
@@ -31,18 +45,12 @@ func TestDispatchJobOneWorker(t *testing.T) {
 		node    = newTestNode(t, ctx, rdb)
 		worker  = newTestWorker(t, ctx, node)
 	)
+	defer cleanup(t, rdb)
 	err := node.DispatchJob(ctx, key, payload)
 	assert.NoError(t, err)
-	job := readOneWorkerJob(t, worker)
-	if job != nil {
-		job.Ack(ctx)
-		assert.Equal(t, payload, job.Payload)
-		assert.Equal(t, key, job.Key)
-	}
+	assert.Eventually(t, func() bool { return numJobs(t, worker) == 1 }, max, delay)
+	assert.Equal(t, payload, worker.jobs[key].Payload)
 	assert.NoError(t, node.Shutdown(ctx))
-	ln, err := rdb.Keys(ctx, "*").Result()
-	assert.NoError(t, err)
-	assert.Len(t, ln, 0)
 }
 
 func TestDispatchJobTwoWorkers(t *testing.T) {
@@ -56,26 +64,16 @@ func TestDispatchJobTwoWorkers(t *testing.T) {
 		worker1 = newTestWorker(t, ctx, node)
 		worker2 = newTestWorker(t, ctx, node)
 	)
+	defer cleanup(t, rdb)
 	err := node.DispatchJob(ctx, key, payload)
 	assert.NoError(t, err)
 	err = node.DispatchJob(ctx, key2, payload)
 	assert.NoError(t, err)
-	job1 := readOneWorkerJob(t, worker1)
-	job2 := readOneWorkerJob(t, worker2)
-	if job1 != nil {
-		job1.Ack(ctx)
-		assert.Equal(t, payload, job1.Payload)
-		assert.Equal(t, key, job1.Key)
-	}
-	if job2 != nil {
-		job2.Ack(ctx)
-		assert.Equal(t, payload, job2.Payload)
-		assert.Equal(t, key2, job2.Key)
-	}
+	require.Eventually(t, func() bool { return numJobs(t, worker1) == 1 }, max, delay)
+	require.Eventually(t, func() bool { return numJobs(t, worker2) == 1 }, max, delay)
+	assert.Equal(t, payload, worker1.jobs[key].Payload)
+	assert.Equal(t, payload, worker2.jobs[key2].Payload)
 	assert.NoError(t, node.Shutdown(ctx))
-	ln, err := rdb.Keys(ctx, "*").Result()
-	assert.NoError(t, err)
-	assert.Len(t, ln, 0)
 }
 
 func TestStopThenShutdown(t *testing.T) {
@@ -85,18 +83,16 @@ func TestStopThenShutdown(t *testing.T) {
 		node   = newTestNode(t, ctx, rdb)
 		worker = newTestWorker(t, ctx, node)
 	)
+	defer cleanup(t, rdb)
 	assert.NoError(t, node.RemoveWorker(ctx, worker))
 	assert.NoError(t, node.Shutdown(ctx))
-	ln, err := rdb.Keys(ctx, "*").Result()
-	assert.NoError(t, err)
-	assert.Len(t, ln, 0)
 }
 
 func newTestNode(t *testing.T, ctx context.Context, rdb *redis.Client) *Node {
 	t.Helper()
 	node, err := AddNode(ctx, "testNode", rdb,
 		WithLogger(ponos.ClueLogger(ctx)),
-		WithMaxShutdownDuration(100*time.Millisecond),
+		WithWorkerShutdownTTL(100*time.Millisecond),
 		WithJobSinkBlockDuration(50*time.Millisecond),
 		WithWorkerTTL(50*time.Millisecond))
 	require.NoError(t, err)
@@ -105,23 +101,32 @@ func newTestNode(t *testing.T, ctx context.Context, rdb *redis.Client) *Node {
 
 func newTestWorker(t *testing.T, ctx context.Context, node *Node) *Worker {
 	t.Helper()
-	worker, err := node.AddWorker(ctx)
+	wm := &workerMock{jobs: make(map[string]*Job)}
+	wm.startFunc = func(ctx context.Context, job *Job) error { wm.jobs[job.Key] = job; return nil }
+	wm.stopFunc = func(ctx context.Context, key string) error { delete(wm.jobs, key); return nil }
+	wm.notifyFunc = func(ctx context.Context, payload []byte) error { return nil }
+	worker, err := node.AddWorker(ctx, wm)
 	require.NoError(t, err)
 	return worker
-}
-
-func readOneWorkerJob(t *testing.T, worker *Worker) *Job {
-	t.Helper()
-	select {
-	case job := <-worker.C:
-		return job
-	case <-time.After(10 * time.Second):
-		t.Error("timeout")
-		return nil
-	}
 }
 
 func testContext(t *testing.T) context.Context {
 	t.Helper()
 	return log.Context(context.Background(), log.WithDebug())
+}
+
+func numJobs(t *testing.T, w *Worker) int {
+	t.Helper()
+	w.lock.Lock()
+	defer w.lock.Unlock()
+	return len(w.jobs)
+}
+
+func cleanup(t *testing.T, rdb *redis.Client) {
+	t.Helper()
+	ctx := context.Background()
+	ln, err := rdb.Keys(ctx, "*").Result()
+	assert.NoError(t, err)
+	assert.Len(t, ln, 0)
+	assert.NoError(t, rdb.FlushDB(ctx).Err())
 }

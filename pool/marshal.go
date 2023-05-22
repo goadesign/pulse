@@ -60,6 +60,18 @@ func unmarshalJob(data []byte) *Job {
 	}
 }
 
+// marshalJobKey marshals a job key into a byte slice.
+func marshalJobKey(key string) []byte {
+	var buf bytes.Buffer
+	if err := binary.Write(&buf, binary.LittleEndian, int32(len(key))); err != nil {
+		panic(err)
+	}
+	if err := binary.Write(&buf, binary.LittleEndian, []byte(key)); err != nil {
+		panic(err)
+	}
+	return buf.Bytes()
+}
+
 func unmarshalJobKey(data []byte) string {
 	reader := bytes.NewReader(data)
 	var keyLength int32
@@ -73,32 +85,25 @@ func unmarshalJobKey(data []byte) string {
 	return string(keyBytes)
 }
 
-// marshalPendingJob marshals j into a string.
-func marshalPendingJob(job *pendingJob) string {
+func marshalNotification(key string, payload []byte) []byte {
 	var buf bytes.Buffer
-	if err := binary.Write(&buf, binary.LittleEndian, job.Done); err != nil {
+	if err := binary.Write(&buf, binary.LittleEndian, int32(len(key))); err != nil {
 		panic(err)
 	}
-	if err := binary.Write(&buf, binary.LittleEndian, int32(len(job.Key))); err != nil {
+	if err := binary.Write(&buf, binary.LittleEndian, []byte(key)); err != nil {
 		panic(err)
 	}
-	if err := binary.Write(&buf, binary.LittleEndian, []byte(job.Key)); err != nil {
+	if err := binary.Write(&buf, binary.LittleEndian, int32(len(payload))); err != nil {
 		panic(err)
 	}
-	if err := binary.Write(&buf, binary.LittleEndian, job.CreatedAt); err != nil {
+	if err := binary.Write(&buf, binary.LittleEndian, payload); err != nil {
 		panic(err)
 	}
-	return buf.String()
+	return buf.Bytes()
 }
 
-// unmarshalPendingJob unmarshals a pendingJob from a byte slice created by
-// marshalPendingJob.
-func unmarshalPendingJob(s string) *pendingJob {
-	var job pendingJob
-	reader := bytes.NewReader([]byte(s))
-	if err := binary.Read(reader, binary.LittleEndian, &job.Done); err != nil {
-		panic(err)
-	}
+func unmarshalNotification(data []byte) (string, []byte) {
+	reader := bytes.NewReader(data)
 	var keyLength int32
 	if err := binary.Read(reader, binary.LittleEndian, &keyLength); err != nil {
 		panic(err)
@@ -107,20 +112,57 @@ func unmarshalPendingJob(s string) *pendingJob {
 	if err := binary.Read(reader, binary.LittleEndian, &keyBytes); err != nil {
 		panic(err)
 	}
-	job.Key = string(keyBytes)
-	if err := binary.Read(reader, binary.LittleEndian, &job.CreatedAt); err != nil {
+	// read payload
+	var payloadLength int32
+	if err := binary.Read(reader, binary.LittleEndian, &payloadLength); err != nil {
 		panic(err)
 	}
-	return &job
+	payload := make([]byte, payloadLength)
+	if err := binary.Read(reader, binary.LittleEndian, &payload); err != nil {
+		panic(err)
+	}
+	return string(keyBytes), payload
 }
 
-// unmarshalPendingJobDone unmarshals the Done field of a pendingJob from a byte
-// slice created by marshalPendingJob.
-func unmarshalPendingJobDone(s string) bool {
-	var done bool
-	reader := bytes.NewReader([]byte(s))
-	if err := binary.Read(reader, binary.LittleEndian, &done); err != nil {
+// Envelope used to identify event sender.
+func marshalEnvelope(sender string, payload []byte) []byte {
+	var buf bytes.Buffer
+	if err := binary.Write(&buf, binary.LittleEndian, int32(len(sender))); err != nil {
 		panic(err)
 	}
-	return done
+	if err := binary.Write(&buf, binary.LittleEndian, []byte(sender)); err != nil {
+		panic(err)
+	}
+	if err := binary.Write(&buf, binary.LittleEndian, int32(len(payload))); err != nil {
+		panic(err)
+	}
+	if err := binary.Write(&buf, binary.LittleEndian, payload); err != nil {
+		panic(err)
+	}
+	return buf.Bytes()
+}
+
+// unmarshalEnvelope unmarshals an envelope from a byte slice created by marshalEnvelope.
+func unmarshalEnvelope(data []byte) (string, []byte) {
+	reader := bytes.NewReader(data)
+	var senderLength int32
+	if err := binary.Read(reader, binary.LittleEndian, &senderLength); err != nil {
+		panic(err)
+	}
+	senderBytes := make([]byte, senderLength)
+	if err := binary.Read(reader, binary.LittleEndian, &senderBytes); err != nil {
+		panic(err)
+	}
+	var payloadLength int32
+	if err := binary.Read(reader, binary.LittleEndian, &payloadLength); err != nil {
+		panic(err)
+	}
+	var payload []byte
+	if payloadLength > 0 {
+		payload = make([]byte, payloadLength)
+		if err := binary.Read(reader, binary.LittleEndian, &payload); err != nil {
+			panic(err)
+		}
+	}
+	return string(senderBytes), payload
 }

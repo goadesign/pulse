@@ -15,9 +15,9 @@ type (
 
 	poolOption struct {
 		workerTTL            time.Duration
-		leaseTTL             time.Duration
+		pendingJobTTL        time.Duration
+		workerShutdownTTL    time.Duration
 		maxQueuedJobs        int
-		maxShutdownDuration  time.Duration
 		clientOnly           bool
 		jobSinkBlockDuration time.Duration
 		logger               ponos.Logger
@@ -37,11 +37,19 @@ func WithWorkerTTL(ttl time.Duration) PoolOption {
 	}
 }
 
-// WithLeaseTTL sets the duration after which the job is made available to other
-// workers if it wasn't acked. The default is 5s.
-func WithLeaseTTL(ttl time.Duration) PoolOption {
+// WithPendingJobTTL sets the duration after which a job is made available to
+// other workers if it wasn't started. The default is 20s.
+func WithPendingJobTTL(ttl time.Duration) PoolOption {
 	return func(o *poolOption) {
-		o.leaseTTL = ttl
+		o.pendingJobTTL = ttl
+	}
+}
+
+// WithWorkerShutdownTTL sets the maximum time to wait for workers to
+// shutdown.  The default is 2 minutes.
+func WithWorkerShutdownTTL(ttl time.Duration) PoolOption {
+	return func(o *poolOption) {
+		o.workerShutdownTTL = ttl
 	}
 }
 
@@ -50,14 +58,6 @@ func WithLeaseTTL(ttl time.Duration) PoolOption {
 func WithMaxQueuedJobs(max int) PoolOption {
 	return func(o *poolOption) {
 		o.maxQueuedJobs = max
-	}
-}
-
-// WithMaxShutdownDuration sets the maximum time to wait for workers to
-// shutdown.  The default is 2 minutes.
-func WithMaxShutdownDuration(max time.Duration) PoolOption {
-	return func(o *poolOption) {
-		o.maxShutdownDuration = max
 	}
 }
 
@@ -89,9 +89,9 @@ func WithLogger(logger ponos.Logger) PoolOption {
 func defaultPoolOptions() *poolOption {
 	return &poolOption{
 		workerTTL:            10 * time.Second,
-		leaseTTL:             5 * time.Second,
+		pendingJobTTL:        20 * time.Second,
+		workerShutdownTTL:    2 * time.Minute,
 		maxQueuedJobs:        1000,
-		maxShutdownDuration:  2 * time.Minute,
 		jobSinkBlockDuration: 5 * time.Second,
 		logger:               ponos.NoopLogger(),
 	}
