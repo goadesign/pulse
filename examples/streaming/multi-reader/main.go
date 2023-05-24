@@ -55,7 +55,7 @@ func main() {
 	defer reader.Close()
 
 	// Read event
-	event := <-reader.C
+	event := <-reader.Subscribe()
 	fmt.Printf("reader 1, event: %s, payload: %s\n", event.EventName, event.Payload)
 
 	// Create other reader for stream "my-stream" and start reading after
@@ -69,6 +69,6 @@ func main() {
 	defer otherReader.Close()
 
 	// Read second event with other reader
-	event = <-otherReader.C
+	event = <-otherReader.Subscribe()
 	fmt.Printf("reader 2, event: %s, payload: %s\n", event.EventName, event.Payload)
 }

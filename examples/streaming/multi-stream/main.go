@@ -69,13 +69,14 @@ func main() {
 	fmt.Printf("event 2 id: %s\n", id2)
 
 	// Consume events from both streams
-	event := <-sink.C
+	c := sink.Subscribe()
+	event := <-c
 	fmt.Printf("stream: %s, event: %s, payload: %s\n", event.StreamName, event.EventName, event.Payload)
 	if err := sink.Ack(ctx, event); err != nil {
 		panic(err)
 	}
 
-	event = <-sink.C
+	event = <-c
 	fmt.Printf("stream: %s, event: %s, payload: %s\n", event.StreamName, event.EventName, event.Payload)
 	if err := sink.Ack(ctx, event); err != nil {
 		panic(err)

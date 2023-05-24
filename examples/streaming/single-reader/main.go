@@ -47,6 +47,6 @@ func main() {
 	defer reader.Close()
 
 	// Consume event
-	event := <-reader.C
+	event := <-reader.Subscribe()
 	fmt.Printf("event: %s, payload: %s\n", event.EventName, event.Payload)
 }

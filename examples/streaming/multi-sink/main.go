@@ -56,7 +56,7 @@ func main() {
 	defer sink.Close()
 
 	// Read and acknowlege event
-	event := <-sink.C
+	event := <-sink.Subscribe()
 	fmt.Printf("sink 1, event: %s, payload: %s\n", event.EventName, event.Payload)
 	if err := sink.Ack(ctx, event); err != nil {
 		panic(err)
@@ -70,7 +70,7 @@ func main() {
 	defer otherSink.Close()
 
 	// Read second event
-	event = <-otherSink.C
+	event = <-otherSink.Subscribe()
 	fmt.Printf("sink 2, event: %s, payload: %s\n", event.EventName, event.Payload)
 	if otherSink.Ack(ctx, event); err != nil {
 		panic(err)

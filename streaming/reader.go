@@ -18,8 +18,6 @@ import (
 type (
 	// Reader represents a stream reader.
 	Reader struct {
-		// C is the reader event channel.
-		C <-chan *Event
 		// closed is true if Close completed.
 		closed bool
 		// startID is the reader start event ID.
@@ -39,8 +37,10 @@ type (
 		// maxPolled is the maximum number of events to read in one
 		// XREADBLOCK call.
 		maxPolled int64
-		// c is the reader event channel.
-		c chan *Event
+		// buffer size of the reader channel.
+		bufferSize int
+		// channels to send notifications
+		chans []chan *Event
 		// donechan is the reader donechan channel.
 		donechan chan struct{}
 		// streamschan notifies the reader when streams are added or
@@ -85,7 +85,6 @@ func newReader(ctx context.Context, stream *Stream, opts ...ReaderOption) (*Read
 	for _, option := range opts {
 		option(&options)
 	}
-	c := make(chan *Event, options.BufferSize)
 	eventMatcher := options.EventMatcher
 	if eventMatcher == nil {
 		if options.Topic != "" {
@@ -97,14 +96,13 @@ func newReader(ctx context.Context, stream *Stream, opts ...ReaderOption) (*Read
 	}
 
 	reader := &Reader{
-		C:             c,
 		startID:       options.LastEventID,
 		streams:       []*Stream{stream},
 		streamKeys:    []string{stream.key},
 		streamCursors: []string{options.LastEventID},
 		blockDuration: options.BlockDuration,
 		maxPolled:     options.MaxPolled,
-		c:             c,
+		bufferSize:    options.BufferSize,
 		donechan:      make(chan struct{}),
 		streamschan:   make(chan struct{}),
 		eventMatcher:  eventMatcher,
@@ -116,6 +114,16 @@ func newReader(ctx context.Context, stream *Stream, opts ...ReaderOption) (*Read
 	go reader.read()
 
 	return reader, nil
+}
+
+// Subscribe returns a channel that receives events from the stream.
+// The channel is closed when the reader is stopped.
+func (r *Reader) Subscribe() <-chan *Event {
+	c := make(chan *Event, r.bufferSize)
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	r.chans = append(r.chans, c)
+	return c
 }
 
 // AddStream adds the stream to the sink. By default the stream cursor starts at
@@ -208,7 +216,7 @@ func (r *Reader) read() {
 		r.lock.Lock()
 		for _, events := range streamsEvents {
 			streamName := events.Stream[len(streamKeyPrefix):]
-			streamEvents(streamName, events.Stream, "", events.Messages, r.eventMatcher, r.c, r.rdb, r.logger)
+			streamEvents(streamName, events.Stream, "", events.Messages, r.eventMatcher, r.chans, r.rdb, r.logger)
 			for i := range r.streamKeys {
 				if r.streamKeys[i] == events.Stream {
 					r.streamCursors[i] = events.Messages[len(events.Messages)-1].ID
@@ -252,7 +260,9 @@ func (r *Reader) notifyStreamChange() {
 func (r *Reader) cleanup() {
 	r.lock.Lock()
 	defer r.lock.Unlock()
-	close(r.c)
+	for _, c := range r.chans {
+		close(c)
+	}
 	r.wait.Done()
 }
 
@@ -333,7 +343,7 @@ func streamEvents(
 	sinkName string,
 	msgs []redis.XMessage,
 	eventMatcher EventMatcherFunc,
-	c chan *Event,
+	chans []chan *Event,
 	rdb *redis.Client,
 	logger ponos.Logger,
 ) {
@@ -360,7 +370,9 @@ func streamEvents(
 			continue
 		}
 		logger.Debug("event", "stream", streamName, "event", ev.ID)
-		c <- ev
+		for _, c := range chans {
+			c <- ev
+		}
 	}
 }
 

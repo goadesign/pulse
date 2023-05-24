@@ -3,6 +3,7 @@ package pool
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -38,33 +39,34 @@ func (w *workerMock) Notify(ctx context.Context, p []byte) error { return w.noti
 
 func TestDispatchJobOneWorker(t *testing.T) {
 	var (
-		key     = "testDispatchJobOneWorker"
-		payload = []byte("payload")
-		ctx     = testContext(t)
-		rdb     = redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
-		node    = newTestNode(t, ctx, rdb)
-		worker  = newTestWorker(t, ctx, node)
+		testName = strings.Replace(t.Name(), "/", "_", -1)
+		payload  = []byte("payload")
+		ctx      = testContext(t)
+		rdb      = redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+		node     = newTestNode(t, ctx, rdb, testName)
+		worker   = newTestWorker(t, ctx, node)
 	)
-	defer cleanup(t, rdb)
-	err := node.DispatchJob(ctx, key, payload)
+	defer cleanup(t, rdb, true, testName)
+	err := node.DispatchJob(ctx, testName, payload)
 	assert.NoError(t, err)
-	assert.Eventually(t, func() bool { return numJobs(t, worker) == 1 }, max, delay)
-	assert.Equal(t, payload, worker.jobs[key].Payload)
+	require.Eventually(t, func() bool { return numJobs(t, worker) == 1 }, max, delay)
+	assert.Equal(t, payload, worker.jobs[testName].Payload)
 	assert.NoError(t, node.Shutdown(ctx))
 }
 
 func TestDispatchJobTwoWorkers(t *testing.T) {
 	var (
-		key     = "differentHash"
-		key2    = "testDispatchJobTwoWorkers"
-		payload = []byte("payload")
-		ctx     = testContext(t)
-		rdb     = redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
-		node    = newTestNode(t, ctx, rdb)
-		worker1 = newTestWorker(t, ctx, node)
-		worker2 = newTestWorker(t, ctx, node)
+		testName = strings.Replace(t.Name(), "/", "_", -1)
+		key      = "differentHash"
+		key2     = "testDispatchJobTwoWorkers"
+		payload  = []byte("payload")
+		ctx      = testContext(t)
+		rdb      = redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+		node     = newTestNode(t, ctx, rdb, testName)
+		worker1  = newTestWorker(t, ctx, node)
+		worker2  = newTestWorker(t, ctx, node)
 	)
-	defer cleanup(t, rdb)
+	defer cleanup(t, rdb, true, testName)
 	err := node.DispatchJob(ctx, key, payload)
 	assert.NoError(t, err)
 	err = node.DispatchJob(ctx, key2, payload)
@@ -76,21 +78,33 @@ func TestDispatchJobTwoWorkers(t *testing.T) {
 	assert.NoError(t, node.Shutdown(ctx))
 }
 
-func TestStopThenShutdown(t *testing.T) {
+func TestRemoveWorkerThenShutdown(t *testing.T) {
 	var (
-		ctx    = testContext(t)
-		rdb    = redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
-		node   = newTestNode(t, ctx, rdb)
-		worker = newTestWorker(t, ctx, node)
+		ctx      = testContext(t)
+		testName = strings.Replace(t.Name(), "/", "_", -1)
+		rdb      = redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+		node     = newTestNode(t, ctx, rdb, testName)
+		worker   = newTestWorker(t, ctx, node)
 	)
-	defer cleanup(t, rdb)
+	defer cleanup(t, rdb, true, testName)
 	assert.NoError(t, node.RemoveWorker(ctx, worker))
 	assert.NoError(t, node.Shutdown(ctx))
 }
 
-func newTestNode(t *testing.T, ctx context.Context, rdb *redis.Client) *Node {
+func TestClose(t *testing.T) {
+	var (
+		ctx      = testContext(t)
+		testName = strings.Replace(t.Name(), "/", "_", -1)
+		rdb      = redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+		node     = newTestNode(t, ctx, rdb, testName)
+	)
+	defer cleanup(t, rdb, false, testName)
+	assert.NoError(t, node.Close(ctx))
+}
+
+func newTestNode(t *testing.T, ctx context.Context, rdb *redis.Client, name string) *Node {
 	t.Helper()
-	node, err := AddNode(ctx, "testNode", rdb,
+	node, err := AddNode(ctx, name, rdb,
 		WithLogger(ponos.ClueLogger(ctx)),
 		WithWorkerShutdownTTL(100*time.Millisecond),
 		WithJobSinkBlockDuration(50*time.Millisecond),
@@ -121,12 +135,19 @@ func numJobs(t *testing.T, w *Worker) int {
 	defer w.lock.Unlock()
 	return len(w.jobs)
 }
-
-func cleanup(t *testing.T, rdb *redis.Client) {
+func cleanup(t *testing.T, rdb *redis.Client, checkClean bool, testName string) {
 	t.Helper()
 	ctx := context.Background()
-	ln, err := rdb.Keys(ctx, "*").Result()
-	assert.NoError(t, err)
-	assert.Len(t, ln, 0)
+	keys, err := rdb.Keys(ctx, "*").Result()
+	require.NoError(t, err)
+	var filtered []string
+	for _, k := range keys {
+		if strings.Contains(k, testName) {
+			filtered = append(filtered, k)
+		}
+	}
+	if checkClean {
+		assert.Len(t, filtered, 0)
+	}
 	assert.NoError(t, rdb.FlushDB(ctx).Err())
 }

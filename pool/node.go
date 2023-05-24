@@ -162,8 +162,8 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...PoolOp
 	}
 
 	p.wg.Add(4)
-	go p.handlePoolEvents() // handleXXX handles streaming events
-	go p.handleNodeEvents()
+	go p.handlePoolEvents(poolSink.Subscribe()) // handleXXX handles streaming events
+	go p.handleNodeEvents(nodeReader.Subscribe())
 	go p.manageWorkers() // manageXXX handles map updates
 	go p.manageShutdown()
 	return p, nil
@@ -290,10 +290,12 @@ func (p *Node) Shutdown(ctx context.Context) error {
 	close(p.done)
 	p.wg.Wait()
 	p.lock.Lock()
-	p.cleanup()
-	p.closeMaps()
+	defer p.lock.Unlock()
+	p.cleanup() // cleanup first then close maps
+	p.keepAliveMap.Close()
+	p.workerMap.Close()
+	p.shutdownMap.Close()
 	p.shutdown = true
-	p.lock.Unlock()
 	p.logger.Info("shutdown")
 	return nil
 }
@@ -323,8 +325,10 @@ func (p *Node) Close(ctx context.Context) error {
 	p.localWorkers = nil
 	if !p.clientOnly {
 		p.poolSink.Close()
+		p.keepAliveMap.Close()
+		p.workerMap.Close()
+		p.shutdownMap.Close()
 	}
-	p.closeMaps()
 	p.closed = true
 	close(p.done)
 	p.lock.Unlock()
@@ -350,10 +354,10 @@ func (p *Node) IsClosed() bool {
 // handlePoolEvents reads events from the pool job stream. If the event is a
 // dispatched job then it routes it to the appropriate worker. If the event is a
 // shutdown request then it writes to the shutdown map to notify all nodes.
-func (p *Node) handlePoolEvents() {
+func (p *Node) handlePoolEvents(c <-chan *streaming.Event) {
 	defer p.wg.Done()
 	ctx := context.Background()
-	for ev := range p.poolSink.C {
+	for ev := range c {
 		switch ev.EventName {
 		case evStartJob, evNotify, evStopJob:
 			if p.IsShutdown() {
@@ -361,8 +365,8 @@ func (p *Node) handlePoolEvents() {
 				continue
 			}
 			p.logger.Debug("routing", "event", ev.EventName, "event-id", ev.ID)
-			if err := p.routePoolEvent(ctx, ev); err != nil {
-				p.logger.Error(fmt.Errorf("failed to route event: %w", err), "event", ev.EventName, "event-id", ev.ID)
+			if err := p.routeWorkerEvent(ctx, ev); err != nil {
+				p.logger.Error(fmt.Errorf("failed to route event: %w, will retry after %v", err, p.pendingJobTTL), "event", ev.EventName, "event-id", ev.ID)
 			}
 		case evShutdown:
 			p.poolSink.Close() // Closes p.eventSink.C
@@ -373,55 +377,45 @@ func (p *Node) handlePoolEvents() {
 	}
 }
 
-// routePoolEvent routes a dispatched event to the proper worker.
-func (p *Node) routePoolEvent(ctx context.Context, ev *streaming.Event) error {
+// routeWorkerEvent routes a dispatched event to the proper worker.
+func (p *Node) routeWorkerEvent(ctx context.Context, ev *streaming.Event) error {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
 	// Compute the worker ID that will handle the job.
 	key := unmarshalJobKey(ev.Payload)
-
-	// Retry a few times in case a worker is currently stopping, has closed
-	// its stream but the replicated map hasn't been updated yet.
-	retries := 0
-	var err error
-	for retries < 10 {
-		wid, err := p.jobWorker(ctx, key)
-		if err != nil {
-			// Don't retry, jobWorker already retried.
-			return fmt.Errorf("failed to route job %q to worker: %w", key, err)
-		}
-
-		// Stream the event to the worker corresponding to the key hash.
-		stream, err := p.workerStream(ctx, wid)
-		if err != nil {
-			return err
-		}
-		var eventID string
-		eventID, err = stream.Add(ctx, ev.EventName, marshalEnvelope(p.NodeID, ev.Payload))
-		if err != nil {
-			p.logger.Error(fmt.Errorf("failed to add event %s to worker stream %q, attempt %d: %w", ev.EventName, workerStreamName(wid), retries+1, err))
-			retries++
-			continue
-		}
-		p.logger.Debug("routed", "event", ev.EventName, "event-id", ev.ID, "worker", wid, "worker-event-id", eventID)
-
-		// Record the event in the pending event replicated map.
-		p.pendingEvents[wid+":"+eventID] = ev
-
-		return nil
+	wid, err := p.jobWorker(ctx, key)
+	if err != nil {
+		return fmt.Errorf("failed to route job %q to worker: %w", key, err)
 	}
-	return fmt.Errorf("failed to route job %q to worker after %d retries: %w", key, retries, err)
+
+	// Stream the event to the worker corresponding to the key hash.
+	stream, err := p.workerStream(ctx, wid)
+	if err != nil {
+		return err
+	}
+
+	var eventID string
+	eventID, err = stream.Add(ctx, ev.EventName, marshalEnvelope(p.NodeID, ev.Payload))
+	if err != nil {
+		return fmt.Errorf("failed to add event %s to worker stream %q: %w", ev.EventName, workerStreamName(wid), err)
+	}
+	p.logger.Debug("routed", "event", ev.EventName, "event-id", ev.ID, "worker", wid, "worker-event-id", eventID)
+
+	// Record the event in the pending event replicated map.
+	p.pendingEvents[wid+":"+eventID] = ev
+
+	return nil
 }
 
 // handleNodeEvents reads events from the node event stream and acks the pending
 // events that correspond to jobs that are now running or done.
-func (p *Node) handleNodeEvents() {
+func (p *Node) handleNodeEvents(c <-chan *streaming.Event) {
 	defer p.wg.Done()
 	ctx := context.Background()
 	for {
 		select {
-		case ev := <-p.nodeReader.C:
+		case ev := <-c:
 			p.lock.Lock()
 			workerID, payload := unmarshalEnvelope(ev.Payload)
 			eventID := string(payload)
@@ -463,34 +457,51 @@ func (p *Node) handleNodeEvents() {
 func (p *Node) manageWorkers() {
 	defer p.wg.Done()
 	ctx := context.Background()
-	for range p.workerMap.Subscribe() {
-		p.lock.Lock()
-		if p.closing || p.shuttingDown {
-			p.lock.Unlock()
+	c := p.workerMap.Subscribe()
+	for {
+		select {
+		case <-c:
+			p.handleWorkerMapUpdate(ctx)
+		case <-p.done:
 			return
 		}
-		activeIDs := p.activeWorkers(ctx)
-		if len(activeIDs) == 0 {
-			p.lock.Unlock()
+	}
+}
+
+// handleWorkerMapUpdate is called when the worker map is updated.
+func (p *Node) handleWorkerMapUpdate(ctx context.Context) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	if p.closing || p.shuttingDown {
+		return
+	}
+	activeIDs := p.activeWorkers(ctx)
+	if len(activeIDs) == 0 {
+		return
+	}
+	for _, worker := range p.localWorkers {
+		p.rebalanceWorker(ctx, worker, activeIDs)
+	}
+}
+
+// rebalanceWorker rebalances the jobs handled by the worker across the active
+// workers in the pool.
+func (p *Node) rebalanceWorker(ctx context.Context, worker *Worker, activeIDs []string) {
+	worker.lock.Lock()
+	defer worker.lock.Unlock()
+	numIDs := int64(len(activeIDs))
+	for _, job := range worker.jobs {
+		wid := activeIDs[p.h.Hash(job.Key, numIDs)]
+		if wid == worker.ID {
 			continue
 		}
-		numIDs := int64(len(activeIDs))
-		for _, worker := range p.localWorkers {
-			for _, job := range worker.jobs {
-				wid := activeIDs[p.h.Hash(job.Key, numIDs)]
-				if wid == worker.ID {
-					continue
-				}
-				if err := worker.stopJob(ctx, job.Key); err != nil {
-					p.logger.Error(fmt.Errorf("failed to stop job %q for rebalance: %w", job.Key, err))
-					continue
-				}
-				if _, err := p.poolStream.Add(ctx, evStartJob, marshalJob(job)); err != nil {
-					p.logger.Error(fmt.Errorf("failed to add job %q to stream %q: %w", job.Key, p.poolStream.Name, err))
-				}
-			}
+		if err := worker.stopJob(ctx, job.Key); err != nil {
+			p.logger.Error(fmt.Errorf("failed to stop job %q for rebalance: %w", job.Key, err))
+			continue
 		}
-		p.lock.Unlock()
+		if _, err := p.poolStream.Add(ctx, evStartJob, marshalJob(job)); err != nil {
+			p.logger.Error(fmt.Errorf("failed to add job %q to stream %q: %w", job.Key, p.poolStream.Name, err))
+		}
 	}
 }
 
@@ -498,19 +509,30 @@ func (p *Node) manageWorkers() {
 // owned by the node when it is updated.
 func (p *Node) manageShutdown() {
 	defer p.wg.Done()
-	<-p.shutdownMap.Subscribe()
+	c := p.shutdownMap.Subscribe()
+	for {
+		select {
+		case <-c:
+			p.handleShutdownMapUpdate()
+		case <-p.done:
+			return
+		}
+	}
+}
+
+// handleShutdownMapUpdate is called when the shutdown map is updated.
+func (p *Node) handleShutdownMapUpdate() {
 	p.lock.Lock()
 	defer p.lock.Unlock()
-	if p.closing {
+	if p.closing || p.shuttingDown {
 		return
 	}
+	p.shuttingDown = true
 	if p.clientOnly {
-		p.shuttingDown = true
 		p.shutdown = true
 		p.shutdownMap.Close()
 		return
 	}
-	p.shuttingDown = true
 	sm := p.shutdownMap.Map()
 	var requestingNode string
 	for _, node := range sm {
@@ -538,65 +560,42 @@ func (p *Node) jobWorker(ctx context.Context, key string) (string, error) {
 // activeWorkers returns the IDs of the active workers in the pool.
 // It is the caller's responsibility to lock the node.
 func (p *Node) activeWorkers(ctx context.Context) []string {
-	const (
-		// maxRouteRetries is the maximum number of times a node retries to route a
-		// job to a worker. The retries are necessary to handle the case where a
-		// worker is added to the pool and the workers and keep-alive maps have not
-		// been replicated yet.
-		maxRouteRetries = 10
-		// retryRouteDelay is the delay between route retries.
-		retryRouteDelay = 100 * time.Millisecond
-	)
-	var activeIDs []string
-	retries := 0
-	wasMissing := false
-	for len(activeIDs) == 0 && retries < maxRouteRetries {
-		// First, retrieve workers and sort IDs by creation time.
-		workers := p.workerMap.Map()
-		workerCreatedAtByID := make(map[string]int64, len(workers))
-		for id, createdAt := range workers {
-			cat, _ := strconv.ParseInt(createdAt, 10, 64)
-			workerCreatedAtByID[id] = cat
-		}
-		sortedIDs := make([]string, 0, len(workerCreatedAtByID))
-		for id := range workerCreatedAtByID {
-			sortedIDs = append(sortedIDs, id)
-		}
-		sort.Slice(sortedIDs, func(i, j int) bool {
-			return workerCreatedAtByID[sortedIDs[i]] < workerCreatedAtByID[sortedIDs[j]]
-		})
+	// First, retrieve workers and sort IDs by creation time.
+	workers := p.workerMap.Map()
+	workerCreatedAtByID := make(map[string]int64, len(workers))
+	for id, createdAt := range workers {
+		cat, _ := strconv.ParseInt(createdAt, 10, 64)
+		workerCreatedAtByID[id] = cat
+	}
+	sortedIDs := make([]string, 0, len(workerCreatedAtByID))
+	for id := range workerCreatedAtByID {
+		sortedIDs = append(sortedIDs, id)
+	}
+	sort.Slice(sortedIDs, func(i, j int) bool {
+		return workerCreatedAtByID[sortedIDs[i]] < workerCreatedAtByID[sortedIDs[j]]
+	})
 
-		// Then filter out workers that have not been seen for more than workerTTL.
-		alive := p.keepAliveMap.Map()
-		for _, id := range sortedIDs {
-			a, ok := alive[id]
-			if !ok {
-				// This could happen if a worker is removed from the
-				// pool and the last seen map deletion replicates before
-				// the workers map deletion.
-				continue
-			}
-			nanos, _ := strconv.ParseInt(a, 10, 64)
-			t := time.Unix(0, nanos)
-			horizon := t.Add(p.workerTTL)
-			if horizon.After(time.Now()) {
-				activeIDs = append(activeIDs, id)
-			} else {
-				p.logger.Info("deleting", "worker", id, "last seen", t, "TTL", p.workerTTL)
-				if err := p.deleteWorker(ctx, id); err != nil {
-					p.logger.Error(fmt.Errorf("failed to delete worker %q: %w", id, err))
-				}
-			}
+	// Then filter out workers that have not been seen for more than workerTTL.
+	alive := p.keepAliveMap.Map()
+	var activeIDs []string
+	for _, id := range sortedIDs {
+		a, ok := alive[id]
+		if !ok {
+			// This could happen if a worker is removed from the
+			// pool and the last seen map deletion replicates before
+			// the workers map deletion.
+			continue
 		}
-		if len(activeIDs) == 0 {
-			// We want to wait a bit and retry in case the workers
-			// and/or keep-alive maps has not been replicated yet.
-			p.logger.Info("no active worker in pool, waiting...")
-			wasMissing = true
-			retries++
-			time.Sleep(retryRouteDelay)
-		} else if wasMissing {
-			p.logger.Info("active workers found")
+		nanos, _ := strconv.ParseInt(a, 10, 64)
+		t := time.Unix(0, nanos)
+		horizon := t.Add(p.workerTTL)
+		if horizon.After(time.Now()) {
+			activeIDs = append(activeIDs, id)
+		} else {
+			p.logger.Info("deleting", "worker", id, "last seen", t, "TTL", p.workerTTL)
+			if err := p.deleteWorker(ctx, id); err != nil {
+				p.logger.Error(fmt.Errorf("failed to delete worker %q: %w", id, err))
+			}
 		}
 	}
 	return activeIDs
@@ -618,15 +617,6 @@ func (p *Node) cleanup() error {
 		p.logger.Error(fmt.Errorf("failed to destroy job stream: %w", err))
 	}
 	return nil
-}
-
-// closeMaps stops all replicated maps.
-func (p *Node) closeMaps() {
-	p.shutdownMap.Close()
-	if !p.clientOnly {
-		p.keepAliveMap.Close()
-		p.workerMap.Close()
-	}
 }
 
 // deleteWorker removes a worker from the pool deleting the worker stream.

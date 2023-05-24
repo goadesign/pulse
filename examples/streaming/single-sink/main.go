@@ -47,7 +47,7 @@ func main() {
 	defer sink.Close()
 
 	// Consume event
-	event := <-sink.C
+	event := <-sink.Subscribe()
 	fmt.Printf("event: %s, payload: %s\n", event.EventName, event.Payload)
 
 	// Acknowledge event

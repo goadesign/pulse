@@ -28,8 +28,6 @@ type (
 	Sink struct {
 		// Name is the sink name.
 		Name string
-		// C is the sink event channel.
-		C <-chan *Event
 		// closed is true if Close completed.
 		closed bool
 		// consumer is the sink consumer name.
@@ -52,8 +50,10 @@ type (
 		// maxPolled is the maximum number of events to read in one
 		// XREADGROUP call.
 		maxPolled int64
-		// c is the sink event channel.
-		c chan *Event
+		// bufferSize is the sink channel buffer size.
+		bufferSize int
+		// chans are the sink event channels.
+		chans []chan *Event
 		// donechan is the sink done channel.
 		donechan chan struct{}
 		// streamschan notifies the reader when streams are added or
@@ -89,7 +89,6 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...SinkOptio
 	for _, option := range opts {
 		option(&options)
 	}
-	c := make(chan *Event, options.BufferSize)
 	eventMatcher := options.EventMatcher
 	if eventMatcher == nil {
 		if options.Topic != "" {
@@ -132,7 +131,6 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...SinkOptio
 	}
 	sink := &Sink{
 		Name:                  name,
-		C:                     c,
 		consumer:              consumer,
 		staleLockKeyName:      staleLockName(name),
 		startID:               options.LastEventID,
@@ -141,7 +139,7 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...SinkOptio
 		streamCursors:         []string{stream.key, ">"},
 		blockDuration:         options.BlockDuration,
 		maxPolled:             options.MaxPolled,
-		c:                     c,
+		bufferSize:            options.BufferSize,
 		streamschan:           make(chan struct{}),
 		donechan:              make(chan struct{}),
 		eventMatcher:          eventMatcher,
@@ -156,6 +154,15 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...SinkOptio
 	go sink.read()
 	go sink.manageStaleMessages()
 	return sink, nil
+}
+
+// Subscribe returns a channel that receives events from the sink.
+func (s *Sink) Subscribe() <-chan *Event {
+	c := make(chan *Event, s.bufferSize)
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	s.chans = append(s.chans, c)
+	return c
 }
 
 // Ack acknowledges the event.
@@ -286,7 +293,9 @@ func (s *Sink) read() {
 		s.lock.Lock()
 		s.removeConsumer(ctx, s.consumer)
 		s.lock.Unlock()
-		close(s.c)
+		for _, c := range s.chans {
+			close(c)
+		}
 		s.wait.Done()
 		s.logger.Debug("stopped")
 	}()
@@ -305,7 +314,7 @@ func (s *Sink) read() {
 		s.lock.Lock()
 		for _, events := range streamsEvents {
 			streamName := events.Stream[len(streamKeyPrefix):]
-			streamEvents(streamName, events.Stream, s.Name, events.Messages, s.eventMatcher, s.c, s.rdb, s.logger)
+			streamEvents(streamName, events.Stream, s.Name, events.Messages, s.eventMatcher, s.chans, s.rdb, s.logger)
 		}
 		s.lock.Unlock()
 	}
@@ -416,7 +425,7 @@ func (s *Sink) claim(ctx context.Context, streamName string, args redis.XAutoCla
 	messages, start, err := s.rdb.XAutoClaim(ctx, &args).Result()
 	if len(messages) > 0 {
 		s.logger.Info("claimed", "stale-consumer", args.Consumer, "messages", len(messages))
-		streamEvents(streamName, args.Stream, s.Name, messages, s.eventMatcher, s.c, s.rdb, s.logger)
+		streamEvents(streamName, args.Stream, s.Name, messages, s.eventMatcher, s.chans, s.rdb, s.logger)
 	}
 	return start, err
 }

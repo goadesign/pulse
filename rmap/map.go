@@ -27,6 +27,7 @@ type (
 		hashkey string                // Redis hash key
 		msgch   <-chan *redis.Message // channel to receive map updates
 		chans   []chan struct{}       // channels to send notifications
+		ichan   chan struct{}         // internal channel to send notifications
 		done    chan struct{}         // channel to signal shutdown
 		wait    sync.WaitGroup        // wait for read goroutine to exit
 		logger  ponos.Logger          // logger
@@ -148,6 +149,7 @@ func Join(ctx context.Context, name string, rdb *redis.Client, options ...MapOpt
 		Name:    name,
 		chankey: fmt.Sprintf("map:%s:updates", name),
 		hashkey: fmt.Sprintf("map:%s:content", name),
+		ichan:   make(chan struct{}, 1),
 		done:    make(chan struct{}),
 		logger:  opts.Logger.WithPrefix("map", name),
 		rdb:     rdb,
@@ -262,6 +264,29 @@ func (sm *Map) Set(ctx context.Context, key, value string) (string, error) {
 	return prev.(string), nil
 }
 
+// SetAndWait is a convenience method that calls Set and then waits for the
+// update to be applied and the notification to be sent.
+func (sm *Map) SetAndWait(ctx context.Context, key, value string) (string, error) {
+	prev, err := sm.Set(ctx, key, value)
+	if err != nil {
+		return "", err
+	}
+	// Wait for the update to be applied.
+	for {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case _, ok := <-sm.ichan:
+			if !ok {
+				return "", fmt.Errorf("ponos map: %s is stopped", sm.Name)
+			}
+			if v, ok := sm.content[key]; ok && v == value {
+				return prev, nil
+			}
+		}
+	}
+}
+
 // Inc increments the value for the given key and returns the result, the value
 // must represent an integer. An error is returned if the key is empty, contains
 // an equal sign or if the value does not represent an integer.
@@ -368,6 +393,7 @@ func (sm *Map) Close() {
 	sm.wait.Wait()
 	sm.lock.Lock()
 	defer sm.lock.Unlock()
+	close(sm.ichan)
 	sm.closed = true
 }
 
@@ -405,19 +431,6 @@ func (sm *Map) init(ctx context.Context) error {
 // run updates the local copy of the replicated map whenever a remote update is
 // received and sends notifications when needed.
 func (sm *Map) run() {
-	defer func() {
-		// no need to lock, stopping is true
-		for _, c := range sm.chans {
-			close(c)
-		}
-		if err := sm.sub.Unsubscribe(context.Background(), sm.chankey); err != nil {
-			sm.logger.Error(fmt.Errorf("failed to unsubscribe: %w", err))
-		}
-		if err := sm.sub.Close(); err != nil {
-			sm.logger.Error(fmt.Errorf("failed to close subscription: %w", err))
-		}
-		sm.wait.Done()
-	}()
 	for {
 		select {
 		case msg, ok := <-sm.msgch:
@@ -443,7 +456,11 @@ func (sm *Map) run() {
 				sm.logger.Debug("deleted", "key", key)
 			default:
 				sm.content[key] = val
-				// sm.logger.Debug("set", key, val)
+				sm.logger.Debug("set", key, val)
+			}
+			select {
+			case sm.ichan <- struct{}{}:
+			default:
 			}
 			for _, c := range sm.chans {
 				select {
@@ -455,6 +472,17 @@ func (sm *Map) run() {
 
 		case <-sm.done:
 			sm.logger.Info("stopped")
+			// no need to lock, stopping is true
+			for _, c := range sm.chans {
+				close(c)
+			}
+			if err := sm.sub.Unsubscribe(context.Background(), sm.chankey); err != nil {
+				sm.logger.Error(fmt.Errorf("failed to unsubscribe: %w", err))
+			}
+			if err := sm.sub.Close(); err != nil {
+				sm.logger.Error(fmt.Errorf("failed to close subscription: %w", err))
+			}
+			sm.wait.Done()
 			return
 		}
 	}

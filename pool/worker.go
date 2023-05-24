@@ -80,14 +80,18 @@ func newWorker(ctx context.Context, p *Node, h JobHandler, opts ...WorkerOption)
 	}
 	wid := ulid.Make().String()
 	createdAt := time.Now()
-	if _, err := p.workerMap.Set(ctx, wid, strconv.FormatInt(createdAt.UnixNano(), 10)); err != nil {
+	if _, err := p.workerMap.SetAndWait(ctx, wid, strconv.FormatInt(createdAt.UnixNano(), 10)); err != nil {
 		return nil, fmt.Errorf("failed to add worker %q to pool %q: %w", wid, p.Name, err)
+	}
+	now := strconv.FormatInt(time.Now().UnixNano(), 10)
+	if _, err := p.keepAliveMap.SetAndWait(ctx, wid, now); err != nil {
+		return nil, fmt.Errorf("failed to update worker keep-alive: %w", err)
 	}
 	stream, err := streaming.NewStream(ctx, workerStreamName(wid), p.rdb, streaming.WithStreamLogger(p.logger))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create jobs stream for worker %q: %w", wid, err)
 	}
-	reader, err := stream.NewReader(ctx, streaming.WithReaderBlockDuration(p.workerTTL))
+	reader, err := stream.NewReader(ctx, streaming.WithReaderBlockDuration(p.workerTTL), streaming.WithReaderStartAtOldest())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create reader for worker %q: %w", wid, err)
 	}
@@ -110,7 +114,7 @@ func newWorker(ctx context.Context, p *Node, h JobHandler, opts ...WorkerOption)
 	}
 
 	w.wg.Add(2)
-	go w.handleEvents()
+	go w.handleEvents(reader.Subscribe())
 	go w.keepAlive()
 
 	return w, nil
@@ -133,12 +137,12 @@ func (w *Worker) Jobs() []*Job {
 }
 
 // handleEvents is the worker loop.
-func (w *Worker) handleEvents() {
+func (w *Worker) handleEvents(c <-chan *streaming.Event) {
 	defer w.wg.Done()
 	ctx := context.Background()
 	for {
 		select {
-		case ev, ok := <-w.reader.C:
+		case ev, ok := <-c:
 			if !ok {
 				return
 			}
@@ -294,25 +298,22 @@ func (w *Worker) ackPoolEvent(ctx context.Context, nodeID, eventID string) {
 func (w *Worker) keepAlive() {
 	defer w.wg.Done()
 	ctx := context.Background()
-	update := func() {
-		w.lock.Lock()
-		defer w.lock.Unlock()
-		if w.stopped {
-			// Let's not recreate the map if we just deleted it
-			return
-		}
-		now := strconv.FormatInt(time.Now().UnixNano(), 10)
-		if _, err := w.keepAliveMap.Set(ctx, w.ID, now); err != nil {
-			w.logger.Error(fmt.Errorf("failed to update worker keep-alive: %w", err))
-		}
-	}
-	update()
 	ticker := time.NewTicker(w.workerTTL / 2)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			update()
+			w.lock.Lock()
+			if w.stopped {
+				w.lock.Unlock()
+				// Let's not recreate the map if we just deleted it
+				return
+			}
+			now := strconv.FormatInt(time.Now().UnixNano(), 10)
+			if _, err := w.keepAliveMap.Set(ctx, w.ID, now); err != nil {
+				w.logger.Error(fmt.Errorf("failed to update worker keep-alive: %w", err))
+			}
+			w.lock.Unlock()
 		case <-w.done:
 			return
 		}

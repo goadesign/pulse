@@ -55,13 +55,14 @@ func main() {
 	defer sink.Close()
 
 	// Read both events
-	event := <-sink.C
+	c := sink.Subscribe()
+	event := <-c
 	fmt.Printf("topic: %s, event: %s, payload: %s\n", event.Topic, event.EventName, event.Payload)
 	if err := sink.Ack(ctx, event); err != nil {
 		panic(err)
 	}
 
-	event = <-sink.C
+	event = <-c
 	fmt.Printf("topic: %s, event: %s, payload: %s\n", event.Topic, event.EventName, event.Payload)
 	if err := sink.Ack(ctx, event); err != nil {
 		panic(err)
@@ -82,7 +83,7 @@ func main() {
 	defer reader.Close()
 
 	// Read event from topic "my-topic"
-	event = <-reader.C
+	event = <-reader.Subscribe()
 	fmt.Printf("reader topic pattern: my-*, topic: %s, event: %s, payload: %s\n", event.Topic, event.EventName, event.Payload)
 
 	// Create reader for stream "my-stream" that reads from the beginning,
@@ -102,6 +103,6 @@ func main() {
 	defer reader2.Close()
 
 	// Read event from topic "my-topic"
-	event = <-reader2.C
+	event = <-reader2.Subscribe()
 	fmt.Printf("reader topic filter: my-topic, topic: %s, event: %s, payload: %s\n", event.Topic, event.EventName, event.Payload)
 }
