@@ -1,0 +1,58 @@
+#!/bin/bash
+
+files=(
+  "examples/pool/worker/main.go"
+  "examples/pool/producer/main.go"
+  "examples/rmap/basics/main.go"
+  "examples/rmap/multi-nodes/main.go"
+  "examples/rmap/multi-nodes/main.go"
+  "examples/streaming/single-reader/main.go"
+  "examples/streaming/single-sink/main.go"
+  "examples/streaming/multi-readers/main.go"
+  "examples/streaming/multi-sinks/main.go"
+  "examples/streaming/multi-streams/main.go"
+  "examples/streaming/pub-sub/main.go"
+)
+
+args=(
+  ""
+  ""
+  ""
+  ""
+  "--write"
+)
+
+# Pool worker can take up to 15 seconds to shutdown
+timeout_sec=20
+
+run_example() {
+  local file=$1
+  shift
+  local args=("$@")
+  echo "Running: $file ${args[*]}"
+  output=$(timeout "$timeout_sec" go run -v "$file" "${args[@]}" 2>&1)
+  local exit_status=$?
+  if [[ $exit_status -ne 0 ]]; then
+    echo "Example '${file}' exited with an error or exceeded the timeout:"
+    echo "$output"
+    return 1
+  fi
+  return 0
+}
+
+pids=()
+
+for ((i = 0; i < ${#files[@]}; i++)); do
+  run_example "${files[i]}" ${args[i]} &
+  pids+=($!)
+  sleep 0.5
+done
+
+status=0
+for pid in "${pids[@]}"; do
+  if ! wait "$pid"; then
+    status=1
+  fi
+done
+
+exit "$status"

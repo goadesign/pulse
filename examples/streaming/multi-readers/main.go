@@ -20,8 +20,8 @@ func main() {
 		panic(err)
 	}
 
-	// Create stream "my-stream"
-	stream, err := streaming.NewStream(ctx, "my-stream", rdb)
+	// Create stream
+	stream, err := streaming.NewStream(ctx, "multireaders", rdb)
 	if err != nil {
 		panic(err)
 	}
@@ -42,9 +42,9 @@ func main() {
 	}
 	fmt.Printf("event 2 id: %s\n", id2)
 
-	// Create reader for stream "my-stream" that reads from the beginning and
-	// waits for events for up to 100ms
-	reader, err := stream.NewReader(ctx,
+	// Create reader1 for stream that reads from the beginning and waits for
+	// events for up to 100ms
+	reader1, err := stream.NewReader(ctx,
 		streaming.WithReaderStartAtOldest(),
 		streaming.WithReaderBlockDuration(100*time.Millisecond))
 	if err != nil {
@@ -52,23 +52,22 @@ func main() {
 	}
 
 	// Don't forget to close the reader when done
-	defer reader.Close()
+	defer reader1.Close()
 
 	// Read event
-	event := <-reader.Subscribe()
+	event := <-reader1.Subscribe()
 	fmt.Printf("reader 1, event: %s, payload: %s\n", event.EventName, event.Payload)
 
-	// Create other reader for stream "my-stream" and start reading after
-	// first event
-	otherReader, err := stream.NewReader(ctx,
+	// Create other reader for stream and start reading after first event
+	reader2, err := stream.NewReader(ctx,
 		streaming.WithReaderStartAfter(event.ID),
 		streaming.WithReaderBlockDuration(100*time.Millisecond))
 	if err != nil {
 		panic(err)
 	}
-	defer otherReader.Close()
+	defer reader2.Close()
 
 	// Read second event with other reader
-	event = <-otherReader.Subscribe()
+	event = <-reader2.Subscribe()
 	fmt.Printf("reader 2, event: %s, payload: %s\n", event.EventName, event.Payload)
 }

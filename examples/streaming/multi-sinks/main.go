@@ -21,8 +21,8 @@ func main() {
 		panic(err)
 	}
 
-	// Create stream "my-stream"
-	stream, err := streaming.NewStream(ctx, "my-stream", rdb)
+	// Create stream
+	stream, err := streaming.NewStream(ctx, "multisinks", rdb)
 	if err != nil {
 		panic(err)
 	}
@@ -43,9 +43,9 @@ func main() {
 	}
 	fmt.Printf("event 2 id: %s\n", id2)
 
-	// Create sink for stream "my-stream" that reads from the beginning and
-	// waits for events for up to 100ms
-	sink, err := stream.NewSink(ctx, "my-sink",
+	// Create sink that reads from the beginning and waits for events for up
+	// to 100ms
+	sink1, err := stream.NewSink(ctx, "multisinks-sink1",
 		streaming.WithSinkStartAtOldest(),
 		streaming.WithSinkBlockDuration(100*time.Millisecond))
 	if err != nil {
@@ -53,26 +53,28 @@ func main() {
 	}
 
 	// Don't forget to close the sink when done
-	defer sink.Close()
+	defer sink1.Close()
 
 	// Read and acknowlege event
-	event := <-sink.Subscribe()
+	event := <-sink1.Subscribe()
 	fmt.Printf("sink 1, event: %s, payload: %s\n", event.EventName, event.Payload)
-	if err := sink.Ack(ctx, event); err != nil {
+	if err := sink1.Ack(ctx, event); err != nil {
 		panic(err)
 	}
 
-	// Create sink for stream "my-stream" and start reading after first event
-	otherSink, err := stream.NewSink(ctx, "other", streaming.WithSinkStartAfter(event.ID))
+	// Create sink and start reading after first event
+	sink2, err := stream.NewSink(ctx, "multisinks-sink2",
+		streaming.WithSinkStartAfter(event.ID),
+		streaming.WithSinkBlockDuration(100*time.Millisecond))
 	if err != nil {
 		panic(err)
 	}
-	defer otherSink.Close()
+	defer sink2.Close()
 
 	// Read second event
-	event = <-otherSink.Subscribe()
+	event = <-sink2.Subscribe()
 	fmt.Printf("sink 2, event: %s, payload: %s\n", event.EventName, event.Payload)
-	if otherSink.Ack(ctx, event); err != nil {
+	if sink2.Ack(ctx, event); err != nil {
 		panic(err)
 	}
 }

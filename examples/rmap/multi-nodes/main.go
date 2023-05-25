@@ -25,13 +25,13 @@ func main() {
 		panic(err)
 	}
 
-	// Join replicated map "my-map"
-	m, err := rmap.Join(ctx, "my-map", rdb)
+	// Join replicated map
+	m, err := rmap.Join(ctx, "multinodes", rdb)
 	if err != nil {
 		panic(err)
 	}
 
-	if len(os.Args) > 1 && os.Args[1] == "write" {
+	if len(os.Args) > 1 && os.Args[1] == "--write" {
 		// Reset the map
 		if err := m.Reset(ctx); err != nil {
 			panic(err)
@@ -43,6 +43,9 @@ func main() {
 				panic(err)
 			}
 		}
+
+		// Exit
+		os.Exit(0)
 	}
 
 	// Start a goroutine to listen for updates

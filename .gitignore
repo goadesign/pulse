@@ -1,3 +1,4 @@
 .vscode/
 coverage.out
 examples/pool/worker/worker
+examples/streaming/single-reader/ponos.code-workspace

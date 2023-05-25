@@ -22,10 +22,6 @@ type (
 		jobSinkBlockDuration time.Duration
 		logger               ponos.Logger
 	}
-
-	workerOption struct {
-		jobChannelSize int
-	}
 )
 
 // WithWorkerTTL sets the duration after which the worker is removed from the pool in
@@ -94,19 +90,5 @@ func defaultPoolOptions() *poolOption {
 		maxQueuedJobs:        1000,
 		jobSinkBlockDuration: 5 * time.Second,
 		logger:               ponos.NoopLogger(),
-	}
-}
-
-// WithJobChannelSize sets the size of the job channel. The default is 100.
-func WithJobChannelSize(size int) WorkerOption {
-	return func(o *workerOption) {
-		o.jobChannelSize = size
-	}
-}
-
-// defaultWorkerOptions returns the default options.
-func defaultWorkerOptions() *workerOption {
-	return &workerOption{
-		jobChannelSize: 100,
 	}
 }

@@ -19,9 +19,9 @@ To run the example, follow these steps:
    git clone https://github.com/goadesign/ponos.git
    ```
 
-5. Change into the `examples/rmap/multi-node` directory:
+5. Change into the `examples/rmap/multi-nodes` directory:
    ```
-   cd ponos/examples/rmap/multi-node
+   cd ponos/examples/rmap/multi-nodes
    ```
 
 6. Install the required dependencies by running the following command:
@@ -37,14 +37,15 @@ To run the example, follow these steps:
 8. Run the program without any command-line arguments to listen for updates. Use
    the following command:
    ```
-   ./multi-node
+   ./multi-nodes
    ```
 
    This will start the program, and it will wait for updates on the replicated map.
 
-9. Open another terminal and run the program with the "write" argument. Use the following command:
+9. Open another terminal and run the program with the `--write` argument. Use
+   the following command:
    ```
-   ./multi-node write
+   ./multi-nodes --write
    ```
 
    This will reset the map and write `numitems` key-value pairs to the map.
@@ -79,20 +80,20 @@ if err := rdb.Ping(ctx).Err(); err != nil {
 }
 ```
 
-* The replicated map named "my-map" is joined using the rmap.Join function,
+* The replicated map is joined using the rmap.Join function,
   which takes the Redis client as an argument. This function returns a
   replicated map object (`m`) and an error (if any).
 
 ```go
-m, err := rmap.Join(ctx, "my-map", rdb)
+m, err := rmap.Join(ctx, "multinodes", rdb)
 ```
 
-* If the command-line argument "write" is provided, the code resets the map
+* If the command-line argument `--write` is provided, the code resets the map
   using `m.Reset`. This clears any existing data in the map. Then, a loop is
   used to write numitems key-value pairs to the map using `m.Set`.
 
 ```go
-if len(os.Args) > 1 && os.Args[1] == "write" {
+if len(os.Args) > 1 && os.Args[1] == "--write" {
 	// Reset the map
 	if err := m.Reset(ctx); err != nil {
 		panic(err)

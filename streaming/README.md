@@ -6,9 +6,8 @@ API to create and consume streams, for example:
 
 [![Single Reader](../snippets/single-reader.png)](../examples/streaming/single-reader/main.go)
 
-The code above creates a stream named "my-stream" and adds a new event to it.
-The event is then consumed by a reader. The reader is closed after the event
-is consumed.
+The code above creates a stream and adds a new event to it.  The event is then
+consumed by a reader. The reader is closed after the event is consumed.
 
 ```mermaid
 %%{init: {'themeVariables': { 'background': '#282828', 'mainBkg': '#282828', 'edgeLabelBackground': '#7A7A7A'}}}%%

@@ -20,7 +20,7 @@ func main() {
 	}
 
 	// Create stream
-	stream, err := streaming.NewStream(ctx, "my-stream", rdb)
+	stream, err := streaming.NewStream(ctx, "pubsub-stream", rdb)
 	if err != nil {
 		panic(err)
 	}
@@ -35,16 +35,16 @@ func main() {
 	}
 	fmt.Printf("event 1 id: %s\n", id1)
 
-	// Add a new event to topic "my-other-topic"
+	// Add a new event to topic "other-topic"
 	id2, err := stream.Add(ctx, "event 2", []byte("payload 2"), streaming.WithTopic("other-topic"))
 	if err != nil {
 		panic(err)
 	}
 	fmt.Printf("event 2 id: %s\n", id2)
 
-	// Create sink for stream "my-stream" that reads from the beginning and
-	// waits for events for up to 100ms
-	sink, err := stream.NewSink(ctx, "my-sink",
+	// Create sink that reads from the beginning and waits for events for up
+	// to 100ms
+	sink, err := stream.NewSink(ctx, "pubsub-sink",
 		streaming.WithSinkStartAtOldest(),
 		streaming.WithSinkBlockDuration(100*time.Millisecond))
 	if err != nil {
@@ -68,9 +68,8 @@ func main() {
 		panic(err)
 	}
 
-	// Create reader for stream "my-stream" that reads from the beginning,
-	// waits for events for up to 100ms and only reads events whose topic
-	// match the pattern "my-*"
+	// Create reader that reads from the beginning, waits for events for up
+	// to 100ms and only reads events whose topic match the pattern "my-*"
 	reader, err := stream.NewReader(ctx,
 		streaming.WithReaderStartAtOldest(),
 		streaming.WithReaderBlockDuration(100*time.Millisecond),

@@ -6,9 +6,10 @@ dedicated worker pools.
 
 ## Overview
 
-A *dedicated* worker pool is a collection of workers that process jobs where each
-worker is assigned a range of job keys. Jobs are distributed to workers based on
-the job key and a consistent hashing algorithm.
+A *dedicated* worker pool uses a consistent hashing algorithm to assign long
+running jobs to workers. Each job is associated with a key and each worker with
+a range of hashed values. The pool hashes the job key when the job is dispatched
+to route the job to the proper worker.
 
 Workers can be added or removed from the pool dynamically. Jobs get
 automatically re-assigned to workers when the pool grows or shrinks. This makes
@@ -24,10 +25,10 @@ and worker assignment stability.
 %%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
 flowchart LR
     A[Job Producer]
-    subgraph Pool[Pool Node]
-        Sink
+    subgraph Pool["<span style='margin: 0 10px;'>Routing Pool Node</span>"]
+        Sink["Job Sink"]
     end
-    subgraph Worker[Pool Node]
+    subgraph Worker[Worker Pool Node]
         Reader
         B[Worker]
     end
@@ -49,7 +50,7 @@ flowchart LR
 ## Usage
 
 Ponos dedicated worker pools are generally valuable when workers require
-statefulness, and their state relies on the jobs they perform.
+state which depends on the jobs they perform.
 
 To illustrate, let's consider the scenario of a multitenant system that requires
 managing a collection of background tasks for each tenant. In this case,
@@ -57,107 +58,119 @@ utilizing a Ponos worker pool proves to be highly beneficial. The system can
 create a dedicated worker pool and create one job per tenant, utilizing the
 unique tenant identifier as the job key. This approach ensures that only one
 worker handles the background task for a specific tenant at any given time. As
-new tenants are added or old ones are removed, jobs can be created to start or
-stop the background tasks accordingly. Similarly, workers can be added or
-removed based on performance requirements.
+new tenants are added or old ones are removed, jobs can be started or stopped
+accordingly. Similarly, workers can be added or removed based on performance
+requirements.
 
 Ponos dedicated worker pools are not needed when workers are stateless and can
 be scaled horizontally. In such cases, any standard load balancing solution can
 be used.
 
-## Example
+### Creating A Pool
 
-The following example creates a worker pool named "fibonacci", the job payloads
-consists of a single 64-bit unsigned integer. The worker computes the
-[Fibonacci number](https://en.wikipedia.org/wiki/Fibonacci_number) of the
-payload and prints it to stdout.
+The function `AddNode` is used to create a new pool node. It takes as input a
+name, a Redis client and a set of options.
 
-`worker.go`
+[![Pool AddNode](../snippets/pool-addnode.png)](../examples/pool/worker/main.go#L43-L47)
 
-```go
-package main
+The `AddNode` function returns a new pool node and an error. The pool node
+should be closed when it is no longer needed (see below).
 
-import (
-    "encoding/binary"
+The options are used to configure the pool node. The following options are
+available:
 
-    redis "github.com/redis/go-redis/v9"
-    "goa.design/ponos/pool"
-)
+* `WithLogger` - sets the logger to be used by the pool node.
+* `WithWorkerTTL` - sets the worker time-to-live (TTL) in seconds. The TTL
+  defines the maximum delay between two health-checks before a worker is removed
+  from the pool. The default value is 10 seconds.
+* `WithPendingJobTTL` - sets the pending job time-to-live (TTL) in seconds. The
+  TTL defines the maximum delay between a worker picking up the job and
+  successfully starting it. The default value is 20 seconds.
+* `WithWorkerShutdownTTL` - specifies teh maximum time to wait for a worker to
+  shutdown gracefully. The default value is 2 minutes.
+* `WithMaxQueuedJobs` - sets the maximum number of jobs that can be queued
+  before the pool starts rejecting new jobs. The default value is 1000.
+* `WithClientOnly` - specifies that the pool node should not starts
+  background goroutines to manage the pool and thus not allow creating workers.
+  This option is useful when the pool is used only to dispatch jobs to workers
+  that are created in other nodes.
+* `WithJobSinkBlockDuration` - sets the max poll duration for new jobs. This
+  value is mostly used by tests to accelerate the pool shutdown process. The
+  default value is 5 seconds.
 
-func main() {
-    // Connect to Redis
-    rdb := redis.NewClient(&redis.Options{ Addr: "localhost:6379" })
+### Closing A Node
 
-    // Create node for pool "fibonacci".
-    ctx := context.Background()
-    node, err := pool.AddNode(ctx, "fibonacci", rdb)
-    if err != nil {
-        panic(err)
-    }
+The `Close` method closes the pool node and releases all resources associated
+with it. It should be called when the node is no longer needed.
 
-    // Create a new worker for pool "fibonacci".
-    worker, err := node.AddWorker(ctx)
-    if err != nil {
-        panic(err)
-    }
+[![Pool Close](../snippets/pool-close.png)](../examples/pool/producer/main.go#L31-L36)
 
-    // Handle jobs
-    for job := range worker.C {
-        n := binary.BigEndian.Uint64(job.Payload)
-        fmt.Printf("fib(%d)=%d\n", n, fib(n))
-    }
-}
+### Shutting Down A Pool
 
-func fib(n uint64) uint64 {
-    if n <= 1 {
-        return n
-    }
-    return fib(n-1) + fib(n-2)
-}
-```
+Alternatively, the `Shutdown` method shuts down the entire pool by stopping
+all its workers gracefully. It should be called when the pool is no longer
+needed.
 
-`producer.go`
+[![Pool Shutdown](../snippets/pool-shutdown.png)](../examples/pool/worker/main.go#L59-L61)
 
-```go
-package main
+See the [Data Flows](#data-flows) section below for more details on the
+shutdown process.
 
-import (
-    "encoding/binary"
+### Creating A Worker
 
-    redis "github.com/redis/go-redis/v9"
-    "goa.design/ponos/pool"
-)
+The function `AddWorker` is used to create a new worker. It takes as input a job
+handler object.
 
-func main() {
-    // Connect to Redis
-    rdb := redis.NewClient(&redis.Options{ Addr: "localhost:6379" })
+[![Worker AddWorker](../snippets/worker-addworker.png)](../examples/pool/worker/main.go#L49-L53)
 
-    // Add client-only node
-    ctx := context.Background()
-    node, err := pool.AddNode(ctx, "fibonacci", rdb, pool.WithClientOnly())
-    if err != nil {
-        panic(err)
-    }
+The job handler must implement the `Start` and `Stop` methods used to start and
+stop jobs. The handler may also optionally implement a `HandleNotification`
+method to receive notifications.
 
-    // Queue new job with key "key" and payload 42 
-    payload := make([]byte, 8)
-    binary.BigEndian.PutUint64(payload, 42)
-    if err := node.DispatchJob(ctx, "key", payload); err != nil {
-        panic(err)
-    }
+[![Worker JobHandler](../snippets/worker-jobhandler.png)](worker.go#L59-L72)
 
-    // Gracefully shutdown the pool
-    if err := node.Shutdown(ctx); err != nil {
-        panic(err)
-    }
-}
-```
+The `AddWorker` function returns a new worker and an error. Workers can be
+removed from pool nodes using the `RemoveWorker` method.
+
+[![Worker RemoveWorker](../snippets/worker-removeworker.png)](node.go#L193-L208)
+
+### Dispatching A Job
+
+The `DispatchJob` method is used to dispatch a new job to the pool. It takes as
+input a job key and a job payload.
+
+[![Pool DispatchJob](../snippets/pool-dispatchjob.png)](../examples/pool/producer/main.go#L38-L42)
+
+The job key is used to route the job to the proper worker. The job payload is
+passed to the worker's `Start` method.
+
+The `DispatchJob` method returns an error if the job could not be dispatched.
+This can happen if the pool is full or if the job key is invalid.
+
+### Notifications
+
+Nodes can send notifications to workers using the `NotifyWorker` method. The method
+takes as input a job key and a notification payload.
+
+[![Pool NotifyWorker](../snippets/pool-notifyworker.png)](node.go#L246-247)
+
+The notification payload is passed to the worker's `HandleNotification` method.
+
+### Stopping A Job
+
+The `StopJob` method is used to stop a job. It takes as input a job key.
+
+[![Pool StopJob](../snippets/pool-stopjob.png)](node.go#L249-250)
+
+The `StopJob` method returns an error if the job could not be stopped. This can
+happen if the job key is invalid.
 
 ## Data Flows
 
 The following sections provide additional details on the internal data flows
 involved in creating and using a Ponos worker pool. They are provided for
-informational purposes only and are not required to use the package.
+informational purposes only and are not required reading for simply using the
+package.
 
 ### Adding A New Job
 
@@ -165,49 +178,56 @@ The following diagram illustrates the data flow involved in adding a new job to
 a Ponos worker pool:
 
 * The producer calls `DispatchJob` which adds an event to the pool job stream.
-* The pool job stream is read by the pool sink which creates an entry in the
-   pending jobs map and adds the job to the dedicated worker stream.
-* The dedicated worker stream is read by the worker which adds the job to its
-  channel.
-* The worker user code reads the job from its channel and processes it.
-* The worker marks the job as completed in the pending jobs map.
-* The pool sink gets notified of the completed job, acks the job from the
-  pool job stream and removes it from the pending jobs map.
+* The pool job stream is read by the pool sink running in one of the pool nodes.
+  The routing node records the event so it can ack it later and routes the event
+  to the proper worker stream using a consistent hashing algorithm.
+* The dedicated worker stream is read by the worker which starts the job by
+  calling the `Start` method on the worker job handler. Once `Start` returns
+  successfully the worker sends an event back to the original pool node.
+* Upon getting the event, the pool node acks the job with the
+  pool job stream and removes it from its pending jobs map.
 
 
 ```mermaid
-%%{ init: { 'flowchart': { 'curve': 'monotoneX' } } }%%
+%%{ init: { 'flowchart': { 'curve': 'basis' } } }%%
 %%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
-flowchart LR
-    subgraph p[Producer Process]
-        pr[User code] --1. DispatchJob--> po[Pool]
-        ps
-    end
-    subgraph w[Worker Process]
-        r[Reader] --7. Add Job--> c[[Worker Channel]]
-        c -.Job.-> u[User code]
+flowchart TD
+    subgraph w[Worker Node]
+        r[Reader]
+        u[User code]
     end
     subgraph rdb[Redis]
-        r --8. Mark Job Complete--> pj
-        pj -.9. Notify.-> ps
-        ps --11. Delete Pending Job--> pj
-        po --2. Add Job--> js([Pool Job Stream])
-        ps --10. Ack Job--> js
-        js -.3. Job.-> ps[Pool Sink]
-        ps --4. Set Pending Job--> pj[(Pending Jobs <br/> Replicated Map)]
-        ps --5. Add Job--> ws(["Worker Stream (dedicated)"])
-        ws -.6. Job.-> r
+        js(["Pool Job Stream (shared)"])
+        ws(["Worker Stream (dedicated)"])
+        rs(["Routing Node Stream (dedicated)"])
     end
+    subgraph p[Producer Node]
+        pr[User code]
+        no[Client Node]
+    end
+    subgraph ro[Routing Node]
+        ps[Pool Sink]
+        nr[Routing Node Reader]
+    end
+    pr --1. DispatchJob--> no
+    no --2. Add Job--> js
+    js -.3. Job.-> ps
+    ps --4. Add Job--> ws
+    ws -.5. Job.-> r
+    r --6. Start Job--> u
+    r --7. Add Ack--> rs
+    rs -.7. Ack.-> nr
+    nr --8. Ack Add Job Event--> js
     
     classDef userCode fill:#9A6D1F, stroke:#D9B871, stroke-width:2px, color:#FFF2CC;
     classDef producer fill:#2C5A9A, stroke:#6B96C1, stroke-width:2px, color:#CCE0FF;
-    classDef ponos fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
+    classDef redis fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
     classDef background fill:#7A7A7A, color:#F2F2F2;
 
     class pr,u userCode;
-    class pj,js,ws ponos;
-    class po,ps,r,c producer;
-    class p,w,rdb background; 
+    class pj,js,ws,rs redis;
+    class no,ps,r,c,nr producer;
+    class p,w,rdb,ro background; 
 
     linkStyle 0 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
     linkStyle 1 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
@@ -217,10 +237,6 @@ flowchart LR
     linkStyle 5 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
     linkStyle 6 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
     linkStyle 7 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
-    linkStyle 8 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
-    linkStyle 9 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
-    linkStyle 10 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
-    linkStyle 11 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
 ```
 
 The worker pool uses a job stream so that jobs that do not get acknowledged in time
@@ -234,30 +250,25 @@ ensures that unhealthy workers are properly ignored when requeuing jobs.
 The following diagram illustrates the data flow involved in shutting down a
 Ponos worker pool:
 
-* The producer calls `Shutdown` which sets the shutdown flag in the pool
-  shutdown replicated map.
+* The producer calls `Shutdown` which adds a shutdown event to the pool stream.
+* Upon receving the shutdown event the pool node closes the pool stream to avoid
+  accepting new jobs and sets a flag in the pool shutdown replicated map.
 * The pool nodes get notified and stop accepting new jobs (`DispatchJob`
   returns an error if called).
 * The pool nodes add a stop event to the worker streams for all the workers
   they own.
-* Upon receiving the stop event, the workers remove themselves from the pool
-  workers replicated map and exit.  Note that any job that was enqueued before
-  the stop event still gets processed.
-* Once the workers replicated map is empty, the producer that initiated the
-  shutdown cleans up the pool resources (jobs sink, jobs stream, replicated
-  maps) and the pool nodes exit.
+* Upon receiving the event, the workers remove themselves from the pool
+  workers replicated map, destroy their stream and exit.  Note that any job that
+  was enqueued before the shutdown event still gets processed.
+* Once the workers have stopped, the producer that initiated the
+  shutdown cleans up the pool resources (jobs sink, jobs stream, replicated maps)
+  and the pool nodes exit.
 
 ```mermaid
-%%{ init: { 'flowchart': { 'curve': 'monotoneX' } } }%%
+%%{ init: { 'flowchart': { 'curve': 'basis' } } }%%
 %%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
 
-flowchart LR
-    subgraph rdb[Redis]
-        sr[(Shutdown <br/> Replicated Map)]
-        wr[(Worker </br/> Replicated Map)]
-        ws1(["Worker 1 Stream"])
-        ws2(["Worker 2 Stream"])
-    end
+flowchart TD
     subgraph pn1[Pool Node 1]
         u[User code]
         po1[Pool 1]
@@ -266,6 +277,12 @@ flowchart LR
     subgraph pn2[Pool Node 2]
         po2[Pool 2]
         w2[Worker 2]
+    end
+    subgraph rdb[Redis]
+        sr[(Shutdown <br/> Replicated Map)]
+        wr[(Worker </br/> Replicated Map)]
+        ws1(["Worker 1 Stream"])
+        ws2(["Worker 2 Stream"])
     end
     u[User code] --1. Shutdown--> po1[Pool 1]
     po1 --2. Set Shutdown Flag--> sr[(Shutdown <br/> Replicated Map)]

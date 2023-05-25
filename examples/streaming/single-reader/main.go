@@ -18,8 +18,8 @@ func main() {
 		panic(err)
 	}
 
-	// Create stream "my-stream"
-	stream, err := streaming.NewStream(ctx, "my-stream", rdb)
+	// Create stream
+	stream, err := streaming.NewStream(ctx, "singlereader-stream", rdb)
 	if err != nil {
 		panic(err)
 	}

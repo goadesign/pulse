@@ -28,6 +28,13 @@ func main() {
 		panic(err)
 	}
 
+	// Cleanup node on exit.
+	defer func() {
+		if err := node.Close(ctx); err != nil {
+			panic(err)
+		}
+	}()
+
 	// Start 2 jobs
 	fmt.Println("** Starting job one...")
 	if err := node.DispatchJob(ctx, "one", nil); err != nil {

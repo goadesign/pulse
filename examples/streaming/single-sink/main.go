@@ -19,7 +19,7 @@ func main() {
 	}
 
 	// Create stream
-	stream, err := streaming.NewStream(ctx, "my-stream", rdb)
+	stream, err := streaming.NewStream(ctx, "singlesink-stream", rdb)
 	if err != nil {
 		panic(err)
 	}
@@ -36,7 +36,7 @@ func main() {
 
 	// Create sink that reads from the beginning and waits for events for
 	// up to 100ms
-	sink, err := stream.NewSink(ctx, "my-sink",
+	sink, err := stream.NewSink(ctx, "singlesink-sink",
 		streaming.WithSinkStartAtOldest(),
 		streaming.WithSinkBlockDuration(100*time.Millisecond))
 	if err != nil {

@@ -25,13 +25,23 @@ carbon-now examples/rmap/basics/main.go --start 102 --end 103 --config snippets/
 carbon-now examples/rmap/basics/main.go --start 104 --end 104 --config snippets/carbon-config.json --preset ponos --save-as "snippets/rmap-unsubscribe"
 
 carbon-now examples/streaming/single-reader/main.go --start 21 --end 51 --config snippets/carbon-config.json --preset ponos --save-as "snippets/single-reader"
-carbon-now examples/streaming/multi-reader/main.go  --start 45 --end 73 --config snippets/carbon-config.json --preset ponos --save-as "snippets/multi-reader"
+carbon-now examples/streaming/multi-readers/main.go  --start 45 --end 73 --config snippets/carbon-config.json --preset ponos --save-as "snippets/multi-reader"
 carbon-now examples/streaming/single-sink/main.go   --start 37 --end 56 --config snippets/carbon-config.json --preset ponos --save-as "snippets/single-sink"
-carbon-now examples/streaming/multi-sink/main.go    --start 58 --end 77 --config snippets/carbon-config.json --preset ponos --save-as "snippets/multi-sink"
-carbon-now examples/streaming/multi-stream/main.go  --start 58 --end 62 --config snippets/carbon-config.json --preset ponos --save-as "snippets/multi-stream"
-carbon-now examples/streaming/multi-stream/main.go  --start 85 --end 85 --config snippets/carbon-config.json --preset ponos --save-as "snippets/remove-stream"
+carbon-now examples/streaming/multi-sinks/main.go    --start 58 --end 77 --config snippets/carbon-config.json --preset ponos --save-as "snippets/multi-sink"
+carbon-now examples/streaming/multi-streams/main.go  --start 58 --end 62 --config snippets/carbon-config.json --preset ponos --save-as "snippets/multi-stream"
+carbon-now examples/streaming/multi-streams/main.go  --start 85 --end 85 --config snippets/carbon-config.json --preset ponos --save-as "snippets/remove-stream"
 carbon-now examples/streaming/pub-sub/main.go       --start 31 --end 36 --config snippets/carbon-config.json --preset ponos --save-as "snippets/pub-sub"
 carbon-now examples/streaming/pub-sub/main.go       --start 73 --end 76 --config snippets/carbon-config.json --preset ponos --save-as "snippets/pub-sub-pattern"
 carbon-now examples/streaming/pub-sub/main.go       --start 91 --end 96 --config snippets/carbon-config.json --preset ponos --save-as "snippets/pub-sub-matcher"
+
+carbon-now examples/pool/worker/main.go    --start 43  --end 47  --config snippets/carbon-config.json --preset ponos --save-as "snippets/pool-addnode"
+carbon-now examples/pool/producer/main.go  --start 31  --end 36  --config snippets/carbon-config.json --preset ponos --save-as "snippets/pool-close"
+carbon-now examples/pool/worker/main.go    --start 59  --end 61  --config snippets/carbon-config.json --preset ponos --save-as "snippets/pool-shutdown"
+carbon-now examples/pool/worker/main.go    --start 49  --end 53  --config snippets/carbon-config.json --preset ponos --save-as "snippets/pool-addworker"
+carbon-now pool/worker.go                  --start 59  --end 72  --config snippets/carbon-config.json --preset ponos --save-as "snippets/worker-jobhandler"
+carbon-now pool/node.go                    --start 193 --end 208 --config snippets/carbon-config.json --preset ponos --save-as "snippets/worker-removeworker"
+carbon-now examples/pool/producer/main.go  --start 38  --end 42  --config snippets/carbon-config.json --preset ponos --save-as "snippets/pool-dispatchjob"
+carbon-now pool/node.go                    --start 246 --end 247 --config snippets/carbon-config.json --preset ponos --save-as "snippets/pool-notifyworker"
+carbon-now pool/node.go                    --start 249 --end 250 --config snippets/carbon-config.json --preset ponos --save-as "snippets/pool-stopjob"
 
 popd

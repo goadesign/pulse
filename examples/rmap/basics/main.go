@@ -21,8 +21,8 @@ func main() {
 		panic(err)
 	}
 
-	// Join replicated map "my-map"
-	m, err := rmap.Join(ctx, "my-map", rdb)
+	// Join replicated map
+	m, err := rmap.Join(ctx, "basics", rdb)
 	if err != nil {
 		panic(err)
 	}

@@ -73,11 +73,7 @@ type (
 )
 
 // newWorker creates a new worker.
-func newWorker(ctx context.Context, p *Node, h JobHandler, opts ...WorkerOption) (*Worker, error) {
-	options := defaultWorkerOptions()
-	for _, opt := range opts {
-		opt(options)
-	}
+func newWorker(ctx context.Context, p *Node, h JobHandler) (*Worker, error) {
 	wid := ulid.Make().String()
 	createdAt := time.Now()
 	if _, err := p.workerMap.SetAndWait(ctx, wid, strconv.FormatInt(createdAt.UnixNano(), 10)); err != nil {

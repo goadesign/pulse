@@ -172,7 +172,7 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...PoolOp
 // AddWorker adds a new worker to the pool and returns it. The worker starts
 // processing jobs immediately. handler can optionally implement the
 // NotificationHandler interface to handle notifications.
-func (p *Node) AddWorker(ctx context.Context, handler JobHandler, opts ...WorkerOption) (*Worker, error) {
+func (p *Node) AddWorker(ctx context.Context, handler JobHandler) (*Worker, error) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 	if p.closing || p.shuttingDown {
@@ -181,7 +181,7 @@ func (p *Node) AddWorker(ctx context.Context, handler JobHandler, opts ...Worker
 	if p.clientOnly {
 		return nil, fmt.Errorf("pool %q is client-only", p.Name)
 	}
-	w, err := newWorker(ctx, p, handler, opts...)
+	w, err := newWorker(ctx, p, handler)
 	if err != nil {
 		return nil, err
 	}

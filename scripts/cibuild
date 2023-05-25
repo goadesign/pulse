@@ -7,5 +7,6 @@ pushd ${GIT_ROOT}
 
 ./scripts/setup
 ./scripts/test
+./scripts/run-examples
 
 popd
