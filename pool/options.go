@@ -10,9 +10,6 @@ type (
 	// PoolOption is a worker creation option.
 	PoolOption func(*poolOption)
 
-	// WorkerOption is a worker creation option.
-	WorkerOption func(*workerOption)
-
 	poolOption struct {
 		workerTTL            time.Duration
 		pendingJobTTL        time.Duration
