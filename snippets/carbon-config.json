@@ -1,24 +1,13 @@
 {
   "ponos": {
     "bg": "#ADB7C1",
-    "ds": true,
-    "dsblur": "20px",
-    "dsyoff": "10px",
-    "es": "1x",
-    "fl": 1,
-    "fm": "Inconsolata",
-    "fs": "18px",
-    "lh": "133%",
-    "ln": false,
-    "ph": "15px",
-    "pv": "15px",
-    "si": false,
-    "sl": "*",
+    "es": "2x",
+    "fm": "Fantasque Sans Mono",
     "t": "a11y-dark",
     "type": "png",
     "wa": true,
-    "wc": false,
-    "wm": false,
-    "wt": "none"
+    "ph": "5px",
+    "pv": "5px",
+    "wc": false
   }
 }
