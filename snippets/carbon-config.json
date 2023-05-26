@@ -5,9 +5,10 @@
     "fm": "Fantasque Sans Mono",
     "t": "a11y-dark",
     "type": "png",
-    "wa": true,
+    "wa": false,
     "ph": "5px",
     "pv": "5px",
-    "wc": false
+    "wc": false,
+    "lh": "140%"
   }
 }
