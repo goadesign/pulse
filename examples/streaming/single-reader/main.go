@@ -34,8 +34,8 @@ func main() {
 	}
 	fmt.Printf("event id: %s\n", id)
 
-	// Create reader that reads from the beginning and waits for events for
-	// up to 100ms
+	// Create reader that reads from the beginning and waits for
+	// events for up to 100ms
 	reader, err := stream.NewReader(ctx,
 		streaming.WithReaderStartAtOldest(),
 		streaming.WithReaderBlockDuration(100*time.Millisecond))

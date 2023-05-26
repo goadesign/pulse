@@ -55,7 +55,7 @@ func main() {
 	// Don't forget to close the sink when done
 	defer sink1.Close()
 
-	// Read and acknowlege ev
+	// Read and acknowlege event
 	ev := <-sink1.Subscribe()
 	fmt.Printf("sink 1, event: %s, payload: %s\n", ev.EventName, ev.Payload)
 	if err := sink1.Ack(ctx, ev); err != nil {

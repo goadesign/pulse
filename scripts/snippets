@@ -52,6 +52,6 @@ carbon examples/pool/worker/main.go     43   47  "pool-addnode"
 carbon examples/pool/producer/main.go   31   36  "pool-close"
 carbon examples/pool/worker/main.go     62   64  "pool-shutdown"
 carbon examples/pool/worker/main.go     55   57  "pool-addworker"
-carbon pool/worker.go                   59   72  "worker-jobhandler"
-carbon examples/pool/producer/main.go   38   42  "pool-dispatchjob"
+carbon pool/worker.go                   59   71  "worker-jobhandler"
+carbon examples/pool/producer/main.go   39   42  "pool-dispatchjob"
 popd

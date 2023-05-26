@@ -25,7 +25,7 @@ and worker assignment stability.
 %%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
 flowchart LR
     A[Job Producer]
-    subgraph Pool["<span style='margin: 0 10px;'>Routing Pool Node</span>"]
+    subgraph Pool["<span style='margin: 0 10px;'>Routing Pool Node</span>"]"
         Sink["Job Sink"]
     end
     subgraph Worker[Worker Pool Node]
@@ -86,7 +86,7 @@ available:
 * `WithPendingJobTTL` - sets the pending job time-to-live (TTL) in seconds. The
   TTL defines the maximum delay between a worker picking up the job and
   successfully starting it. The default value is 20 seconds.
-* `WithWorkerShutdownTTL` - specifies teh maximum time to wait for a worker to
+* `WithWorkerShutdownTTL` - specifies the maximum time to wait for a worker to
   shutdown gracefully. The default value is 2 minutes.
 * `WithMaxQueuedJobs` - sets the maximum number of jobs that can be queued
   before the pool starts rejecting new jobs. The default value is 1000.
@@ -105,13 +105,16 @@ with it. It should be called when the node is no longer needed.
 
 [![Pool Close](../snippets/pool-close.png)](../examples/pool/producer/main.go#L31-L36)
 
+Note that closing a pool node does not stop remote workers. It only stops the
+local pool node. Remote workers can be stopped by calling the `Shutdown` method
+described below.
+
 ### Shutting Down A Pool
 
-Alternatively, the `Shutdown` method shuts down the entire pool by stopping
-all its workers gracefully. It should be called when the pool is no longer
-needed.
+The `Shutdown` method shuts down the entire pool by stopping all its workers
+gracefully. It should be called when the pool is no longer needed.
 
-[![Pool Shutdown](../snippets/pool-shutdown.png)](../examples/pool/worker/main.go#L59-L61)
+[![Pool Shutdown](../snippets/pool-shutdown.png)](../examples/pool/worker/main.go#L62-L64)
 
 See the [Data Flows](#data-flows) section below for more details on the
 shutdown process.
@@ -121,13 +124,13 @@ shutdown process.
 The function `AddWorker` is used to create a new worker. It takes as input a job
 handler object.
 
-[![Worker AddWorker](../snippets/worker-addworker.png)](../examples/pool/worker/main.go#L49-L53)
+[![Worker AddWorker](../snippets/pool-addworker.png)](../examples/pool/worker/main.go#L55-L57)
 
 The job handler must implement the `Start` and `Stop` methods used to start and
 stop jobs. The handler may also optionally implement a `HandleNotification`
 method to receive notifications.
 
-[![Worker JobHandler](../snippets/worker-jobhandler.png)](worker.go#L59-L72)
+[![Worker JobHandler](../snippets/worker-jobhandler.png)](worker.go#L59-L71)
 
 The `AddWorker` function returns a new worker and an error. Workers can be
 removed from pool nodes using the `RemoveWorker` method.
@@ -137,7 +140,7 @@ removed from pool nodes using the `RemoveWorker` method.
 The `DispatchJob` method is used to dispatch a new job to the pool. It takes as
 input a job key and a job payload.
 
-[![Pool DispatchJob](../snippets/pool-dispatchjob.png)](../examples/pool/producer/main.go#L38-L42)
+[![Pool DispatchJob](../snippets/pool-dispatchjob.png)](../examples/pool/producer/main.go#L39-L42)
 
 The job key is used to route the job to the proper worker. The job payload is
 passed to the worker's `Start` method.

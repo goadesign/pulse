@@ -58,7 +58,8 @@ func main() {
 	ev := <-reader1.Subscribe()
 	fmt.Printf("reader 1, event: %s, payload: %s\n", ev.EventName, ev.Payload)
 
-	// Create other reader for stream and start reading after first event
+	// Create other reader for stream and start reading after first
+	// event
 	reader2, err := stream.NewReader(ctx,
 		streaming.WithReaderStartAfter(ev.ID),
 		streaming.WithReaderBlockDuration(100*time.Millisecond))
