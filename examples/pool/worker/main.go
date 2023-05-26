@@ -41,7 +41,10 @@ func main() {
 	})
 
 	// Create node for pool "example".
-	node, err := pool.AddNode(ctx, "example", rdb, pool.WithLogger(ponos.ClueLogger(ctx)))
+	node, err := pool.AddNode(ctx,
+		"example",
+		rdb,
+		pool.WithLogger(ponos.ClueLogger(ctx)))
 	if err != nil {
 		panic(err)
 	}

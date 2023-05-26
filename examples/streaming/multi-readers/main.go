@@ -42,8 +42,8 @@ func main() {
 	}
 	fmt.Printf("event 2 id: %s\n", id2)
 
-	// Create reader1 for stream that reads from the beginning and waits for
-	// events for up to 100ms
+	// Create reader1 for stream that reads from the beginning and
+	// waits for events for up to 100ms
 	reader1, err := stream.NewReader(ctx,
 		streaming.WithReaderStartAtOldest(),
 		streaming.WithReaderBlockDuration(100*time.Millisecond))
@@ -55,12 +55,12 @@ func main() {
 	defer reader1.Close()
 
 	// Read event
-	event := <-reader1.Subscribe()
-	fmt.Printf("reader 1, event: %s, payload: %s\n", event.EventName, event.Payload)
+	ev := <-reader1.Subscribe()
+	fmt.Printf("reader 1, event: %s, payload: %s\n", ev.EventName, ev.Payload)
 
 	// Create other reader for stream and start reading after first event
 	reader2, err := stream.NewReader(ctx,
-		streaming.WithReaderStartAfter(event.ID),
+		streaming.WithReaderStartAfter(ev.ID),
 		streaming.WithReaderBlockDuration(100*time.Millisecond))
 	if err != nil {
 		panic(err)
@@ -68,6 +68,6 @@ func main() {
 	defer reader2.Close()
 
 	// Read second event with other reader
-	event = <-reader2.Subscribe()
-	fmt.Printf("reader 2, event: %s, payload: %s\n", event.EventName, event.Payload)
+	ev = <-reader2.Subscribe()
+	fmt.Printf("reader 2, event: %s, payload: %s\n", ev.EventName, ev.Payload)
 }

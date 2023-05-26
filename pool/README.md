@@ -132,8 +132,6 @@ method to receive notifications.
 The `AddWorker` function returns a new worker and an error. Workers can be
 removed from pool nodes using the `RemoveWorker` method.
 
-[![Worker RemoveWorker](../snippets/worker-removeworker.png)](node.go#L193-L208)
-
 ### Dispatching A Job
 
 The `DispatchJob` method is used to dispatch a new job to the pool. It takes as
@@ -150,20 +148,14 @@ This can happen if the pool is full or if the job key is invalid.
 ### Notifications
 
 Nodes can send notifications to workers using the `NotifyWorker` method. The method
-takes as input a job key and a notification payload.
-
-[![Pool NotifyWorker](../snippets/pool-notifyworker.png)](node.go#L246-247)
-
-The notification payload is passed to the worker's `HandleNotification` method.
+takes as input a job key and a notification payload.  The notification payload
+is passed to the worker's `HandleNotification` method.
 
 ### Stopping A Job
 
-The `StopJob` method is used to stop a job. It takes as input a job key.
-
-[![Pool StopJob](../snippets/pool-stopjob.png)](node.go#L249-250)
-
-The `StopJob` method returns an error if the job could not be stopped. This can
-happen if the job key is invalid.
+The `StopJob` method is used to stop a job. It takes a job key as input and
+returns an error if the job could not be stopped. This can happen if the job key
+is invalid, the node is closed or the pool shutdown.
 
 ## Data Flows
 

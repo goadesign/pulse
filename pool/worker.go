@@ -56,7 +56,7 @@ type (
 		Worker *Worker
 	}
 
-	// JobHandler is the interface implemented by types that handle jobs.
+	// JobHandler starts and stops jobs.
 	JobHandler interface {
 		// Start starts a job.
 		Start(ctx context.Context, job *Job) error
@@ -64,8 +64,7 @@ type (
 		Stop(ctx context.Context, key string) error
 	}
 
-	// NotificationHandler is the interface implemented by types that handle
-	// notifications.
+	// NotificationHandler handle job notifications.
 	NotificationHandler interface {
 		// HandleNotification handles a notification.
 		HandleNotification(ctx context.Context, key string, payload []byte) error

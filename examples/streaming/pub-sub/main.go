@@ -29,7 +29,10 @@ func main() {
 	defer stream.Destroy(ctx)
 
 	// Add a new event to topic "my-topic"
-	id1, err := stream.Add(ctx, "event 1", []byte("payload 1"), streaming.WithTopic("my-topic"))
+	id1, err := stream.Add(ctx,
+		"event 1",
+		[]byte("payload 1"),
+		streaming.WithTopic("my-topic"))
 	if err != nil {
 		panic(err)
 	}

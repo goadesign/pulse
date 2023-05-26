@@ -19,7 +19,7 @@ func main() {
 	}
 
 	// Create stream
-	stream, err := streaming.NewStream(ctx, "singlereader-stream", rdb)
+	stream, err := streaming.NewStream(ctx, "sr-stream", rdb)
 	if err != nil {
 		panic(err)
 	}
@@ -47,6 +47,6 @@ func main() {
 	defer reader.Close()
 
 	// Consume event
-	event := <-reader.Subscribe()
-	fmt.Printf("event: %s, payload: %s\n", event.EventName, event.Payload)
+	ev := <-reader.Subscribe()
+	fmt.Printf("event: %s, payload: %s\n", ev.EventName, ev.Payload)
 }

@@ -55,16 +55,16 @@ func main() {
 	// Don't forget to close the sink when done
 	defer sink1.Close()
 
-	// Read and acknowlege event
-	event := <-sink1.Subscribe()
-	fmt.Printf("sink 1, event: %s, payload: %s\n", event.EventName, event.Payload)
-	if err := sink1.Ack(ctx, event); err != nil {
+	// Read and acknowlege ev
+	ev := <-sink1.Subscribe()
+	fmt.Printf("sink 1, event: %s, payload: %s\n", ev.EventName, ev.Payload)
+	if err := sink1.Ack(ctx, ev); err != nil {
 		panic(err)
 	}
 
 	// Create sink and start reading after first event
 	sink2, err := stream.NewSink(ctx, "multisinks-sink2",
-		streaming.WithSinkStartAfter(event.ID),
+		streaming.WithSinkStartAfter(ev.ID),
 		streaming.WithSinkBlockDuration(100*time.Millisecond))
 	if err != nil {
 		panic(err)
@@ -72,9 +72,9 @@ func main() {
 	defer sink2.Close()
 
 	// Read second event
-	event = <-sink2.Subscribe()
-	fmt.Printf("sink 2, event: %s, payload: %s\n", event.EventName, event.Payload)
-	if sink2.Ack(ctx, event); err != nil {
+	ev = <-sink2.Subscribe()
+	fmt.Printf("sink 2, event: %s, payload: %s\n", ev.EventName, ev.Payload)
+	if sink2.Ack(ctx, ev); err != nil {
 		panic(err)
 	}
 }

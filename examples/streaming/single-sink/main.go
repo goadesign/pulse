@@ -34,8 +34,8 @@ func main() {
 	}
 	fmt.Printf("event id: %s\n", id)
 
-	// Create sink that reads from the beginning and waits for events for
-	// up to 100ms
+	// Create sink that reads from the beginning and waits for events
+	// for up to 100ms
 	sink, err := stream.NewSink(ctx, "singlesink-sink",
 		streaming.WithSinkStartAtOldest(),
 		streaming.WithSinkBlockDuration(100*time.Millisecond))
@@ -47,11 +47,11 @@ func main() {
 	defer sink.Close()
 
 	// Consume event
-	event := <-sink.Subscribe()
-	fmt.Printf("event: %s, payload: %s\n", event.EventName, event.Payload)
+	ev := <-sink.Subscribe()
+	fmt.Printf("event: %s, payload: %s\n", ev.EventName, ev.Payload)
 
 	// Acknowledge event
-	if err := sink.Ack(ctx, event); err != nil {
+	if err := sink.Ack(ctx, ev); err != nil {
 		panic(err)
 	}
 }
