@@ -25,7 +25,7 @@ and worker assignment stability.
 %%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
 flowchart LR
     A[Job Producer]
-    subgraph Pool["<span style='margin: 0 10px;'>Routing Pool Node</span>"]"
+    subgraph Pool["<span style='margin: 0 10px;'>Routing Pool Node</span>"]
         Sink["Job Sink"]
     end
     subgraph Worker[Worker Pool Node]
