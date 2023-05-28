@@ -166,3 +166,46 @@ func unmarshalEnvelope(data []byte) (string, []byte) {
 	}
 	return string(senderBytes), payload
 }
+
+// marshalAck marshals an ack into a byte slice.
+func marshalAck(ak *ack) []byte {
+	var buf bytes.Buffer
+	if err := binary.Write(&buf, binary.LittleEndian, int32(len(ak.EventID))); err != nil {
+		panic(err)
+	}
+	if err := binary.Write(&buf, binary.LittleEndian, []byte(ak.EventID)); err != nil {
+		panic(err)
+	}
+	if err := binary.Write(&buf, binary.LittleEndian, int32(len(ak.Error))); err != nil {
+		panic(err)
+	}
+	if err := binary.Write(&buf, binary.LittleEndian, []byte(ak.Error)); err != nil {
+		panic(err)
+	}
+	return buf.Bytes()
+}
+
+// unmarshalAck unmarshals an ack from a byte slice created by marshalAck.
+func unmarshalAck(data []byte) *ack {
+	reader := bytes.NewReader(data)
+	var eventIDLength int32
+	if err := binary.Read(reader, binary.LittleEndian, &eventIDLength); err != nil {
+		panic(err)
+	}
+	eventIDBytes := make([]byte, eventIDLength)
+	if err := binary.Read(reader, binary.LittleEndian, &eventIDBytes); err != nil {
+		panic(err)
+	}
+	var errorLength int32
+	if err := binary.Read(reader, binary.LittleEndian, &errorLength); err != nil {
+		panic(err)
+	}
+	errorBytes := make([]byte, errorLength)
+	if err := binary.Read(reader, binary.LittleEndian, &errorBytes); err != nil {
+		panic(err)
+	}
+	return &ack{
+		EventID: string(eventIDBytes),
+		Error:   string(errorBytes),
+	}
+}

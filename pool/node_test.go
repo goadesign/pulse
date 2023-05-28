@@ -116,9 +116,9 @@ func newTestNode(t *testing.T, ctx context.Context, rdb *redis.Client, name stri
 func newTestWorker(t *testing.T, ctx context.Context, node *Node) *Worker {
 	t.Helper()
 	wm := &workerMock{jobs: make(map[string]*Job)}
-	wm.startFunc = func(ctx context.Context, job *Job) error { wm.jobs[job.Key] = job; return nil }
-	wm.stopFunc = func(ctx context.Context, key string) error { delete(wm.jobs, key); return nil }
-	wm.notifyFunc = func(ctx context.Context, payload []byte) error { return nil }
+	wm.startFunc = func(_ context.Context, job *Job) error { wm.jobs[job.Key] = job; return nil }
+	wm.stopFunc = func(_ context.Context, key string) error { delete(wm.jobs, key); return nil }
+	wm.notifyFunc = func(_ context.Context, payload []byte) error { return nil }
 	worker, err := node.AddWorker(ctx, wm)
 	require.NoError(t, err)
 	return worker

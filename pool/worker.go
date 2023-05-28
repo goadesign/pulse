@@ -69,6 +69,14 @@ type (
 		// HandleNotification handles a notification.
 		HandleNotification(ctx context.Context, key string, payload []byte) error
 	}
+
+	// ack is a worker event acknowledgement.
+	ack struct {
+		// EventID is the ID of the event being acknowledged.
+		EventID string
+		// Error is the error that occurred while handling the event if any.
+		Error string
+	}
 )
 
 // newWorker creates a new worker.
@@ -82,7 +90,7 @@ func newWorker(ctx context.Context, p *Node, h JobHandler) (*Worker, error) {
 	if _, err := p.keepAliveMap.SetAndWait(ctx, wid, now); err != nil {
 		return nil, fmt.Errorf("failed to update worker keep-alive: %w", err)
 	}
-	stream, err := streaming.NewStream(ctx, workerStreamName(wid), p.rdb, streaming.WithStreamLogger(p.logger))
+	stream, err := streaming.NewStream(workerStreamName(wid), p.rdb, streaming.WithStreamLogger(p.logger))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create jobs stream for worker %q: %w", wid, err)
 	}
@@ -162,10 +170,10 @@ func (w *Worker) handleEvents(c <-chan *streaming.Event) {
 					w.logger.Info("requeue", ev.EventName, "after", w.pendingJobTTL, "error", err)
 					continue
 				}
-				w.ackPoolEvent(ctx, nodeID, ev.ID)
+				w.ackPoolEvent(ctx, nodeID, ev.ID, err)
 				w.logger.Error(fmt.Errorf("%s handler failed: %w", ev.EventName, err), "event-id", ev.ID)
 			}
-			w.ackPoolEvent(ctx, nodeID, ev.ID)
+			w.ackPoolEvent(ctx, nodeID, ev.ID, nil)
 			w.logger.Info("handled "+ev.EventName, "worker", w.ID)
 		case <-w.done:
 			return
@@ -273,18 +281,19 @@ func (w *Worker) notify(ctx context.Context, key string, payload []byte) error {
 
 // ackPoolEvent acknowledges the pool event that originated from the node with
 // the given ID.
-func (w *Worker) ackPoolEvent(ctx context.Context, nodeID, eventID string) {
+func (w *Worker) ackPoolEvent(ctx context.Context, nodeID, eventID string, ackerr error) {
 	stream, ok := w.nodeStreams[nodeID]
 	if !ok {
 		var err error
-		stream, err = streaming.NewStream(ctx, nodeStreamName(w.Node.Name, nodeID), w.Node.rdb, streaming.WithStreamLogger(w.logger))
+		stream, err = streaming.NewStream(nodeStreamName(w.Node.Name, nodeID), w.Node.rdb, streaming.WithStreamLogger(w.logger))
 		if err != nil {
 			w.logger.Error(fmt.Errorf("failed to create stream for node %q: %w", nodeID, err))
 			return
 		}
 		w.nodeStreams[nodeID] = stream
 	}
-	if _, err := stream.Add(ctx, evAck, marshalEnvelope(w.ID, []byte(eventID))); err != nil {
+	ack := &ack{EventID: eventID, Error: ackerr.Error()}
+	if _, err := stream.Add(ctx, evAck, marshalEnvelope(w.ID, marshalAck(ack))); err != nil {
 		w.logger.Error(fmt.Errorf("failed to ack event %q from node %q: %w", eventID, nodeID, err))
 	}
 }
