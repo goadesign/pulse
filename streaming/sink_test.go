@@ -27,7 +27,7 @@ func TestNewSink(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	defer cleanup(t, rdb, testName)
 	ctx := testContext(t)
-	s, err := NewStream(ctx, testName, rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(testName, rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	sink, err := s.NewSink(ctx, "sink")
 	assert.NoError(t, err)
@@ -40,7 +40,7 @@ func TestReadOnce(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	defer cleanup(t, rdb, testName)
 	ctx := testContext(t)
-	s, err := NewStream(ctx, testName, rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(testName, rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	sink, err := s.NewSink(ctx, "sink",
 		WithSinkStartAtOldest(),
@@ -61,7 +61,7 @@ func TestReadSinceLastEvent(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	defer cleanup(t, rdb, testName)
 	ctx := testContext(t)
-	s, err := NewStream(ctx, testName, rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(testName, rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 
 	// Add and read 2 events consecutively
@@ -115,7 +115,7 @@ func TestCleanup(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	defer cleanup(t, rdb, testName)
 	ctx := testContext(t)
-	s, err := NewStream(ctx, testName, rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(testName, rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	sink, err := s.NewSink(ctx, "sink",
 		WithSinkStartAtOldest(),
@@ -143,13 +143,13 @@ func TestAddStream(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	defer cleanup(t, rdb, testName)
 	ctx := testContext(t)
-	s, err := NewStream(ctx, testName, rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(testName, rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	sink, err := s.NewSink(ctx, "sink",
 		WithSinkStartAtOldest(),
 		WithSinkBlockDuration(testBlockDuration))
 	require.NoError(t, err)
-	s2, err := NewStream(ctx, testName+"2", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
+	s2, err := NewStream(testName+"2", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	assert.NoError(t, sink.AddStream(ctx, s2))
 	assert.NoError(t, sink.AddStream(ctx, s2)) // Make sure it's idempotent
@@ -177,13 +177,13 @@ func TestRemoveStream(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	defer cleanup(t, rdb, testName)
 	ctx := testContext(t)
-	s, err := NewStream(ctx, testName, rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(testName, rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	sink, err := s.NewSink(ctx, "sink",
 		WithSinkStartAtOldest(),
 		WithSinkBlockDuration(testBlockDuration))
 	require.NoError(t, err)
-	s2, err := NewStream(ctx, "testRemoveStream2", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
+	s2, err := NewStream("testRemoveStream2", rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	err = sink.AddStream(ctx, s2)
 	assert.NoError(t, err)
@@ -229,7 +229,7 @@ func TestMultipleConsumers(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	defer cleanup(t, rdb, testName)
 	ctx := testContext(t)
-	s, err := NewStream(ctx, testName, rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(testName, rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	sink, err := s.NewSink(ctx, "sink",
 		WithSinkStartAtOldest(),
@@ -286,7 +286,7 @@ func TestClaimStaleMessages(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	defer cleanup(t, rdb, testName)
 	ctx := testContext(t)
-	s, err := NewStream(ctx, testName, rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(testName, rdb, WithStreamLogger(ponos.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	sink, err := s.NewSink(ctx, "sink",
 		WithSinkStartAtOldest(),

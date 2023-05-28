@@ -21,14 +21,14 @@ func TestDestroy(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	ctx := testContext(t)
 
-	s, err := NewStream(ctx, "testDestroy", rdb)
+	s, err := NewStream("testDestroy", rdb)
 	assert.NoError(t, err)
 	assert.NoError(t, s.Destroy(ctx))
 	exists, err := rdb.Exists(ctx, s.key).Result()
 	assert.NoError(t, err)
 	assert.Equal(t, int64(0), exists)
 
-	s2, err := NewStream(ctx, "testDestroy2", rdb)
+	s2, err := NewStream("testDestroy2", rdb)
 	assert.NoError(t, err)
 	_, err = s2.Add(ctx, "foo", []byte("bar"))
 	assert.NoError(t, err)
@@ -40,7 +40,7 @@ func TestDestroy(t *testing.T) {
 
 func TestOptions(t *testing.T) {
 	ctx := testContext(t)
-	s, err := NewStream(ctx, "testOptions", nil, WithStreamMaxLen(10), WithStreamLogger(nil))
+	s, err := NewStream("testOptions", nil, WithStreamMaxLen(10), WithStreamLogger(nil))
 	assert.NoError(t, err)
 	assert.Equal(t, 10, s.MaxLen)
 	assert.Equal(t, ponos.NoopLogger(), s.logger)
@@ -49,7 +49,7 @@ func TestOptions(t *testing.T) {
 func TestAdd(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	ctx := testContext(t)
-	s, err := NewStream(ctx, "testAdd", rdb)
+	s, err := NewStream("testAdd", rdb)
 	assert.NoError(t, err)
 
 	_, err = s.Add(ctx, "foo", []byte("bar"))
@@ -68,7 +68,7 @@ func TestAdd(t *testing.T) {
 func TestRemove(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	ctx := testContext(t)
-	s, err := NewStream(ctx, "testRemove", rdb)
+	s, err := NewStream("testRemove", rdb)
 	assert.NoError(t, err)
 
 	_, err = s.Add(ctx, "foo", []byte("bar"))
@@ -94,7 +94,7 @@ func TestRemove(t *testing.T) {
 func TestTopic(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	ctx := testContext(t)
-	s, err := NewStream(ctx, "testTopic", rdb)
+	s, err := NewStream("testTopic", rdb)
 	assert.NoError(t, err)
 
 	_, err = s.Add(ctx, "bar", []byte("baz"), WithTopic("foo"))

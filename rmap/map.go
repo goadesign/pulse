@@ -488,7 +488,8 @@ func (sm *Map) run() {
 	}
 }
 
-// runLuaScript runs the given Lua script, the furst argument must be the key.
+// runLuaScript runs the given Lua script, the first argument must be the key.
+// It is the caller's responsibility to make sure the map is locked.
 func (sm *Map) runLuaScript(ctx context.Context, name string, script *redis.Script, args ...any) (any, error) {
 	key := args[0].(string)
 	if len(key) == 0 {

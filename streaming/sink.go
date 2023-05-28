@@ -165,6 +165,19 @@ func (s *Sink) Subscribe() <-chan *Event {
 	return c
 }
 
+// Unsubscribe removes the channel from the sink and closes it.
+func (s *Sink) Unsubscribe(c <-chan *Event) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	for i, ch := range s.chans {
+		if ch == c {
+			close(ch)
+			s.chans = append(s.chans[:i], s.chans[i+1:]...)
+			return
+		}
+	}
+}
+
 // Ack acknowledges the event.
 func (s *Sink) Ack(ctx context.Context, e *Event) error {
 	err := e.rdb.XAck(ctx, e.streamKey, e.SinkName, e.ID).Err()

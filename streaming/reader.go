@@ -80,7 +80,7 @@ type (
 )
 
 // newReader creates a new reader.
-func newReader(ctx context.Context, stream *Stream, opts ...ReaderOption) (*Reader, error) {
+func newReader(stream *Stream, opts ...ReaderOption) (*Reader, error) {
 	options := defaultReaderOptions()
 	for _, option := range opts {
 		option(&options)
@@ -117,13 +117,26 @@ func newReader(ctx context.Context, stream *Stream, opts ...ReaderOption) (*Read
 }
 
 // Subscribe returns a channel that receives events from the stream.
-// The channel is closed when the reader is stopped.
+// The channel is closed when the reader is closed.
 func (r *Reader) Subscribe() <-chan *Event {
 	c := make(chan *Event, r.bufferSize)
 	r.lock.Lock()
 	defer r.lock.Unlock()
 	r.chans = append(r.chans, c)
 	return c
+}
+
+// Unsubscribe removes the channel from the reader subscribers and closes it.
+func (r *Reader) Unsubscribe(c <-chan *Event) {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	for i, ch := range r.chans {
+		if ch == c {
+			close(ch)
+			r.chans = append(r.chans[:i], r.chans[i+1:]...)
+			return
+		}
+	}
 }
 
 // AddStream adds the stream to the sink. By default the stream cursor starts at
