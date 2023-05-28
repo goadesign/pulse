@@ -39,7 +39,6 @@ func TestDestroy(t *testing.T) {
 }
 
 func TestOptions(t *testing.T) {
-	ctx := testContext(t)
 	s, err := NewStream("testOptions", nil, WithStreamMaxLen(10), WithStreamLogger(nil))
 	assert.NoError(t, err)
 	assert.Equal(t, 10, s.MaxLen)
