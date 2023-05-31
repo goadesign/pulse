@@ -126,4 +126,4 @@ behavior to [ponos@goa.design](mailto:ponos@goa.design).
 
 ## Credits
 
-Ponos was originally created by [Raphael Simon](@raphael).
+Ponos was originally created by [Raphael Simon](https://github.com/raphael).
