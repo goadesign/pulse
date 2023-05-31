@@ -8,6 +8,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"goa.design/ponos/streaming"
+	"goa.design/ponos/streaming/options"
 )
 
 // Note: the example below does not handle errors for brevity.
@@ -22,7 +23,7 @@ func main() {
 	}
 
 	// Create stream
-	stream1, err := streaming.NewStream(ctx, "multistreams-stream1", rdb)
+	stream1, err := streaming.NewStream("multistreams-stream1", rdb)
 	if err != nil {
 		panic(err)
 	}
@@ -32,8 +33,8 @@ func main() {
 
 	// Create sink
 	sink, err := stream1.NewSink(ctx, "multistreams-sink",
-		streaming.WithSinkStartAtOldest(),
-		streaming.WithSinkBlockDuration(100*time.Millisecond))
+		options.WithSinkStartAtOldest(),
+		options.WithSinkBlockDuration(100*time.Millisecond))
 	if err != nil {
 		panic(err)
 	}
@@ -52,7 +53,7 @@ func main() {
 	fmt.Printf("event 1 id: %s\n", id1)
 
 	// Create second stream
-	stream2, err := streaming.NewStream(ctx, "multistreams-stream2", rdb)
+	stream2, err := streaming.NewStream("multistreams-stream2", rdb)
 	if err != nil {
 		panic(err)
 	}

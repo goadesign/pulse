@@ -20,6 +20,16 @@ func WithLogger(logger ponos.Logger) MapOption {
 	}
 }
 
+// parseOptions parses the given options and returns the corresponding
+// options.
+func parseOptions(opts ...MapOption) *options {
+	o := defaultOptions()
+	for _, opt := range opts {
+		opt(o)
+	}
+	return o
+}
+
 // defaultOptions returns the default options.
 func defaultOptions() *options {
 	return &options{

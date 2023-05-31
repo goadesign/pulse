@@ -1,0 +1,48 @@
+version: "2"
+services:
+  agent:
+    image: grafana/agent:latest
+    volumes:
+      - ./agent/config:/etc/agent-config
+      - /var/log:/var/log
+    entrypoint:
+      - /bin/grafana-agent
+      - -config.file=/etc/agent-config/agent.yaml
+      - -prometheus.wal-directory=/tmp/agent/wal
+    ports:
+      - "12345:12345"
+    depends_on:
+      - tempo
+    extra_hosts:
+      - "host.docker.internal:${HOST_GATEWAY}"
+
+  loki:
+    image: grafana/loki:latest
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+
+  # tracing backend
+  tempo:
+    image: grafana/tempo:latest
+    volumes:
+      - /tmp/tempo:/tmp/tempo
+      - ./tempo/config:/etc/tempo-config
+    command:
+      - "-config.file=/etc/tempo-config/tempo.yaml"
+    ports:
+      - "4317:4317"
+
+  grafana:
+    image: grafana/grafana:latest
+    entrypoint:
+      - /usr/share/grafana/bin/grafana-server
+      - --homepath=/usr/share/grafana
+      - --config=/etc/grafana-config/grafana.ini
+    volumes:
+      - ./grafana/config:/etc/grafana-config
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources
+      - ./grafana/dashboards-provisioning:/etc/grafana/provisioning/dashboards
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    ports:
+      - "3000:3000"

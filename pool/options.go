@@ -7,10 +7,10 @@ import (
 )
 
 type (
-	// PoolOption is a worker creation option.
-	PoolOption func(*poolOption)
+	// NodeOption is a worker creation option.
+	NodeOption func(*nodeOptions)
 
-	poolOption struct {
+	nodeOptions struct {
 		workerTTL            time.Duration
 		pendingJobTTL        time.Duration
 		workerShutdownTTL    time.Duration
@@ -24,32 +24,32 @@ type (
 // WithWorkerTTL sets the duration after which the worker is removed from the pool in
 // case of network partitioning.  The default is 10s. A lower number causes more
 // frequent keep-alive updates from all workers.
-func WithWorkerTTL(ttl time.Duration) PoolOption {
-	return func(o *poolOption) {
+func WithWorkerTTL(ttl time.Duration) NodeOption {
+	return func(o *nodeOptions) {
 		o.workerTTL = ttl
 	}
 }
 
 // WithPendingJobTTL sets the duration after which a job is made available to
 // other workers if it wasn't started. The default is 20s.
-func WithPendingJobTTL(ttl time.Duration) PoolOption {
-	return func(o *poolOption) {
+func WithPendingJobTTL(ttl time.Duration) NodeOption {
+	return func(o *nodeOptions) {
 		o.pendingJobTTL = ttl
 	}
 }
 
 // WithWorkerShutdownTTL sets the maximum time to wait for workers to
 // shutdown.  The default is 2 minutes.
-func WithWorkerShutdownTTL(ttl time.Duration) PoolOption {
-	return func(o *poolOption) {
+func WithWorkerShutdownTTL(ttl time.Duration) NodeOption {
+	return func(o *nodeOptions) {
 		o.workerShutdownTTL = ttl
 	}
 }
 
 // WithMaxQueuedJobs sets the maximum number of jobs that can be queued in the pool.
 // The default is 1000.
-func WithMaxQueuedJobs(max int) PoolOption {
-	return func(o *poolOption) {
+func WithMaxQueuedJobs(max int) NodeOption {
+	return func(o *nodeOptions) {
 		o.maxQueuedJobs = max
 	}
 }
@@ -57,30 +57,40 @@ func WithMaxQueuedJobs(max int) PoolOption {
 // WithClientOnly sets the pool to be client only. A client-only pool only
 // supports dispatching jobs to workers and does not start background goroutines
 // to route jobs.
-func WithClientOnly() PoolOption {
-	return func(o *poolOption) {
+func WithClientOnly() NodeOption {
+	return func(o *nodeOptions) {
 		o.clientOnly = true
 	}
 }
 
 // WithJobSinkBlockDuration sets the duration to block when reading from the
 // job stream. The default is 5s. This option is mostly useful for testing.
-func WithJobSinkBlockDuration(d time.Duration) PoolOption {
-	return func(o *poolOption) {
+func WithJobSinkBlockDuration(d time.Duration) NodeOption {
+	return func(o *nodeOptions) {
 		o.jobSinkBlockDuration = d
 	}
 }
 
 // WithLogger sets the handler used to report temporary errors.
-func WithLogger(logger ponos.Logger) PoolOption {
-	return func(o *poolOption) {
+func WithLogger(logger ponos.Logger) NodeOption {
+	return func(o *nodeOptions) {
 		o.logger = logger
 	}
 }
 
+// parseOptions parses the given options and returns the corresponding
+// options.
+func parseOptions(opts ...NodeOption) *nodeOptions {
+	o := defaultPoolOptions()
+	for _, opt := range opts {
+		opt(o)
+	}
+	return o
+}
+
 // defaultPoolOptions returns the default options.
-func defaultPoolOptions() *poolOption {
-	return &poolOption{
+func defaultPoolOptions() *nodeOptions {
+	return &nodeOptions{
 		workerTTL:            10 * time.Second,
 		pendingJobTTL:        20 * time.Second,
 		workerShutdownTTL:    2 * time.Minute,

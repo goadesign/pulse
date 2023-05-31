@@ -14,6 +14,7 @@ import (
 
 	"goa.design/ponos/ponos"
 	"goa.design/ponos/rmap"
+	"goa.design/ponos/streaming/options"
 )
 
 var (
@@ -63,8 +64,8 @@ type (
 		wait sync.WaitGroup
 		// closing is true if Close was called.
 		closing bool
-		// eventMatcher is the event matcher if any.
-		eventMatcher EventMatcherFunc
+		// eventFilter is the event filter if any.
+		eventFilter eventFilterFunc
 		// consumersMap are the replicated maps used to track sink
 		// consumers.  Each map key is the sink name and the value is a list
 		// of consumer names.  consumersMap is indexed by stream name.
@@ -81,22 +82,20 @@ type (
 		// rdb is the redis connection.
 		rdb *redis.Client
 	}
+
+	// eventFilterFunc is the function used to filter events.
+	eventFilterFunc func(*Event) bool
 )
 
 // newSink creates a new sink.
-func newSink(ctx context.Context, name string, stream *Stream, opts ...SinkOption) (*Sink, error) {
-	options := defaultSinkOptions()
-	for _, option := range opts {
-		option(&options)
-	}
-	eventMatcher := options.EventMatcher
-	if eventMatcher == nil {
-		if options.Topic != "" {
-			eventMatcher = func(e *Event) bool { return e.Topic == options.Topic }
-		} else if options.TopicPattern != "" {
-			topicPatternRegexp := regexp.MustCompile(options.TopicPattern)
-			eventMatcher = func(e *Event) bool { return topicPatternRegexp.MatchString(e.Topic) }
-		}
+func newSink(ctx context.Context, name string, stream *Stream, opts ...options.Sink) (*Sink, error) {
+	o := options.ParseSinkOptions(opts...)
+	var eventMatcher eventFilterFunc
+	if o.Topic != "" {
+		eventMatcher = func(e *Event) bool { return e.Topic == o.Topic }
+	} else if o.TopicPattern != "" {
+		topicPatternRegexp := regexp.MustCompile(o.TopicPattern)
+		eventMatcher = func(e *Event) bool { return topicPatternRegexp.MatchString(e.Topic) }
 	}
 
 	// Record consumer so we can destroy the sink when no longer needed.
@@ -121,7 +120,7 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...SinkOptio
 	}
 
 	// Create the consumer group, ignore error if it already exists.
-	if err := stream.rdb.XGroupCreateMkStream(ctx, stream.key, name, options.LastEventID).Err(); err != nil && !isBusyGroupErr(err) {
+	if err := stream.rdb.XGroupCreateMkStream(ctx, stream.key, name, o.LastEventID).Err(); err != nil && !isBusyGroupErr(err) {
 		return nil, fmt.Errorf("failed to create Redis consumer group %s for stream %s: %w", name, stream.Name, err)
 	}
 
@@ -133,19 +132,19 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...SinkOptio
 		Name:                  name,
 		consumer:              consumer,
 		staleLockKeyName:      staleLockName(name),
-		startID:               options.LastEventID,
-		noAck:                 options.NoAck,
+		startID:               o.LastEventID,
+		noAck:                 o.NoAck,
 		streams:               []*Stream{stream},
 		streamCursors:         []string{stream.key, ">"},
-		blockDuration:         options.BlockDuration,
-		maxPolled:             options.MaxPolled,
-		bufferSize:            options.BufferSize,
+		blockDuration:         o.BlockDuration,
+		maxPolled:             o.MaxPolled,
+		bufferSize:            o.BufferSize,
 		streamschan:           make(chan struct{}),
 		donechan:              make(chan struct{}),
-		eventMatcher:          eventMatcher,
+		eventFilter:           eventMatcher,
 		consumersMap:          map[string]*rmap.Map{stream.Name: cm},
 		consumersKeepAliveMap: km,
-		ackGracePeriod:        options.AckGracePeriod,
+		ackGracePeriod:        o.AckGracePeriod,
 		logger:                stream.rootLogger.WithPrefix("sink", name, "consumer", consumer),
 		rdb:                   stream.rdb,
 	}
@@ -192,7 +191,7 @@ func (s *Sink) Ack(ctx context.Context, e *Event) error {
 // AddStream adds the stream to the sink. By default the stream cursor starts at
 // the same timestamp as the sink main stream cursor.  This can be overridden
 // with opts. AddStream does nothing if the stream is already part of the sink.
-func (s *Sink) AddStream(ctx context.Context, stream *Stream, opts ...AddStreamOption) error {
+func (s *Sink) AddStream(ctx context.Context, stream *Stream, opts ...options.AddStream) error {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 	for _, s := range s.streams {
@@ -201,7 +200,7 @@ func (s *Sink) AddStream(ctx context.Context, stream *Stream, opts ...AddStreamO
 		}
 	}
 	startID := s.startID
-	options := defaultAddStreamOptions()
+	options := options.ParseAddStreamOptions(opts...)
 	for _, option := range opts {
 		option(&options)
 	}
@@ -327,14 +326,13 @@ func (s *Sink) read() {
 		s.lock.Lock()
 		for _, events := range streamsEvents {
 			streamName := events.Stream[len(streamKeyPrefix):]
-			streamEvents(streamName, events.Stream, s.Name, events.Messages, s.eventMatcher, s.chans, s.rdb, s.logger)
+			streamEvents(streamName, events.Stream, s.Name, events.Messages, s.eventFilter, s.chans, s.rdb, s.logger)
 		}
 		s.lock.Unlock()
 	}
 }
 
 // manageStaleMessages does 3 things:
-//
 //  1. It refreshes this consumer keep-alive every half ack grace period
 //  2. It claims any stale message every check stale period (a stale message is
 //     one that has been read but not acked for more than the ack grace period)
@@ -438,7 +436,7 @@ func (s *Sink) claim(ctx context.Context, streamName string, args redis.XAutoCla
 	messages, start, err := s.rdb.XAutoClaim(ctx, &args).Result()
 	if len(messages) > 0 {
 		s.logger.Info("claimed", "stale-consumer", args.Consumer, "messages", len(messages))
-		streamEvents(streamName, args.Stream, s.Name, messages, s.eventMatcher, s.chans, s.rdb, s.logger)
+		streamEvents(streamName, args.Stream, s.Name, messages, s.eventFilter, s.chans, s.rdb, s.logger)
 	}
 	return start, err
 }

@@ -13,6 +13,7 @@ import (
 	"goa.design/ponos/ponos"
 	"goa.design/ponos/rmap"
 	"goa.design/ponos/streaming"
+	soptions "goa.design/ponos/streaming/options"
 )
 
 type (
@@ -59,15 +60,15 @@ type (
 	// JobHandler starts and stops jobs.
 	JobHandler interface {
 		// Start starts a job.
-		Start(ctx context.Context, job *Job) error
+		Start(job *Job) error
 		// Stop stops a job with a given key.
-		Stop(ctx context.Context, key string) error
+		Stop(key string) error
 	}
 
 	// NotificationHandler handle job notifications.
 	NotificationHandler interface {
 		// HandleNotification handles a notification.
-		HandleNotification(ctx context.Context, key string, payload []byte) error
+		HandleNotification(key string, payload []byte) error
 	}
 
 	// ack is a worker event acknowledgement.
@@ -90,11 +91,11 @@ func newWorker(ctx context.Context, p *Node, h JobHandler) (*Worker, error) {
 	if _, err := p.keepAliveMap.SetAndWait(ctx, wid, now); err != nil {
 		return nil, fmt.Errorf("failed to update worker keep-alive: %w", err)
 	}
-	stream, err := streaming.NewStream(workerStreamName(wid), p.rdb, streaming.WithStreamLogger(p.logger))
+	stream, err := streaming.NewStream(workerStreamName(wid), p.rdb, soptions.WithStreamLogger(p.logger))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create jobs stream for worker %q: %w", wid, err)
 	}
-	reader, err := stream.NewReader(ctx, streaming.WithReaderBlockDuration(p.workerTTL), streaming.WithReaderStartAtOldest())
+	reader, err := stream.NewReader(ctx, soptions.WithReaderBlockDuration(p.workerTTL), soptions.WithReaderStartAtOldest())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create reader for worker %q: %w", wid, err)
 	}
@@ -233,7 +234,7 @@ func (w *Worker) startJob(ctx context.Context, job *Job) error {
 		return fmt.Errorf("worker %q stopped", w.ID)
 	}
 	job.Worker = w
-	if err := w.handler.Start(ctx, job); err != nil {
+	if err := w.handler.Start(job); err != nil {
 		return err
 	}
 	w.logger.Info("started job", "key", job.Key)
@@ -253,7 +254,7 @@ func (w *Worker) stopJob(ctx context.Context, key string) error {
 	if _, ok := w.jobs[key]; !ok {
 		return fmt.Errorf("job %s not found", key)
 	}
-	if err := w.handler.Stop(ctx, key); err != nil {
+	if err := w.handler.Stop(key); err != nil {
 		return fmt.Errorf("failed to stop job %q: %w", key, err)
 	}
 	w.logger.Info("stopped job", "key", key)
@@ -276,7 +277,7 @@ func (w *Worker) notify(ctx context.Context, key string, payload []byte) error {
 		return nil
 	}
 	w.logger.Debug("handled notification", "payload", string(payload))
-	return nh.HandleNotification(ctx, key, payload)
+	return nh.HandleNotification(key, payload)
 }
 
 // ackPoolEvent acknowledges the pool event that originated from the node with
@@ -285,14 +286,18 @@ func (w *Worker) ackPoolEvent(ctx context.Context, nodeID, eventID string, acker
 	stream, ok := w.nodeStreams[nodeID]
 	if !ok {
 		var err error
-		stream, err = streaming.NewStream(nodeStreamName(w.Node.Name, nodeID), w.Node.rdb, streaming.WithStreamLogger(w.logger))
+		stream, err = streaming.NewStream(nodeStreamName(w.Node.Name, nodeID), w.Node.rdb, soptions.WithStreamLogger(w.logger))
 		if err != nil {
 			w.logger.Error(fmt.Errorf("failed to create stream for node %q: %w", nodeID, err))
 			return
 		}
 		w.nodeStreams[nodeID] = stream
 	}
-	ack := &ack{EventID: eventID, Error: ackerr.Error()}
+	var msg string
+	if ackerr != nil {
+		msg = ackerr.Error()
+	}
+	ack := &ack{EventID: eventID, Error: msg}
 	if _, err := stream.Add(ctx, evAck, marshalEnvelope(w.ID, marshalAck(ack))); err != nil {
 		w.logger.Error(fmt.Errorf("failed to ack event %q from node %q: %w", eventID, nodeID, err))
 	}

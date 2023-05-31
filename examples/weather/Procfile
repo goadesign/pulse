@@ -1,0 +1,2 @@
+forecaster: bin/forecaster
+poller: bin/poller

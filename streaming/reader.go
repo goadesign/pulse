@@ -13,6 +13,7 @@ import (
 	redis "github.com/redis/go-redis/v9"
 
 	"goa.design/ponos/ponos"
+	"goa.design/ponos/streaming/options"
 )
 
 type (
@@ -50,8 +51,8 @@ type (
 		wait sync.WaitGroup
 		// closing is true if Close was called.
 		closing bool
-		// eventMatcher is the event matcher if any.
-		eventMatcher EventMatcherFunc
+		// eventFilter is the event filter if any.
+		eventFilter eventFilterFunc
 		// logger is the logger used by the reader.
 		logger ponos.Logger
 		// rdb is the redis connection.
@@ -80,32 +81,27 @@ type (
 )
 
 // newReader creates a new reader.
-func newReader(stream *Stream, opts ...ReaderOption) (*Reader, error) {
-	options := defaultReaderOptions()
-	for _, option := range opts {
-		option(&options)
-	}
-	eventMatcher := options.EventMatcher
-	if eventMatcher == nil {
-		if options.Topic != "" {
-			eventMatcher = func(e *Event) bool { return e.Topic == options.Topic }
-		} else if options.TopicPattern != "" {
-			topicPatternRegexp := regexp.MustCompile(options.TopicPattern)
-			eventMatcher = func(e *Event) bool { return topicPatternRegexp.MatchString(e.Topic) }
-		}
+func newReader(stream *Stream, opts ...options.Reader) (*Reader, error) {
+	o := options.ParseReaderOptions(opts...)
+	var eventFilter eventFilterFunc
+	if o.Topic != "" {
+		eventFilter = func(e *Event) bool { return e.Topic == o.Topic }
+	} else if o.TopicPattern != "" {
+		topicPatternRegexp := regexp.MustCompile(o.TopicPattern)
+		eventFilter = func(e *Event) bool { return topicPatternRegexp.MatchString(e.Topic) }
 	}
 
 	reader := &Reader{
-		startID:       options.LastEventID,
+		startID:       o.LastEventID,
 		streams:       []*Stream{stream},
 		streamKeys:    []string{stream.key},
-		streamCursors: []string{options.LastEventID},
-		blockDuration: options.BlockDuration,
-		maxPolled:     options.MaxPolled,
-		bufferSize:    options.BufferSize,
+		streamCursors: []string{o.LastEventID},
+		blockDuration: o.BlockDuration,
+		maxPolled:     o.MaxPolled,
+		bufferSize:    o.BufferSize,
 		donechan:      make(chan struct{}),
 		streamschan:   make(chan struct{}),
-		eventMatcher:  eventMatcher,
+		eventFilter:   eventFilter,
 		logger:        stream.rootLogger.WithPrefix("reader", stream.Name),
 		rdb:           stream.rdb,
 	}
@@ -142,7 +138,7 @@ func (r *Reader) Unsubscribe(c <-chan *Event) {
 // AddStream adds the stream to the sink. By default the stream cursor starts at
 // the same timestamp as the sink main stream cursor.  This can be overridden
 // with opts. AddStream does nothing if the stream is already part of the sink.
-func (r *Reader) AddStream(ctx context.Context, stream *Stream, opts ...AddStreamOption) error {
+func (r *Reader) AddStream(ctx context.Context, stream *Stream, opts ...options.AddStream) error {
 	r.lock.Lock()
 	defer r.lock.Unlock()
 	for _, name := range r.streamKeys {
@@ -151,12 +147,9 @@ func (r *Reader) AddStream(ctx context.Context, stream *Stream, opts ...AddStrea
 		}
 	}
 	startID := r.startID
-	options := defaultAddStreamOptions()
-	for _, option := range opts {
-		option(&options)
-	}
-	if options.LastEventID != "" {
-		startID = options.LastEventID
+	o := options.ParseAddStreamOptions(opts...)
+	if o.LastEventID != "" {
+		startID = o.LastEventID
 	}
 	r.streams = append(r.streams, stream)
 	r.streamKeys = append(r.streamKeys, stream.key)
@@ -201,8 +194,8 @@ func (r *Reader) Close() {
 	r.logger.Info("stopped")
 }
 
-// Closed returns true if the reader is stopped.
-func (r *Reader) Closed() bool {
+// IsClosed returns true if the reader is stopped.
+func (r *Reader) IsClosed() bool {
 	r.lock.Lock()
 	defer r.lock.Unlock()
 	return r.closed
@@ -214,6 +207,7 @@ func (r *Reader) read() {
 	defer r.cleanup()
 	for {
 		streamsEvents, err := readOnce(ctx, r.xread, r.streamschan, r.donechan, r.logger)
+		r.logger.Info("read", "events", len(streamsEvents))
 		if r.isClosing() {
 			return
 		}
@@ -229,7 +223,7 @@ func (r *Reader) read() {
 		r.lock.Lock()
 		for _, events := range streamsEvents {
 			streamName := events.Stream[len(streamKeyPrefix):]
-			streamEvents(streamName, events.Stream, "", events.Messages, r.eventMatcher, r.chans, r.rdb, r.logger)
+			streamEvents(streamName, events.Stream, "", events.Messages, r.eventFilter, r.chans, r.rdb, r.logger)
 			for i := range r.streamKeys {
 				if r.streamKeys[i] == events.Stream {
 					r.streamCursors[i] = events.Messages[len(events.Messages)-1].ID
@@ -355,7 +349,7 @@ func streamEvents(
 	streamKey string,
 	sinkName string,
 	msgs []redis.XMessage,
-	eventMatcher EventMatcherFunc,
+	eventFilter eventFilterFunc,
 	chans []chan *Event,
 	rdb *redis.Client,
 	logger ponos.Logger,
@@ -378,7 +372,7 @@ func streamEvents(
 			streamKey:  streamKey,
 			rdb:        rdb,
 		}
-		if eventMatcher != nil && !eventMatcher(ev) {
+		if eventFilter != nil && !eventFilter(ev) {
 			logger.Debug("event did not match event matcher", "stream", streamName, "event", ev.ID)
 			continue
 		}

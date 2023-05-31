@@ -8,6 +8,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"goa.design/ponos/streaming"
+	"goa.design/ponos/streaming/options"
 )
 
 // NOTE: the example below does not handle errors for brevity.
@@ -20,7 +21,7 @@ func main() {
 	}
 
 	// Create stream
-	stream, err := streaming.NewStream(ctx, "pubsub-stream", rdb)
+	stream, err := streaming.NewStream("pubsub-stream", rdb)
 	if err != nil {
 		panic(err)
 	}
@@ -32,14 +33,14 @@ func main() {
 	id1, err := stream.Add(ctx,
 		"event 1",
 		[]byte("payload 1"),
-		streaming.WithTopic("my-topic"))
+		options.WithTopic("my-topic"))
 	if err != nil {
 		panic(err)
 	}
 	fmt.Printf("event 1 id: %s\n", id1)
 
 	// Add a new event to topic "other-topic"
-	id2, err := stream.Add(ctx, "event 2", []byte("payload 2"), streaming.WithTopic("other-topic"))
+	id2, err := stream.Add(ctx, "event 2", []byte("payload 2"), options.WithTopic("other-topic"))
 	if err != nil {
 		panic(err)
 	}
@@ -48,8 +49,8 @@ func main() {
 	// Create sink that reads from the beginning and waits for events for up
 	// to 100ms
 	sink, err := stream.NewSink(ctx, "pubsub-sink",
-		streaming.WithSinkStartAtOldest(),
-		streaming.WithSinkBlockDuration(100*time.Millisecond))
+		options.WithSinkStartAtOldest(),
+		options.WithSinkBlockDuration(100*time.Millisecond))
 	if err != nil {
 		panic(err)
 	}
@@ -74,9 +75,9 @@ func main() {
 	// Create reader that reads from the beginning, waits for events for up
 	// to 100ms and only reads events whose topic match the pattern "my-*"
 	reader, err := stream.NewReader(ctx,
-		streaming.WithReaderStartAtOldest(),
-		streaming.WithReaderBlockDuration(100*time.Millisecond),
-		streaming.WithReaderTopicPattern("my-*"))
+		options.WithReaderStartAtOldest(),
+		options.WithReaderBlockDuration(100*time.Millisecond),
+		options.WithReaderTopicPattern("my-*"))
 	if err != nil {
 		panic(err)
 	}
@@ -87,24 +88,4 @@ func main() {
 	// Read event from topic "my-topic"
 	event = <-reader.Subscribe()
 	fmt.Printf("reader topic pattern: my-*, topic: %s, event: %s, payload: %s\n", event.Topic, event.EventName, event.Payload)
-
-	// Create reader for stream "my-stream" that reads from the beginning,
-	// waits for events for up to 100ms and only reads events whose topic
-	// match the given custom filter.
-	reader2, err := stream.NewReader(ctx,
-		streaming.WithReaderStartAtOldest(),
-		streaming.WithReaderBlockDuration(100*time.Millisecond),
-		streaming.WithReaderEventMatcher(func(event *streaming.Event) bool {
-			return event.Topic == "my-topic"
-		}))
-	if err != nil {
-		panic(err)
-	}
-
-	// Don't forget to close the reader when done
-	defer reader2.Close()
-
-	// Read event from topic "my-topic"
-	event = <-reader2.Subscribe()
-	fmt.Printf("reader topic filter: my-topic, topic: %s, event: %s, payload: %s\n", event.Topic, event.EventName, event.Payload)
 }

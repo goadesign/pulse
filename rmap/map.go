@@ -134,24 +134,21 @@ const luaRemove = `
 //
 // Clients should call Close before exiting to stop updates and release
 // resources resulting in a read-only point-in-time copy.
-func Join(ctx context.Context, name string, rdb *redis.Client, options ...MapOption) (*Map, error) {
+func Join(ctx context.Context, name string, rdb *redis.Client, opts ...MapOption) (*Map, error) {
 	if !isValidRedisKeyName(name) {
 		return nil, fmt.Errorf("ponos map: not a valid map name %q", name)
 	}
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
-	opts := defaultOptions()
-	for _, o := range options {
-		o(opts)
-	}
+	o := parseOptions(opts...)
 	sm := &Map{
 		Name:    name,
 		chankey: fmt.Sprintf("map:%s:updates", name),
 		hashkey: fmt.Sprintf("map:%s:content", name),
 		ichan:   make(chan struct{}, 1),
 		done:    make(chan struct{}),
-		logger:  opts.Logger.WithPrefix("map", name),
+		logger:  o.Logger.WithPrefix("map", name),
 		rdb:     rdb,
 		set:     redis.NewScript(luaSet),
 		incr:    redis.NewScript(luaIncr),

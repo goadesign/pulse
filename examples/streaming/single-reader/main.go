@@ -8,6 +8,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"goa.design/ponos/streaming"
+	"goa.design/ponos/streaming/options"
 )
 
 func main() {
@@ -19,7 +20,7 @@ func main() {
 	}
 
 	// Create stream
-	stream, err := streaming.NewStream(ctx, "sr-stream", rdb)
+	stream, err := streaming.NewStream("sr-stream", rdb)
 	if err != nil {
 		panic(err)
 	}
@@ -37,8 +38,8 @@ func main() {
 	// Create reader that reads from the beginning and waits for
 	// events for up to 100ms
 	reader, err := stream.NewReader(ctx,
-		streaming.WithReaderStartAtOldest(),
-		streaming.WithReaderBlockDuration(100*time.Millisecond))
+		options.WithReaderStartAtOldest(),
+		options.WithReaderBlockDuration(100*time.Millisecond))
 	if err != nil {
 		panic(err)
 	}

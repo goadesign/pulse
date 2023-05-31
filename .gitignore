@@ -2,3 +2,5 @@
 coverage.out
 examples/pool/worker/worker
 examples/streaming/single-reader/ponos.code-workspace
+examples/weather/bin/poller
+examples/weather/bin/forecaster

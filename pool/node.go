@@ -15,9 +15,11 @@ import (
 	"github.com/oklog/ulid/v2"
 	redis "github.com/redis/go-redis/v9"
 
+	"goa.design/clue/log"
 	"goa.design/ponos/ponos"
 	"goa.design/ponos/rmap"
 	"goa.design/ponos/streaming"
+	soptions "goa.design/ponos/streaming/options"
 )
 
 type (
@@ -73,19 +75,16 @@ const (
 )
 
 // AddNode adds a new node to the pool with the given name and returns it. The
-// node can be used to dispatch jobs and to add new workers. A node also routes
+// node can be used to dispatch jobs and add new workers. A node also routes
 // dispatched jobs to the proper worker and acks the corresponding events once
 // the worker acks the job.
 //
 // The options WithClientOnly can be used to create a node that can only be used
 // to dispatch jobs. Such a node does not route or process jobs in the
 // background.
-func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...PoolOption) (*Node, error) {
-	options := defaultPoolOptions()
-	for _, opt := range opts {
-		opt(options)
-	}
-	logger := options.logger
+func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...NodeOption) (*Node, error) {
+	o := parseOptions(opts...)
+	logger := o.logger
 	if logger == nil {
 		logger = ponos.NoopLogger()
 	}
@@ -97,8 +96,8 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...PoolOp
 		return nil, fmt.Errorf("pool %q is shutting down", name)
 	}
 	poolStream, err := streaming.NewStream(poolStreamName(name), rdb,
-		streaming.WithStreamMaxLen(options.maxQueuedJobs),
-		streaming.WithStreamLogger(logger))
+		soptions.WithStreamMaxLen(o.maxQueuedJobs),
+		soptions.WithStreamLogger(logger))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create pool job stream %q: %w", poolStreamName(name), err)
 	}
@@ -110,7 +109,7 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...PoolOp
 		nodeStream *streaming.Stream
 		nodeReader *streaming.Reader
 	)
-	if !options.clientOnly {
+	if !o.clientOnly {
 		wm, err = rmap.Join(ctx, workerMapName(name), rdb, rmap.WithLogger(logger))
 		if err != nil {
 			return nil, fmt.Errorf("failed to join pool workers replicated map %q: %w", workerMapName(name), err)
@@ -120,15 +119,15 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...PoolOp
 			return nil, fmt.Errorf("failed to join pool keep-alive replicated map %q: %w", keepAliveMapName(name), err)
 		}
 		poolSink, err = poolStream.NewSink(ctx, "events",
-			streaming.WithSinkBlockDuration(options.jobSinkBlockDuration))
+			soptions.WithSinkBlockDuration(o.jobSinkBlockDuration))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create events sink for stream %q: %w", poolStreamName(name), err)
 		}
-		nodeStream, err = streaming.NewStream(nodeStreamName(name, nodeID), rdb, streaming.WithStreamLogger(logger))
+		nodeStream, err = streaming.NewStream(nodeStreamName(name, nodeID), rdb, soptions.WithStreamLogger(logger))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create node event stream %q: %w", nodeStreamName(name, nodeID), err)
 		}
-		nodeReader, err = nodeStream.NewReader(ctx, streaming.WithReaderBlockDuration(options.jobSinkBlockDuration), streaming.WithReaderStartAtOldest())
+		nodeReader, err = nodeStream.NewReader(ctx, soptions.WithReaderBlockDuration(o.jobSinkBlockDuration), soptions.WithReaderStartAtOldest())
 		if err != nil {
 			return nil, fmt.Errorf("failed to create node event reader for stream %q: %w", nodeStreamName(name, nodeID), err)
 		}
@@ -147,17 +146,17 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...PoolOp
 		poolSink:          poolSink,
 		nodeStream:        nodeStream,
 		nodeReader:        nodeReader,
-		clientOnly:        options.clientOnly,
-		workerTTL:         options.workerTTL,
-		workerShutdownTTL: options.workerShutdownTTL,
-		pendingJobTTL:     options.pendingJobTTL,
+		clientOnly:        o.clientOnly,
+		workerTTL:         o.workerTTL,
+		workerShutdownTTL: o.workerShutdownTTL,
+		pendingJobTTL:     o.pendingJobTTL,
 		logger:            logger.WithPrefix("pool", name, "node", nodeID),
 		h:                 jumpHash{crc64.New(crc64.MakeTable(crc64.ECMA))},
 		stop:              make(chan struct{}),
 		rdb:               rdb,
 	}
 
-	if options.clientOnly {
+	if o.clientOnly {
 		logger.Info("client-only")
 		p.wg.Add(1)
 		go p.manageShutdown()
@@ -165,8 +164,10 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...PoolOp
 	}
 
 	p.wg.Add(4)
-	go p.handlePoolEvents(poolSink.Subscribe()) // handleXXX handles streaming events
-	go p.handleNodeEvents(nodeReader.Subscribe())
+	pch := poolSink.Subscribe()
+	nch := nodeReader.Subscribe()
+	go p.handlePoolEvents(pch) // handleXXX handles streaming events
+	go p.handleNodeEvents(nch)
 	go p.manageWorkers() // manageXXX handles map updates
 	go p.manageShutdown()
 	return p, nil
@@ -222,22 +223,36 @@ func (node *Node) Workers() []*Worker {
 // DispatchJob dispatches a job to the proper worker in the pool.
 // It returns the error returned by the worker's start handler if any.
 func (node *Node) DispatchJob(ctx context.Context, key string, payload []byte) error {
+	cherr, err := node.lockAndDispatch(ctx, key, payload)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		node.lock.Lock()
+		delete(node.pendingJobs, key)
+		close(cherr)
+		node.lock.Unlock()
+	}()
+	return <-cherr
+}
+
+// lockAndDispatch helps with locking.
+func (node *Node) lockAndDispatch(ctx context.Context, key string, payload []byte) (chan error, error) {
 	node.lock.Lock()
 	defer node.lock.Unlock()
 	if _, ok := node.pendingJobs[key]; ok {
-		return fmt.Errorf("job with key %q is already pending", key)
+		return nil, fmt.Errorf("job with key %q is already pending", key)
 	}
 	if node.closing || node.shuttingDown {
-		return fmt.Errorf("pool %q is closed", node.Name)
+		return nil, fmt.Errorf("pool %q is closed", node.Name)
 	}
 	job := marshalJob(&Job{Key: key, Payload: payload, CreatedAt: time.Now()})
 	if _, err := node.poolStream.Add(ctx, evStartJob, job); err != nil {
-		return fmt.Errorf("failed to add job to stream %q: %w", node.poolStream.Name, err)
+		return nil, fmt.Errorf("failed to add job to stream %q: %w", node.poolStream.Name, err)
 	}
 	cherr := make(chan error, 1)
-	defer close(cherr)
 	node.pendingJobs[key] = cherr
-	return <-cherr
+	return cherr, nil
 }
 
 // StopJob stops the job with the given key.
@@ -305,6 +320,8 @@ func (node *Node) Shutdown(ctx context.Context) error {
 	node.keepAliveMap.Close()
 	node.workerMap.Close()
 	node.shutdownMap.Close()
+	node.nodeReader.Close()
+	node.nodeStream.Destroy(ctx)
 	node.shutdown = true
 	node.logger.Info("shutdown")
 	return nil
@@ -338,6 +355,8 @@ func (node *Node) Close(ctx context.Context) error {
 		node.keepAliveMap.Close()
 		node.workerMap.Close()
 		node.shutdownMap.Close()
+		node.nodeReader.Close()
+		node.nodeStream.Destroy(ctx)
 	}
 	node.closed = true
 	close(node.stop)
@@ -425,7 +444,10 @@ func (node *Node) handleNodeEvents(c <-chan *streaming.Event) {
 	ctx := context.Background()
 	for {
 		select {
-		case ev := <-c:
+		case ev, ok := <-c:
+			if !ok {
+				return
+			}
 			node.lock.Lock()
 			workerID, payload := unmarshalEnvelope(ev.Payload)
 			ack := unmarshalAck(payload)
@@ -509,16 +531,20 @@ func (node *Node) handleWorkerMapUpdate(ctx context.Context) {
 func (node *Node) rebalanceWorker(ctx context.Context, worker *Worker, activeIDs []string) {
 	worker.lock.Lock()
 	defer worker.lock.Unlock()
+	if worker.stopped {
+		return
+	}
 	numIDs := int64(len(activeIDs))
 	for _, job := range worker.jobs {
 		wid := activeIDs[node.h.Hash(job.Key, numIDs)]
 		if wid == worker.ID {
 			continue
 		}
-		if err := worker.stopJob(ctx, job.Key); err != nil {
-			node.logger.Error(fmt.Errorf("failed to stop job %q for rebalance: %w", job.Key, err))
+		if err := worker.handler.Stop(job.Key); err != nil {
+			log.Errorf(ctx, err, "failed to stop job %q during rebalance", job.Key)
 			continue
 		}
+		delete(worker.jobs, job.Key)
 		if _, err := node.poolStream.Add(ctx, evStartJob, marshalJob(job)); err != nil {
 			node.logger.Error(fmt.Errorf("failed to add job %q to stream %q: %w", job.Key, node.poolStream.Name, err))
 		}
@@ -662,7 +688,7 @@ func (node *Node) deleteWorker(ctx context.Context, id string) error {
 func (node *Node) workerStream(ctx context.Context, id string) (*streaming.Stream, error) {
 	stream, ok := node.workerStreams[id]
 	if !ok {
-		s, err := streaming.NewStream(workerStreamName(id), node.rdb, streaming.WithStreamLogger(node.logger))
+		s, err := streaming.NewStream(workerStreamName(id), node.rdb, soptions.WithStreamLogger(node.logger))
 		if err != nil {
 			return nil, fmt.Errorf("failed to retrieve stream for worker %q: %w", id, err)
 		}

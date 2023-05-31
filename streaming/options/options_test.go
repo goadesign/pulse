@@ -1,4 +1,4 @@
-package streaming
+package options
 
 import (
 	"fmt"
@@ -13,29 +13,29 @@ import (
 func TestStreamOptions(t *testing.T) {
 	cases := []struct {
 		name string
-		opts []StreamOption
-		want streamOptions
+		opts []Stream
+		want StreamOptions
 	}{
 		{
 			name: "default",
-			opts: []StreamOption{},
-			want: streamOptions{
+			opts: []Stream{},
+			want: StreamOptions{
 				MaxLen: 1000,
 				Logger: ponos.NoopLogger(),
 			},
 		},
 		{
 			name: "maxlen",
-			opts: []StreamOption{WithStreamMaxLen(10)},
-			want: streamOptions{
+			opts: []Stream{WithStreamMaxLen(10)},
+			want: StreamOptions{
 				MaxLen: 10,
 				Logger: ponos.NoopLogger(),
 			},
 		},
 		{
 			name: "custom logger",
-			opts: []StreamOption{WithStreamLogger(ponos.StdLogger(log.Default()))},
-			want: streamOptions{
+			opts: []Stream{WithStreamLogger(ponos.StdLogger(log.Default()))},
+			want: StreamOptions{
 				MaxLen: 1000,
 				Logger: ponos.StdLogger(log.Default()),
 			},
@@ -56,13 +56,13 @@ func TestStreamOptions(t *testing.T) {
 func TestReaderOptions(t *testing.T) {
 	cases := []struct {
 		name string
-		opts []ReaderOption
-		want readerOptions
+		opts []Reader
+		want ReaderOptions
 	}{
 		{
 			name: "default",
-			opts: []ReaderOption{},
-			want: readerOptions{
+			opts: []Reader{},
+			want: ReaderOptions{
 				BlockDuration: 5 * time.Second,
 				MaxPolled:     1000,
 				BufferSize:    1000,
@@ -71,8 +71,8 @@ func TestReaderOptions(t *testing.T) {
 		},
 		{
 			name: "block duration",
-			opts: []ReaderOption{WithReaderBlockDuration(10 * time.Second)},
-			want: readerOptions{
+			opts: []Reader{WithReaderBlockDuration(10 * time.Second)},
+			want: ReaderOptions{
 				BlockDuration: 10 * time.Second,
 				MaxPolled:     1000,
 				BufferSize:    1000,
@@ -81,8 +81,8 @@ func TestReaderOptions(t *testing.T) {
 		},
 		{
 			name: "max polled",
-			opts: []ReaderOption{WithReaderMaxPolled(10)},
-			want: readerOptions{
+			opts: []Reader{WithReaderMaxPolled(10)},
+			want: ReaderOptions{
 				BlockDuration: 5 * time.Second,
 				MaxPolled:     10,
 				BufferSize:    1000,
@@ -91,8 +91,8 @@ func TestReaderOptions(t *testing.T) {
 		},
 		{
 			name: "topic",
-			opts: []ReaderOption{WithReaderTopic("foo")},
-			want: readerOptions{
+			opts: []Reader{WithReaderTopic("foo")},
+			want: ReaderOptions{
 				BlockDuration: 5 * time.Second,
 				MaxPolled:     1000,
 				BufferSize:    1000,
@@ -102,8 +102,8 @@ func TestReaderOptions(t *testing.T) {
 		},
 		{
 			name: "topic pattern",
-			opts: []ReaderOption{WithReaderTopicPattern("foo*")},
-			want: readerOptions{
+			opts: []Reader{WithReaderTopicPattern("foo*")},
+			want: ReaderOptions{
 				BlockDuration: 5 * time.Second,
 				MaxPolled:     1000,
 				BufferSize:    1000,
@@ -112,20 +112,9 @@ func TestReaderOptions(t *testing.T) {
 			},
 		},
 		{
-			name: "event matcher",
-			opts: []ReaderOption{WithReaderEventMatcher(nil)},
-			want: readerOptions{
-				BlockDuration: 5 * time.Second,
-				MaxPolled:     1000,
-				BufferSize:    1000,
-				LastEventID:   "$",
-				EventMatcher:  nil,
-			},
-		},
-		{
 			name: "buffer size",
-			opts: []ReaderOption{WithReaderBufferSize(10)},
-			want: readerOptions{
+			opts: []Reader{WithReaderBufferSize(10)},
+			want: ReaderOptions{
 				BlockDuration: 5 * time.Second,
 				MaxPolled:     1000,
 				BufferSize:    10,
@@ -134,8 +123,8 @@ func TestReaderOptions(t *testing.T) {
 		},
 		{
 			name: "last event ID",
-			opts: []ReaderOption{WithReaderStartAfter("foo")},
-			want: readerOptions{
+			opts: []Reader{WithReaderStartAfter("foo")},
+			want: ReaderOptions{
 				BlockDuration: 5 * time.Second,
 				MaxPolled:     1000,
 				BufferSize:    1000,
@@ -159,13 +148,13 @@ func TestSinkOptions(t *testing.T) {
 	date := time.Date(2019, 1, 1, 0, 0, 0, 0, time.UTC)
 	cases := []struct {
 		name string
-		opts []SinkOption
-		want sinkOptions
+		opts []Sink
+		want SinkOptions
 	}{
 		{
 			name: "default",
-			opts: []SinkOption{},
-			want: sinkOptions{
+			opts: []Sink{},
+			want: SinkOptions{
 				BlockDuration:  5 * time.Second,
 				MaxPolled:      1000,
 				BufferSize:     1000,
@@ -175,8 +164,8 @@ func TestSinkOptions(t *testing.T) {
 		},
 		{
 			name: "block duration",
-			opts: []SinkOption{WithSinkBlockDuration(10 * time.Second)},
-			want: sinkOptions{
+			opts: []Sink{WithSinkBlockDuration(10 * time.Second)},
+			want: SinkOptions{
 				BlockDuration:  10 * time.Second,
 				MaxPolled:      1000,
 				BufferSize:     1000,
@@ -186,8 +175,8 @@ func TestSinkOptions(t *testing.T) {
 		},
 		{
 			name: "max polled",
-			opts: []SinkOption{WithSinkMaxPolled(10)},
-			want: sinkOptions{
+			opts: []Sink{WithSinkMaxPolled(10)},
+			want: SinkOptions{
 				BlockDuration:  5 * time.Second,
 				MaxPolled:      10,
 				BufferSize:     1000,
@@ -197,8 +186,8 @@ func TestSinkOptions(t *testing.T) {
 		},
 		{
 			name: "topic",
-			opts: []SinkOption{WithSinkTopic("foo")},
-			want: sinkOptions{
+			opts: []Sink{WithSinkTopic("foo")},
+			want: SinkOptions{
 				BlockDuration:  5 * time.Second,
 				MaxPolled:      1000,
 				BufferSize:     1000,
@@ -209,8 +198,8 @@ func TestSinkOptions(t *testing.T) {
 		},
 		{
 			name: "topic pattern",
-			opts: []SinkOption{WithSinkTopicPattern("foo*")},
-			want: sinkOptions{
+			opts: []Sink{WithSinkTopicPattern("foo*")},
+			want: SinkOptions{
 				BlockDuration:  5 * time.Second,
 				MaxPolled:      1000,
 				BufferSize:     1000,
@@ -220,21 +209,9 @@ func TestSinkOptions(t *testing.T) {
 			},
 		},
 		{
-			name: "event matcher",
-			opts: []SinkOption{WithSinkEventMatcher(nil)},
-			want: sinkOptions{
-				BlockDuration:  5 * time.Second,
-				MaxPolled:      1000,
-				BufferSize:     1000,
-				LastEventID:    "$",
-				AckGracePeriod: 30 * time.Second,
-				EventMatcher:   nil,
-			},
-		},
-		{
 			name: "buffer size",
-			opts: []SinkOption{WithSinkBufferSize(10)},
-			want: sinkOptions{
+			opts: []Sink{WithSinkBufferSize(10)},
+			want: SinkOptions{
 				BlockDuration:  5 * time.Second,
 				MaxPolled:      1000,
 				BufferSize:     10,
@@ -244,8 +221,8 @@ func TestSinkOptions(t *testing.T) {
 		},
 		{
 			name: "last event ID",
-			opts: []SinkOption{WithSinkStartAfter("foo")},
-			want: sinkOptions{
+			opts: []Sink{WithSinkStartAfter("foo")},
+			want: SinkOptions{
 				BlockDuration:  5 * time.Second,
 				MaxPolled:      1000,
 				BufferSize:     1000,
@@ -255,8 +232,8 @@ func TestSinkOptions(t *testing.T) {
 		},
 		{
 			name: "start at",
-			opts: []SinkOption{WithSinkStartAt(date)},
-			want: sinkOptions{
+			opts: []Sink{WithSinkStartAt(date)},
+			want: SinkOptions{
 				BlockDuration:  5 * time.Second,
 				MaxPolled:      1000,
 				BufferSize:     1000,
@@ -266,8 +243,8 @@ func TestSinkOptions(t *testing.T) {
 		},
 		{
 			name: "no ack",
-			opts: []SinkOption{WithSinkNoAck()},
-			want: sinkOptions{
+			opts: []Sink{WithSinkNoAck()},
+			want: SinkOptions{
 				BlockDuration:  5 * time.Second,
 				MaxPolled:      1000,
 				BufferSize:     1000,
@@ -278,8 +255,8 @@ func TestSinkOptions(t *testing.T) {
 		},
 		{
 			name: "ack grace period",
-			opts: []SinkOption{WithSinkAckGracePeriod(10 * time.Second)},
-			want: sinkOptions{
+			opts: []Sink{WithSinkAckGracePeriod(10 * time.Second)},
+			want: SinkOptions{
 				BlockDuration:  5 * time.Second,
 				MaxPolled:      1000,
 				BufferSize:     1000,
@@ -304,27 +281,27 @@ func TestAddStreamOptions(t *testing.T) {
 	date := time.Date(2019, 1, 1, 0, 0, 0, 0, time.UTC)
 	cases := []struct {
 		name string
-		opts []AddStreamOption
-		want addStreamOptions
+		opts []AddStream
+		want AddStreamOptions
 	}{
 		{
 			name: "default",
-			opts: []AddStreamOption{},
-			want: addStreamOptions{
+			opts: []AddStream{},
+			want: AddStreamOptions{
 				LastEventID: "",
 			},
 		},
 		{
 			name: "last event ID",
-			opts: []AddStreamOption{WithAddStreamStartAfter("foo")},
-			want: addStreamOptions{
+			opts: []AddStream{WithAddStreamStartAfter("foo")},
+			want: AddStreamOptions{
 				LastEventID: "foo",
 			},
 		},
 		{
 			name: "start at",
-			opts: []AddStreamOption{WithAddStreamStartAt(date)},
-			want: addStreamOptions{
+			opts: []AddStream{WithAddStreamStartAt(date)},
+			want: AddStreamOptions{
 				LastEventID: fmt.Sprintf("%d-0", date.UnixMilli()),
 			},
 		},

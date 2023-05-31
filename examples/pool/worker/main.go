@@ -65,7 +65,7 @@ func main() {
 }
 
 // Start starts an execution.
-func (w *JobHandler) Start(ctx context.Context, job *pool.Job) error {
+func (w *JobHandler) Start(job *pool.Job) error {
 	w.lock.Lock()
 	defer w.lock.Unlock()
 	exec := &Execution{c: make(chan struct{})}
@@ -75,7 +75,7 @@ func (w *JobHandler) Start(ctx context.Context, job *pool.Job) error {
 }
 
 // Stop stops an execution.
-func (w *JobHandler) Stop(ctx context.Context, key string) error {
+func (w *JobHandler) Stop(key string) error {
 	w.lock.Lock()
 	defer w.lock.Unlock()
 	exec, ok := w.executions[key]
@@ -91,7 +91,7 @@ func (w *JobHandler) Stop(ctx context.Context, key string) error {
 }
 
 // Print notification.
-func (w *JobHandler) HandleNotification(ctx context.Context, key string, payload []byte) error {
+func (w *JobHandler) HandleNotification(key string, payload []byte) error {
 	fmt.Printf(">> Notification: %s\n", string(payload))
 	return nil
 }

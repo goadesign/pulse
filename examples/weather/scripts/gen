@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+
+set -e
+
+GIT_ROOT=$(git rev-parse --show-toplevel)
+pushd ${GIT_ROOT}/examples/weather
+
+echo "Generating Goa code..."
+
+# Do Goa first so that if client types are changing we can get the new generated
+# code and fix the clients (cmg will fail until we do)
+for svc in forecaster poller; do
+  goa gen goa.design/ponos/examples/weather/services/${svc}/design -o services/${svc}
+done
+for svc in forecaster poller; do
+  if [ -d services/${svc}/clients ]; then
+    cmg gen ./services/${svc}/clients/*/
+  fi
+done
+
+popd

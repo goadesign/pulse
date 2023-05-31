@@ -8,6 +8,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"goa.design/ponos/streaming"
+	"goa.design/ponos/streaming/options"
 )
 
 // NOTE: the example below does not handle errors for brevity.
@@ -22,7 +23,7 @@ func main() {
 	}
 
 	// Create stream
-	stream, err := streaming.NewStream(ctx, "multisinks", rdb)
+	stream, err := streaming.NewStream("multisinks", rdb)
 	if err != nil {
 		panic(err)
 	}
@@ -46,8 +47,8 @@ func main() {
 	// Create sink that reads from the beginning and waits for events for up
 	// to 100ms
 	sink1, err := stream.NewSink(ctx, "multisinks-sink1",
-		streaming.WithSinkStartAtOldest(),
-		streaming.WithSinkBlockDuration(100*time.Millisecond))
+		options.WithSinkStartAtOldest(),
+		options.WithSinkBlockDuration(100*time.Millisecond))
 	if err != nil {
 		panic(err)
 	}
@@ -64,8 +65,8 @@ func main() {
 
 	// Create sink and start reading after first event
 	sink2, err := stream.NewSink(ctx, "multisinks-sink2",
-		streaming.WithSinkStartAfter(ev.ID),
-		streaming.WithSinkBlockDuration(100*time.Millisecond))
+		options.WithSinkStartAfter(ev.ID),
+		options.WithSinkBlockDuration(100*time.Millisecond))
 	if err != nil {
 		panic(err)
 	}

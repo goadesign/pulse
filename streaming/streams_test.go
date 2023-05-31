@@ -7,6 +7,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"goa.design/ponos/ponos"
+	"goa.design/ponos/streaming/options"
 )
 
 var redisPwd = "redispassword"
@@ -39,7 +40,7 @@ func TestDestroy(t *testing.T) {
 }
 
 func TestOptions(t *testing.T) {
-	s, err := NewStream("testOptions", nil, WithStreamMaxLen(10), WithStreamLogger(nil))
+	s, err := NewStream("testOptions", nil, options.WithStreamMaxLen(10), options.WithStreamLogger(nil))
 	assert.NoError(t, err)
 	assert.Equal(t, 10, s.MaxLen)
 	assert.Equal(t, ponos.NoopLogger(), s.logger)
@@ -96,7 +97,7 @@ func TestTopic(t *testing.T) {
 	s, err := NewStream("testTopic", rdb)
 	assert.NoError(t, err)
 
-	_, err = s.Add(ctx, "bar", []byte("baz"), WithTopic("foo"))
+	_, err = s.Add(ctx, "bar", []byte("baz"), options.WithTopic("foo"))
 	assert.NoError(t, err)
 
 	l, err := rdb.XLen(ctx, s.key).Result()

@@ -7,6 +7,7 @@ import (
 
 	redis "github.com/redis/go-redis/v9"
 	"goa.design/ponos/ponos"
+	"goa.design/ponos/streaming/options"
 )
 
 type (
@@ -20,8 +21,6 @@ type (
 		Name string
 		// MaxLen is the maximum number of events in the stream.
 		MaxLen int
-		// C is the channel the stream receives events on.
-		C <-chan *Event
 		// logger is the logger used by the stream.
 		logger ponos.Logger
 		// rootLogger is the prefix-free logger used to create sink loggers.
@@ -46,27 +45,22 @@ const (
 
 // NewStream returns the stream with the given name. All stream instances
 // with the same name share the same events.
-func NewStream(ctx context.Context, name string, rdb *redis.Client, opts ...StreamOption) (*Stream, error) {
+func NewStream(name string, rdb *redis.Client, opts ...options.Stream) (*Stream, error) {
 	if !isValidRedisKeyName(name) {
 		return nil, fmt.Errorf("ponos stream: not a valid name %q", name)
 	}
-	options := defaultStreamOptions()
-	for _, option := range opts {
-		option(&options)
-	}
-	var logger, rootLogger ponos.Logger
-	if options.Logger != nil {
-		logger = options.Logger.WithPrefix("stream", name)
-		rootLogger = options.Logger
+	o := options.ParseStreamOptions(opts...)
+	var logger ponos.Logger
+	if o.Logger != nil {
+		logger = o.Logger.WithPrefix("stream", name)
 	} else {
 		logger = ponos.NoopLogger()
-		rootLogger = logger
 	}
 	s := &Stream{
 		Name:       name,
-		MaxLen:     options.MaxLen,
+		MaxLen:     o.MaxLen,
 		logger:     logger,
-		rootLogger: rootLogger,
+		rootLogger: logger,
 		key:        streamKeyPrefix + name,
 		rdb:        rdb,
 	}
@@ -82,8 +76,8 @@ func NewStream(ctx context.Context, name string, rdb *redis.Client, opts ...Stre
 //     event is still in the stream, oldest event otherwise
 //   - from the event added on or after the timestamp provided via
 //     WithReaderStartAt if still in the stream, oldest event otherwise
-func (s *Stream) NewReader(ctx context.Context, opts ...ReaderOption) (*Reader, error) {
-	reader, err := newReader(ctx, s, opts...)
+func (s *Stream) NewReader(ctx context.Context, opts ...options.Reader) (*Reader, error) {
+	reader, err := newReader(s, opts...)
 	if err != nil {
 		err := fmt.Errorf("failed to create reader: %w", err)
 		s.logger.Error(err)
@@ -104,7 +98,7 @@ func (s *Stream) NewReader(ctx context.Context, opts ...ReaderOption) (*Reader, 
 //     event is still in the stream, oldest event otherwise
 //   - from the event added on or after the timestamp provided via
 //     WithSinkStartAt if still in the stream, oldest event otherwise
-func (s *Stream) NewSink(ctx context.Context, name string, opts ...SinkOption) (*Sink, error) {
+func (s *Stream) NewSink(ctx context.Context, name string, opts ...options.Sink) (*Sink, error) {
 	sink, err := newSink(ctx, name, s, opts...)
 	if err != nil {
 		err := fmt.Errorf("failed to create sink: %w", err)
@@ -119,21 +113,21 @@ func (s *Stream) NewSink(ctx context.Context, name string, opts ...SinkOption) (
 // WithOnlyIfStreamExists is used and the stream does not exist then no event is
 // added and the empty string is returned. The stream is created if the option
 // is omitted or when NewSink is called.
-func (s *Stream) Add(ctx context.Context, name string, payload []byte, opts ...AddEventOption) (string, error) {
-	options := defaultAddEventOptions()
+func (s *Stream) Add(ctx context.Context, name string, payload []byte, opts ...options.AddEvent) (string, error) {
+	o := options.ParseAddEventOptions(opts...)
 	for _, option := range opts {
-		option(&options)
+		option(&o)
 	}
 	values := []any{nameKey, name, payloadKey, payload}
-	if options.Topic != "" {
-		values = append(values, topicKey, options.Topic)
+	if o.Topic != "" {
+		values = append(values, topicKey, o.Topic)
 	}
 	res, err := s.rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream:     s.key,
 		Values:     values,
 		MaxLen:     int64(s.MaxLen),
 		Approx:     true,
-		NoMkStream: options.OnlyIfStreamExists,
+		NoMkStream: o.OnlyIfStreamExists,
 	}).Result()
 	if err != nil {
 		if err == redis.Nil {
@@ -145,7 +139,7 @@ func (s *Stream) Add(ctx context.Context, name string, payload []byte, opts ...A
 		}
 		return "", err
 	}
-	s.logger.Debug("add", "event", name, "id", res)
+	s.logger.Info("add", "event", name, "id", res)
 	return res, nil
 }
 

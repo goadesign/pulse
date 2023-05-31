@@ -100,6 +100,14 @@ flowchart LR
 
 See the [pool package README](pool/README.md) for more details.
 
+## Examples
+
+See the [examples](examples) directory for examples of how to use the packages
+in this repository.
+
+If you are looking for a more complete example of how to use Ponos to build a
+distributed system, check out the [weather](examples/weather) example.
+
 ## License
 
 Ponos is licensed under the MIT license. See [LICENSE](LICENSE) for the full

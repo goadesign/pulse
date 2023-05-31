@@ -27,15 +27,15 @@ func init() {
 }
 
 type workerMock struct {
-	startFunc  func(ctx context.Context, job *Job) error
-	stopFunc   func(ctx context.Context, key string) error
-	notifyFunc func(ctx context.Context, payload []byte) error
+	startFunc  func(job *Job) error
+	stopFunc   func(key string) error
+	notifyFunc func(payload []byte) error
 	jobs       map[string]*Job
 }
 
-func (w *workerMock) Start(ctx context.Context, job *Job) error  { return w.startFunc(ctx, job) }
-func (w *workerMock) Stop(ctx context.Context, key string) error { return w.stopFunc(ctx, key) }
-func (w *workerMock) Notify(ctx context.Context, p []byte) error { return w.notifyFunc(ctx, p) }
+func (w *workerMock) Start(job *Job) error  { return w.startFunc(job) }
+func (w *workerMock) Stop(key string) error { return w.stopFunc(key) }
+func (w *workerMock) Notify(p []byte) error { return w.notifyFunc(p) }
 
 func TestDispatchJobOneWorker(t *testing.T) {
 	var (
@@ -116,9 +116,9 @@ func newTestNode(t *testing.T, ctx context.Context, rdb *redis.Client, name stri
 func newTestWorker(t *testing.T, ctx context.Context, node *Node) *Worker {
 	t.Helper()
 	wm := &workerMock{jobs: make(map[string]*Job)}
-	wm.startFunc = func(_ context.Context, job *Job) error { wm.jobs[job.Key] = job; return nil }
-	wm.stopFunc = func(_ context.Context, key string) error { delete(wm.jobs, key); return nil }
-	wm.notifyFunc = func(_ context.Context, payload []byte) error { return nil }
+	wm.startFunc = func(job *Job) error { wm.jobs[job.Key] = job; return nil }
+	wm.stopFunc = func(key string) error { delete(wm.jobs, key); return nil }
+	wm.notifyFunc = func(payload []byte) error { return nil }
 	worker, err := node.AddWorker(ctx, wm)
 	require.NoError(t, err)
 	return worker
@@ -135,6 +135,7 @@ func numJobs(t *testing.T, w *Worker) int {
 	defer w.lock.Unlock()
 	return len(w.jobs)
 }
+
 func cleanup(t *testing.T, rdb *redis.Client, checkClean bool, testName string) {
 	t.Helper()
 	ctx := context.Background()
