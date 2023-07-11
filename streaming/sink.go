@@ -12,9 +12,9 @@ import (
 	"github.com/oklog/ulid/v2"
 	redis "github.com/redis/go-redis/v9"
 
-	"goa.design/ponos/ponos"
-	"goa.design/ponos/rmap"
-	"goa.design/ponos/streaming/options"
+	"goa.design/pulse/pulse"
+	"goa.design/pulse/rmap"
+	"goa.design/pulse/streaming/options"
 )
 
 var (
@@ -78,7 +78,7 @@ type (
 		// considered unacknowledged.
 		ackGracePeriod time.Duration
 		// logger is the logger used by the sink.
-		logger ponos.Logger
+		logger pulse.Logger
 		// rdb is the redis connection.
 		rdb *redis.Client
 	}

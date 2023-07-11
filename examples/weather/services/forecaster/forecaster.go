@@ -10,12 +10,12 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"goa.design/clue/log"
-	"goa.design/ponos/ponos"
-	"goa.design/ponos/rmap"
+	"goa.design/pulse/pulse"
+	"goa.design/pulse/rmap"
 
-	"goa.design/ponos/examples/weather/services/forecaster/clients/poller"
-	genforecaster "goa.design/ponos/examples/weather/services/forecaster/gen/forecaster"
-	genpoller "goa.design/ponos/examples/weather/services/poller/gen/poller"
+	"goa.design/pulse/examples/weather/services/forecaster/clients/poller"
+	genforecaster "goa.design/pulse/examples/weather/services/forecaster/gen/forecaster"
+	genpoller "goa.design/pulse/examples/weather/services/poller/gen/poller"
 )
 
 type (
@@ -41,7 +41,7 @@ var maxForecastWaitDelay = 10 * time.Second
 
 // New instantiates a new forecast service.
 func New(ctx context.Context, pollerc poller.Client, rdb *redis.Client) *Service {
-	fmap, err := rmap.Join(ctx, forecastCacheMap, rdb, rmap.WithLogger(ponos.ClueLogger(ctx)))
+	fmap, err := rmap.Join(ctx, forecastCacheMap, rdb, rmap.WithLogger(pulse.ClueLogger(ctx)))
 	if err != nil {
 		log.Errorf(ctx, err, "failed to initialize Redis map")
 		os.Exit(1)

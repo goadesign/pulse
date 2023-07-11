@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"goa.design/clue/log"
 
-	"goa.design/ponos/ponos"
+	"goa.design/pulse/pulse"
 )
 
 var redisPwd = "redispassword"
@@ -105,7 +105,7 @@ func TestClose(t *testing.T) {
 func newTestNode(t *testing.T, ctx context.Context, rdb *redis.Client, name string) *Node {
 	t.Helper()
 	node, err := AddNode(ctx, name, rdb,
-		WithLogger(ponos.ClueLogger(ctx)),
+		WithLogger(pulse.ClueLogger(ctx)),
 		WithWorkerShutdownTTL(100*time.Millisecond),
 		WithJobSinkBlockDuration(50*time.Millisecond),
 		WithWorkerTTL(50*time.Millisecond))

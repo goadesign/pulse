@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"goa.design/ponos/ponos"
+	"goa.design/pulse/pulse"
 )
 
 func TestStreamOptions(t *testing.T) {
@@ -21,7 +21,7 @@ func TestStreamOptions(t *testing.T) {
 			opts: []Stream{},
 			want: StreamOptions{
 				MaxLen: 1000,
-				Logger: ponos.NoopLogger(),
+				Logger: pulse.NoopLogger(),
 			},
 		},
 		{
@@ -29,15 +29,15 @@ func TestStreamOptions(t *testing.T) {
 			opts: []Stream{WithStreamMaxLen(10)},
 			want: StreamOptions{
 				MaxLen: 10,
-				Logger: ponos.NoopLogger(),
+				Logger: pulse.NoopLogger(),
 			},
 		},
 		{
 			name: "custom logger",
-			opts: []Stream{WithStreamLogger(ponos.StdLogger(log.Default()))},
+			opts: []Stream{WithStreamLogger(pulse.StdLogger(log.Default()))},
 			want: StreamOptions{
 				MaxLen: 1000,
-				Logger: ponos.StdLogger(log.Default()),
+				Logger: pulse.StdLogger(log.Default()),
 			},
 		},
 	}

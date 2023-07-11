@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 
-	genforecaster "goa.design/ponos/examples/weather/services/forecaster/gen/forecaster"
-	genpoller "goa.design/ponos/examples/weather/services/poller/gen/poller"
+	genforecaster "goa.design/pulse/examples/weather/services/forecaster/gen/forecaster"
+	genpoller "goa.design/pulse/examples/weather/services/poller/gen/poller"
 )
 
 // marshalForecast marshals a forecast into a byte slice using binary encoding.

@@ -1,6 +1,6 @@
 package rmap
 
-import "goa.design/ponos/ponos"
+import "goa.design/pulse/pulse"
 
 type (
 	// MapOption is a Map creation option.
@@ -9,12 +9,12 @@ type (
 	options struct {
 		// Channel name
 		// Logger
-		Logger ponos.Logger
+		Logger pulse.Logger
 	}
 )
 
 // WithLogger sets the logger used by the map.
-func WithLogger(logger ponos.Logger) MapOption {
+func WithLogger(logger pulse.Logger) MapOption {
 	return func(o *options) {
 		o.Logger = logger
 	}
@@ -33,6 +33,6 @@ func parseOptions(opts ...MapOption) *options {
 // defaultOptions returns the default options.
 func defaultOptions() *options {
 	return &options{
-		Logger: ponos.NoopLogger(),
+		Logger: pulse.NoopLogger(),
 	}
 }

@@ -1,6 +1,6 @@
 # Replicated Map Basics Example
 
-This example demonstrates the basic usage of a replicated map using the `rmap` package from the `goadesign/ponos` repository.
+This example demonstrates the basic usage of a replicated map using the `rmap` package from the `goadesign/pulse` repository.
 
 ## Running the Example
 
@@ -10,19 +10,19 @@ To run the example, follow these steps:
 
 2. Open a terminal or command prompt.
 
-3. Clone the `goadesign/ponos` repository by running the following command:
+3. Clone the `goadesign/pulse` repository by running the following command:
    ```
-   git clone https://github.com/goadesign/ponos.git
+   git clone https://github.com/goadesign/pulse.git
    ```
 
 4. Change into the `examples/rmap/basics` directory:
    ```
-   cd ponos/examples/rmap/basics
+   cd pulse/examples/rmap/basics
    ```
 
 5. Install the required dependencies by running the following command:
    ```
-   go get github.com/redis/go-redis/v9 goa.design/ponos/rmap
+   go get github.com/redis/go-redis/v9 goa.design/pulse/rmap
    ```
 
 6. Build the Go program by executing the following command:

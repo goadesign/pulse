@@ -3,7 +3,7 @@
 // Poller service
 //
 // Command:
-// $ goa gen goa.design/ponos/examples/weather/services/poller/design -o
+// $ goa gen goa.design/pulse/examples/weather/services/poller/design -o
 // services/poller
 
 package poller

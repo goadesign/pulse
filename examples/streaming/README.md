@@ -1,6 +1,6 @@
 # Streaming Examples
 
-The examples in the subdirectories demonstrate the basic usage of the `streaming` package from the `goadesign/ponos` repository.
+The examples in the subdirectories demonstrate the basic usage of the `streaming` package from the `goadesign/pulse` repository.
 
 ## Running the Examples
 
@@ -10,20 +10,20 @@ To run the examples, follow these steps:
 
 2. Open a terminal or command prompt.
 
-3. Clone the `goadesign/ponos` repository by running the following command:
+3. Clone the `goadesign/pulse` repository by running the following command:
    ```
-   git clone https://github.com/goadesign/ponos.git
+   git clone https://github.com/goadesign/pulse.git
    ```
 
 4. Change into the example directory (e.g. `examples/streaming/single-reader`):
    ```
-   cd ponos/examples/streaming/single-reader
+   cd pulse/examples/streaming/single-reader
    ```
    ```
 
 5. Install the required dependencies by running the following command:
    ```
-   go get github.com/redis/go-redis/v9 goa.design/ponos/rmap
+   go get github.com/redis/go-redis/v9 goa.design/pulse/rmap
    ```
 
 6. Build the Go program by executing the following command:

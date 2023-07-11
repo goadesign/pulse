@@ -7,7 +7,7 @@ import (
 	"sync"
 
 	"github.com/redis/go-redis/v9"
-	"goa.design/ponos/rmap"
+	"goa.design/pulse/rmap"
 )
 
 func main() {

@@ -3,7 +3,7 @@
 // Forecast Poller Service API HTTP client CLI support package
 //
 // Command:
-// $ goa gen goa.design/ponos/examples/weather/services/poller/design -o
+// $ goa gen goa.design/pulse/examples/weather/services/poller/design -o
 // services/poller
 
 package cli
@@ -16,7 +16,7 @@ import (
 
 	goahttp "goa.design/goa/v3/http"
 	goa "goa.design/goa/v3/pkg"
-	pollerc "goa.design/ponos/examples/weather/services/poller/gen/http/poller/client"
+	pollerc "goa.design/pulse/examples/weather/services/poller/gen/http/poller/client"
 )
 
 // UsageCommands returns the set of commands and sub-commands using the format

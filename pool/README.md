@@ -1,6 +1,6 @@
 # Dedicated Worker Pool
 
-The `pool` package builds on top of the Ponos [rmap](../rmap/README.md) and
+The `pool` package builds on top of the Pulse [rmap](../rmap/README.md) and
 [streaming](../streaming/README.md) packages to provide scalable and reliable
 dedicated worker pools.
 
@@ -16,7 +16,7 @@ automatically re-assigned to workers when the pool grows or shrinks. This makes
 it possible to implement auto-scaling solutions, for example based on queueing
 delays.
 
-Ponos uses the [Jump Consistent Hash](https://arxiv.org/abs/1406.2294) algorithm
+Pulse uses the [Jump Consistent Hash](https://arxiv.org/abs/1406.2294) algorithm
 to assign jobs to workers which provides a good balance between load balancing
 and worker assignment stability.
 
@@ -37,10 +37,10 @@ flowchart LR
     Reader-.->|Job|B
 
     classDef userCode fill:#9A6D1F, stroke:#D9B871, stroke-width:2px, color:#FFF2CC;
-    classDef ponos fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
+    classDef pulse fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
 
     class A,B userCode;
-    class Pool,Sink,Reader,Worker ponos;
+    class Pool,Sink,Reader,Worker pulse;
 
     linkStyle 0 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
     linkStyle 1 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
@@ -49,12 +49,12 @@ flowchart LR
 
 ## Usage
 
-Ponos dedicated worker pools are generally valuable when workers require
+Pulse dedicated worker pools are generally valuable when workers require
 state which depends on the jobs they perform.
 
 To illustrate, let's consider the scenario of a multitenant system that requires
 managing a collection of background tasks for each tenant. In this case,
-utilizing a Ponos worker pool proves to be highly beneficial. The system can
+utilizing a Pulse worker pool proves to be highly beneficial. The system can
 create a dedicated worker pool and create one job per tenant, utilizing the
 unique tenant identifier as the job key. This approach ensures that only one
 worker handles the background task for a specific tenant at any given time. As
@@ -62,7 +62,7 @@ new tenants are added or old ones are removed, jobs can be started or stopped
 accordingly. Similarly, workers can be added or removed based on performance
 requirements.
 
-Ponos dedicated worker pools are not needed when workers are stateless and can
+Pulse dedicated worker pools are not needed when workers are stateless and can
 be scaled horizontally. In such cases, any standard load balancing solution can
 be used.
 
@@ -163,14 +163,14 @@ is invalid, the node is closed or the pool shutdown.
 ## Data Flows
 
 The following sections provide additional details on the internal data flows
-involved in creating and using a Ponos worker pool. They are provided for
+involved in creating and using a Pulse worker pool. They are provided for
 informational purposes only and are not required reading for simply using the
 package.
 
 ### Adding A New Job
 
 The following diagram illustrates the data flow involved in adding a new job to
-a Ponos worker pool:
+a Pulse worker pool:
 
 * The producer calls `DispatchJob` which adds an event to the pool job stream.
 * The pool job stream is read by the pool sink running in one of the pool nodes.
@@ -243,7 +243,7 @@ ensures that unhealthy workers are properly ignored when requeuing jobs.
 ### Shutdown and Cleanup
 
 The following diagram illustrates the data flow involved in shutting down a
-Ponos worker pool:
+Pulse worker pool:
 
 * The producer calls `Shutdown` which adds a shutdown event to the pool stream.
 * Upon receving the shutdown event the pool node closes the pool stream to avoid

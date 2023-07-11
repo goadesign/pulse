@@ -3,7 +3,7 @@
 // Forecaster HTTP client encoders and decoders
 //
 // Command:
-// $ goa gen goa.design/ponos/examples/weather/services/forecaster/design -o
+// $ goa gen goa.design/pulse/examples/weather/services/forecaster/design -o
 // services/forecaster
 
 package client
@@ -16,7 +16,7 @@ import (
 	"net/url"
 
 	goahttp "goa.design/goa/v3/http"
-	forecaster "goa.design/ponos/examples/weather/services/forecaster/gen/forecaster"
+	forecaster "goa.design/pulse/examples/weather/services/forecaster/gen/forecaster"
 )
 
 // BuildForecastRequest instantiates a HTTP request object with method and path

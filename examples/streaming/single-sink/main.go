@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
-	"goa.design/ponos/streaming"
-	"goa.design/ponos/streaming/options"
+	"goa.design/pulse/streaming"
+	"goa.design/pulse/streaming/options"
 )
 
 func main() {

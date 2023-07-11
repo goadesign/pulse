@@ -5,7 +5,7 @@ microservices.
 
 ## Overview
 
-Ponos replicated maps leverage Redis hashes and pub/sub to maintain replicated
+Pulse replicated maps leverage Redis hashes and pub/sub to maintain replicated
 in-memory copies of a map across multiple nodes. Any change to the map is
 automatically replicated to all nodes and results in a notification that can be
 used to trigger actions.

@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	genpoller "goa.design/ponos/examples/weather/services/poller/gen/poller"
+	genpoller "goa.design/pulse/examples/weather/services/poller/gen/poller"
 )
 
 func TestMarshalLocation(t *testing.T) {

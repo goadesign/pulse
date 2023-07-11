@@ -11,8 +11,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"goa.design/clue/log"
-	"goa.design/ponos/ponos"
-	"goa.design/ponos/streaming/options"
+	"goa.design/pulse/pulse"
+	"goa.design/pulse/streaming/options"
 )
 
 var (
@@ -28,7 +28,7 @@ func TestNewSink(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	defer cleanup(t, rdb, testName)
 	ctx := testContext(t)
-	s, err := NewStream(testName, rdb, options.WithStreamLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	sink, err := s.NewSink(ctx, "sink")
 	assert.NoError(t, err)
@@ -41,7 +41,7 @@ func TestReadOnce(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	defer cleanup(t, rdb, testName)
 	ctx := testContext(t)
-	s, err := NewStream(testName, rdb, options.WithStreamLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	sink, err := s.NewSink(ctx, "sink",
 		options.WithSinkStartAtOldest(),
@@ -62,7 +62,7 @@ func TestReadSinceLastEvent(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	defer cleanup(t, rdb, testName)
 	ctx := testContext(t)
-	s, err := NewStream(testName, rdb, options.WithStreamLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
 
 	// Add and read 2 events consecutively
@@ -116,7 +116,7 @@ func TestCleanup(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	defer cleanup(t, rdb, testName)
 	ctx := testContext(t)
-	s, err := NewStream(testName, rdb, options.WithStreamLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	sink, err := s.NewSink(ctx, "sink",
 		options.WithSinkStartAtOldest(),
@@ -144,13 +144,13 @@ func TestAddStream(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	defer cleanup(t, rdb, testName)
 	ctx := testContext(t)
-	s, err := NewStream(testName, rdb, options.WithStreamLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	sink, err := s.NewSink(ctx, "sink",
 		options.WithSinkStartAtOldest(),
 		options.WithSinkBlockDuration(testBlockDuration))
 	require.NoError(t, err)
-	s2, err := NewStream(testName+"2", rdb, options.WithStreamLogger(ponos.ClueLogger(ctx)))
+	s2, err := NewStream(testName+"2", rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	assert.NoError(t, sink.AddStream(ctx, s2))
 	assert.NoError(t, sink.AddStream(ctx, s2)) // Make sure it's idempotent
@@ -178,13 +178,13 @@ func TestRemoveStream(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	defer cleanup(t, rdb, testName)
 	ctx := testContext(t)
-	s, err := NewStream(testName, rdb, options.WithStreamLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	sink, err := s.NewSink(ctx, "sink",
 		options.WithSinkStartAtOldest(),
 		options.WithSinkBlockDuration(testBlockDuration))
 	require.NoError(t, err)
-	s2, err := NewStream("testRemoveStream2", rdb, options.WithStreamLogger(ponos.ClueLogger(ctx)))
+	s2, err := NewStream("testRemoveStream2", rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	err = sink.AddStream(ctx, s2)
 	assert.NoError(t, err)
@@ -230,7 +230,7 @@ func TestMultipleConsumers(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	defer cleanup(t, rdb, testName)
 	ctx := testContext(t)
-	s, err := NewStream(testName, rdb, options.WithStreamLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	sink, err := s.NewSink(ctx, "sink",
 		options.WithSinkStartAtOldest(),
@@ -287,7 +287,7 @@ func TestClaimStaleMessages(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	defer cleanup(t, rdb, testName)
 	ctx := testContext(t)
-	s, err := NewStream(testName, rdb, options.WithStreamLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	sink, err := s.NewSink(ctx, "sink",
 		options.WithSinkStartAtOldest(),

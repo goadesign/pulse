@@ -3,7 +3,7 @@
 // Poller HTTP client encoders and decoders
 //
 // Command:
-// $ goa gen goa.design/ponos/examples/weather/services/poller/design -o
+// $ goa gen goa.design/pulse/examples/weather/services/poller/design -o
 // services/poller
 
 package client
@@ -16,7 +16,7 @@ import (
 	"net/url"
 
 	goahttp "goa.design/goa/v3/http"
-	poller "goa.design/ponos/examples/weather/services/poller/gen/poller"
+	poller "goa.design/pulse/examples/weather/services/poller/gen/poller"
 )
 
 // BuildAddLocationRequest instantiates a HTTP request object with method and

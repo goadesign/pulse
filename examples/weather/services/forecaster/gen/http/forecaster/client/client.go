@@ -3,7 +3,7 @@
 // Forecaster client HTTP transport
 //
 // Command:
-// $ goa gen goa.design/ponos/examples/weather/services/forecaster/design -o
+// $ goa gen goa.design/pulse/examples/weather/services/forecaster/design -o
 // services/forecaster
 
 package client

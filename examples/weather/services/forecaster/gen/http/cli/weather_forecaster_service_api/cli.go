@@ -3,7 +3,7 @@
 // Weather Forecaster Service API HTTP client CLI support package
 //
 // Command:
-// $ goa gen goa.design/ponos/examples/weather/services/forecaster/design -o
+// $ goa gen goa.design/pulse/examples/weather/services/forecaster/design -o
 // services/forecaster
 
 package cli
@@ -16,7 +16,7 @@ import (
 
 	goahttp "goa.design/goa/v3/http"
 	goa "goa.design/goa/v3/pkg"
-	forecasterc "goa.design/ponos/examples/weather/services/forecaster/gen/http/forecaster/client"
+	forecasterc "goa.design/pulse/examples/weather/services/forecaster/gen/http/forecaster/client"
 )
 
 // UsageCommands returns the set of commands and sub-commands using the format

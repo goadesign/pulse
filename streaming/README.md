@@ -1,7 +1,7 @@
 # Streaming
 
-Ponos leverages Redis streams to provide scalable and reliable event streams
-that can be used to implement distributed architectures. Ponos provides a simple
+Pulse leverages Redis streams to provide scalable and reliable event streams
+that can be used to implement distributed architectures. Pulse provides a simple
 API to create and consume streams, for example:
 
 [![Single Reader](../snippets/single-reader.png)](../examples/streaming/single-reader/main.go#L21-L51)
@@ -17,10 +17,10 @@ flowchart LR
     Reader-.->|Event|main
 
     classDef userCode fill:#9A6D1F, stroke:#D9B871, stroke-width:2px, color:#FFF2CC;
-    classDef ponos fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
+    classDef pulse fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
 
     class main userCode;
-    class Stream,Reader ponos;
+    class Stream,Reader pulse;
 
     linkStyle 0 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
     linkStyle 1 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
@@ -43,10 +43,10 @@ flowchart LR
     Stream-.->|Event 2|Reader2[Other Reader]
 
     classDef userCode fill:#9A6D1F, stroke:#D9B871, stroke-width:2px, color:#FFF2CC;
-    classDef ponos fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
+    classDef pulse fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
 
     class main userCode;
-    class Stream,Reader,Reader2 ponos;
+    class Stream,Reader,Reader2 pulse;
 
     linkStyle 0 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
     linkStyle 1 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
@@ -67,7 +67,7 @@ same sink (i.e. a sink with the same name), then each node will receive a unique
 event from the sequence. Nodes using a different sink (or a reader) will receive
 copies of the same events.  
 
-Events read from a sink must be acknowledged by the client. Ponos automatically
+Events read from a sink must be acknowledged by the client. Pulse automatically
 requeues events added to a sink that have been read by a node but not
 acknowledged.
 
@@ -94,10 +94,10 @@ flowchart LR
     main-->|Ack|Sink
 
     classDef userCode fill:#9A6D1F, stroke:#D9B871, stroke-width:2px, color:#FFF2CC;
-    classDef ponos fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
+    classDef pulse fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
 
     class main userCode;
-    class Stream,Sink ponos;
+    class Stream,Sink pulse;
 
     linkStyle 0 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
     linkStyle 1 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
@@ -122,10 +122,10 @@ flowchart LR
     Stream-.->|Event 2|Sink2[Other Sink]
 
     classDef userCode fill:#9A6D1F, stroke:#D9B871, stroke-width:2px, color:#FFF2CC;
-    classDef ponos fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
+    classDef pulse fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
 
     class main userCode;
-    class Stream,Sink,Sink2 ponos;
+    class Stream,Sink,Sink2 pulse;
 
     linkStyle 0 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
     linkStyle 1 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
@@ -155,10 +155,10 @@ flowchart LR
     Stream2-.->|Event 2|Sink
 
     classDef userCode fill:#9A6D1F, stroke:#D9B871, stroke-width:2px, color:#FFF2CC;
-    classDef ponos fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
+    classDef pulse fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
 
     class main userCode;
-    class Stream,Stream2,Sink ponos;
+    class Stream,Stream2,Sink pulse;
 
     linkStyle 0 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
     linkStyle 1 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
@@ -198,10 +198,10 @@ flowchart RL
     main-->|Ack 2|Sink
 
     classDef userCode fill:#9A6D1F, stroke:#D9B871, stroke-width:2px, color:#FFF2CC;
-    classDef ponos fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
+    classDef pulse fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
 
     class main userCode;
-    class Stream,Topic,Topic2,Sink ponos;
+    class Stream,Topic,Topic2,Sink pulse;
 
     linkStyle 0 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
     linkStyle 1 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;

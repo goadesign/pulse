@@ -13,7 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"goa.design/clue/log"
-	"goa.design/ponos/ponos"
+	"goa.design/pulse/pulse"
 )
 
 var (
@@ -229,7 +229,7 @@ func TestLogs(t *testing.T) {
 	ctx := context.Background()
 	ctx = log.Context(ctx, log.WithOutput(&buf), log.WithDebug())
 
-	m, err := Join(ctx, "test", rdb, WithLogger(ponos.ClueLogger(ctx)))
+	m, err := Join(ctx, "test", rdb, WithLogger(pulse.ClueLogger(ctx)))
 	require.NoError(t, err)
 	assert.NoError(t, m.Reset(ctx))
 
@@ -328,7 +328,7 @@ func TestReconnect(t *testing.T) {
 	ctx = log.Context(ctx, log.WithOutput(&buf))
 	log.FlushAndDisableBuffering(ctx)
 
-	m, err := Join(ctx, "test", rdb, WithLogger(ponos.ClueLogger(ctx)))
+	m, err := Join(ctx, "test", rdb, WithLogger(pulse.ClueLogger(ctx)))
 	require.NoError(t, err)
 	defer cleanup(t, m)
 

@@ -21,7 +21,7 @@ carbon() {
                 --start "$start_line" \
                 --end "$end_line" \
                 --config snippets/carbon-config.json \
-                --preset "ponos" \
+                --preset "pulse" \
                 --save-as "snippets/$output_file"
 }
 

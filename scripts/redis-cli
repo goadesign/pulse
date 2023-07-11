@@ -1,3 +1,3 @@
 #!/bin/bash
 source .env
-docker container run --network redis_default -it --link ponos-redis:redis --rm redis redis-cli -h redis -p 6379 -a $REDIS_PASSWORD
+docker container run --network redis_default -it --link pulse-redis:redis --rm redis redis-cli -h redis -p 6379 -a $REDIS_PASSWORD

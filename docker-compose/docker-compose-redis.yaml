@@ -2,7 +2,7 @@ version: "3"
 services:
   redis:
     image: "redis"
-    container_name: "ponos-redis"
+    container_name: "pulse-redis"
     command: redis-server --save 20 1 --loglevel warning --requirepass ${REDIS_PASSWORD}
     ports:
       - "6379:6379"

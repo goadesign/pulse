@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 
-	genpoller "goa.design/ponos/examples/weather/services/poller/gen/poller"
+	genpoller "goa.design/pulse/examples/weather/services/poller/gen/poller"
 )
 
 const (

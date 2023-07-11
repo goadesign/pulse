@@ -14,24 +14,24 @@ var _ = Design("Weather System Architecture", "The Weather example system archit
 	})
 
 	var System = SoftwareSystem("Weather Software System", "Provides location based weather forecasts.", func() {
-		var ForecastStream = Container("Forecast Stream", "Ponos stream used by the Poller service worker to stream forecast updates.", "Go and Ponos", func() {
-			Tag("Ponos")
+		var ForecastStream = Container("Forecast Stream", "Pulse stream used by the Poller service worker to stream forecast updates.", "Go and Pulse", func() {
+			Tag("Pulse")
 		})
-		var WorkerPool = Container("Worker Pool", "Polls forecasts from weather.gov (code runs in Poller service process).", "Go and Ponos", func() {
+		var WorkerPool = Container("Worker Pool", "Polls forecasts from weather.gov (code runs in Poller service process).", "Go and Pulse", func() {
 			Uses(WeatherGov, "Makes requests to", "HTTP", Synchronous)
 			Tag("Pool")
 		})
-		var Poller = Container("Poller Service", "Leverages Ponos to poll weather.gov for weather forecasts.", "Go and Goa", func() {
-			Uses(ForecastStream, "Publishes forecast updates to", "Ponos", Synchronous)
-			Uses(ForecastStream, "Subscribes to forecast updates from", "Ponos", Asynchronous, func() {
+		var Poller = Container("Poller Service", "Leverages Pulse to poll weather.gov for weather forecasts.", "Go and Goa", func() {
+			Uses(ForecastStream, "Publishes forecast updates to", "Pulse", Synchronous)
+			Uses(ForecastStream, "Subscribes to forecast updates from", "Pulse", Asynchronous, func() {
 				Tag("Events")
 			})
-			Uses(WorkerPool, "Uses", "Ponos", Synchronous)
+			Uses(WorkerPool, "Uses", "Pulse", Synchronous)
 			Tag("Service")
 		})
-		Container("Forecaster Service", "Leverages Ponos to provide fast and efficient weather forecasts for US based locations.", "Go and Goa", func() {
+		Container("Forecaster Service", "Leverages Pulse to provide fast and efficient weather forecasts for US based locations.", "Go and Goa", func() {
 			Uses(Poller, "Creates new location forecast poll jobs using", "Goa", Synchronous)
-			Uses(Poller, "Subscribes to forecast updates from", "Ponos", Asynchronous)
+			Uses(Poller, "Subscribes to forecast updates from", "Pulse", Asynchronous)
 			Tag("Service")
 		})
 	})
@@ -60,7 +60,7 @@ var _ = Design("Weather System Architecture", "The Weather example system archit
 				Background("#e6e6ea")
 				Stroke("#f75c03")
 			})
-			ElementStyle("Ponos", func() {
+			ElementStyle("Pulse", func() {
 				Shape(ShapePipe)
 				Background("#e6e6ea")
 				Stroke("#f75c03")

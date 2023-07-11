@@ -1,7 +1,7 @@
 package options
 
 import (
-	"goa.design/ponos/ponos"
+	"goa.design/pulse/pulse"
 )
 
 type (
@@ -10,7 +10,7 @@ type (
 
 	StreamOptions struct {
 		MaxLen int
-		Logger ponos.Logger
+		Logger pulse.Logger
 	}
 )
 
@@ -22,7 +22,7 @@ func WithStreamMaxLen(len int) Stream {
 }
 
 // WithStreamLogger sets the logger used by the stream.
-func WithStreamLogger(logger ponos.Logger) Stream {
+func WithStreamLogger(logger pulse.Logger) Stream {
 	return func(o *StreamOptions) {
 		o.Logger = logger
 	}
@@ -42,6 +42,6 @@ func ParseStreamOptions(opts ...Stream) StreamOptions {
 func defaultStreamOptions() StreamOptions {
 	return StreamOptions{
 		MaxLen: 1000,
-		Logger: ponos.NoopLogger(),
+		Logger: pulse.NoopLogger(),
 	}
 }

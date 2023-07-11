@@ -12,8 +12,8 @@ import (
 
 	redis "github.com/redis/go-redis/v9"
 
-	"goa.design/ponos/ponos"
-	"goa.design/ponos/streaming/options"
+	"goa.design/pulse/pulse"
+	"goa.design/pulse/streaming/options"
 )
 
 type (
@@ -54,7 +54,7 @@ type (
 		// eventFilter is the event filter if any.
 		eventFilter eventFilterFunc
 		// logger is the logger used by the reader.
-		logger ponos.Logger
+		logger pulse.Logger
 		// rdb is the redis connection.
 		rdb *redis.Client
 	}
@@ -300,7 +300,7 @@ func readOnce(
 	readFn func(context.Context) ([]redis.XStream, error),
 	streamschan chan struct{},
 	donechan chan struct{},
-	logger ponos.Logger,
+	logger pulse.Logger,
 ) ([]redis.XStream, error) {
 
 	readchan := make(chan []redis.XStream)
@@ -352,7 +352,7 @@ func streamEvents(
 	eventFilter eventFilterFunc,
 	chans []chan *Event,
 	rdb *redis.Client,
-	logger ponos.Logger,
+	logger pulse.Logger,
 ) {
 	if len(msgs) == 0 {
 		return
@@ -384,7 +384,7 @@ func streamEvents(
 }
 
 // handleReadError retries retryable read errors and ignores non-retryable.
-func handleReadError(err error, logger ponos.Logger) error {
+func handleReadError(err error, logger pulse.Logger) error {
 	if strings.Contains(err.Error(), "stream key no longer exists") {
 		return err // Fatal error
 	}

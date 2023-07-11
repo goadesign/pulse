@@ -1,6 +1,6 @@
 /*
 Package poller implments a simple poller for the weather service.
-It consists of a Ponos worker that periodically calls the weather service
+It consists of a Pulse worker that periodically calls the weather service
 to retrieve the weather forecast for given US cities.
 */
 package poller
@@ -13,23 +13,23 @@ import (
 	"time"
 
 	"goa.design/clue/log"
-	"goa.design/ponos/pool"
-	"goa.design/ponos/streaming"
-	"goa.design/ponos/streaming/options"
+	"goa.design/pulse/pool"
+	"goa.design/pulse/streaming"
+	"goa.design/pulse/streaming/options"
 
-	"goa.design/ponos/examples/weather/services/poller/clients/nominatim"
-	"goa.design/ponos/examples/weather/services/poller/clients/weathergov"
-	genpoller "goa.design/ponos/examples/weather/services/poller/gen/poller"
+	"goa.design/pulse/examples/weather/services/poller/clients/nominatim"
+	"goa.design/pulse/examples/weather/services/poller/clients/weathergov"
+	genpoller "goa.design/pulse/examples/weather/services/poller/gen/poller"
 )
 
 type (
-	// Worker is the type that implements the Ponos worker interface.
+	// Worker is the type that implements the Pulse worker interface.
 	Worker struct {
 		// nominatimc is the Nominatim client.
 		nominatimc nominatim.Client
 		// weatherc is weather service client.
 		weatherc weathergov.Client
-		// updateStream is the Ponos update stream.
+		// updateStream is the Pulse update stream.
 		updateStream *streaming.Stream
 		// Lock protects the locations map.
 		lock sync.Mutex
@@ -63,7 +63,7 @@ func NewWorker(ctx context.Context, updateStream *streaming.Stream, nominatimc n
 }
 
 // Start starts polling the weather service for the city and state encoded in
-// the Ponos job payload and associates the poller with the given key.
+// the Pulse job payload and associates the poller with the given key.
 func (worker *Worker) Start(job *pool.Job) error {
 	ctx := worker.logContext
 	city, state, err := unmarshalCityAndState(job.Payload)

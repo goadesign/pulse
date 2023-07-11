@@ -1,23 +1,23 @@
-# Weather Ponos Example
+# Weather pulse Example
 
-This example showcases the use of the various Ponos packages to build a simple
+This example showcases the use of the various Pulse packages to build a simple
 weather forecast service that minimizes API requests and provides very fast
 response times. The system consists of two components:
 
-- A poller service that leverages a Ponos worker pool and streaming to poll
-        weather forecasts. The service exposes APIs to start poll jobs and subscribe
-        to location specific weather forecast updates. The service also exposes
-        "control" APIs to query statistics for the poll jobs, add or remove workers.
+- A poller service that leverages a Pulse worker pool and streaming to poll
+  weather forecasts. The service exposes APIs to start poll jobs and subscribe
+  to location specific weather forecast updates. The service also exposes
+  "control" APIs to query statistics for the poll jobs, add or remove workers.
 
 - A Forecaster service which provides HTTP APIs to query the latest forecast for
-        a given location. The Forecaster service leverages the poller service to
-        create new forecast poll jobs and to subscribe to updates. 
+  a given location. The Forecaster service leverages the poller service to
+  create new forecast poll jobs and to subscribe to updates. 
 
-The Forecaster service employs a cache system using a Ponos replicated map to
+The Forecaster service employs a cache system using a Pulse replicated map to
 store and retrieve the latest weather forecasts for different locations. When a
 forecast request is received, the service checks the cache and returns the
 cached forecast if available. In case of a cache miss, the forecaster service
-makes a request to the poller service which initiates a Ponos job to fetch the
+makes a request to the poller service which initiates a Pulse job to fetch the
 forecast from the weather API. The Forecaster service then subscribes to the
 replicated map and waits for the forecast to be available in the cache.
 
@@ -39,9 +39,9 @@ example:
 
 - `setup` downloads build dependencies and builds the example.
 - `server` runs the services using
-        [overmind](https://github.com/DarthSim/overmind). `server` also starts
-        `docker-compose` with a configuration that runs Redis, the Grafana agent,
-        cortex, tempo and dashboard locally.
+  [overmind](https://github.com/DarthSim/overmind). `server` also starts
+  `docker-compose` with a configuration that runs Redis, the Grafana agent,
+  cortex, tempo and dashboard locally.
 
 ### Making a Request
 
@@ -156,7 +156,7 @@ service. The mock is used by the service unit tests.
 
 The `waitForForecast` function in the `forecaster.go` file in the Forecaster
 service implements the logic to wait for a specific key to be available in a
-Ponos replicated map with a specific timeout. The function makes use of a
+Pulse replicated map with a specific timeout. The function makes use of a
 `select` statement to wait for replicated map updates or a timeout:
 
 ```go
@@ -181,7 +181,7 @@ func (svc *Service) waitForecast(ctx context.Context, city, state string) (strin
 }
 ```
 
-The `Subscribe` method of the Poller service shows how to forward Ponos stream events
+The `Subscribe` method of the Poller service shows how to forward Pulse stream events
 to a WebSocket connection:
 
 ```go

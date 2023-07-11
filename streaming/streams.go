@@ -6,8 +6,8 @@ import (
 	"regexp"
 
 	redis "github.com/redis/go-redis/v9"
-	"goa.design/ponos/ponos"
-	"goa.design/ponos/streaming/options"
+	"goa.design/pulse/pulse"
+	"goa.design/pulse/streaming/options"
 )
 
 type (
@@ -22,9 +22,9 @@ type (
 		// MaxLen is the maximum number of events in the stream.
 		MaxLen int
 		// logger is the logger used by the stream.
-		logger ponos.Logger
+		logger pulse.Logger
 		// rootLogger is the prefix-free logger used to create sink loggers.
-		rootLogger ponos.Logger
+		rootLogger pulse.Logger
 		// key is the redis key used for the stream.
 		key string
 		// rdb is the redis connection.
@@ -34,7 +34,7 @@ type (
 
 const (
 	// streamKeyPrefix is the prefix used for stream keys.
-	streamKeyPrefix = "ponos:stream:"
+	streamKeyPrefix = "pulse:stream:"
 	// nameKey is the key used to store the event name.
 	nameKey = "n"
 	// payloadKey is the key used to store the event payload.
@@ -47,14 +47,14 @@ const (
 // with the same name share the same events.
 func NewStream(name string, rdb *redis.Client, opts ...options.Stream) (*Stream, error) {
 	if !isValidRedisKeyName(name) {
-		return nil, fmt.Errorf("ponos stream: not a valid name %q", name)
+		return nil, fmt.Errorf("pulse stream: not a valid name %q", name)
 	}
 	o := options.ParseStreamOptions(opts...)
-	var logger ponos.Logger
+	var logger pulse.Logger
 	if o.Logger != nil {
 		logger = o.Logger.WithPrefix("stream", name)
 	} else {
-		logger = ponos.NoopLogger()
+		logger = pulse.NoopLogger()
 	}
 	s := &Stream{
 		Name:       name,

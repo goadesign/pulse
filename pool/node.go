@@ -16,10 +16,10 @@ import (
 	redis "github.com/redis/go-redis/v9"
 
 	"goa.design/clue/log"
-	"goa.design/ponos/ponos"
-	"goa.design/ponos/rmap"
-	"goa.design/ponos/streaming"
-	soptions "goa.design/ponos/streaming/options"
+	"goa.design/pulse/pulse"
+	"goa.design/pulse/rmap"
+	"goa.design/pulse/streaming"
+	soptions "goa.design/pulse/streaming/options"
 )
 
 type (
@@ -37,7 +37,7 @@ type (
 		workerTTL         time.Duration     // Worker considered dead if keep-alive not updated after this duration
 		workerShutdownTTL time.Duration     // Worker considered dead if not shutdown after this duration
 		pendingJobTTL     time.Duration     // Job lease expires if not acked after this duration
-		logger            ponos.Logger
+		logger            pulse.Logger
 		h                 jumpHash
 		stop              chan struct{}  // closed when node is stopped
 		wg                sync.WaitGroup // allows to wait until all goroutines exit
@@ -86,7 +86,7 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...NodeOp
 	o := parseOptions(opts...)
 	logger := o.logger
 	if logger == nil {
-		logger = ponos.NoopLogger()
+		logger = pulse.NoopLogger()
 	}
 	wsm, err := rmap.Join(ctx, shutdownMapName(name), rdb, rmap.WithLogger(logger))
 	if err != nil {

@@ -2,7 +2,7 @@ package design
 
 import (
 	. "goa.design/goa/v3/dsl"
-	. "goa.design/ponos/examples/weather/design"
+	. "goa.design/pulse/examples/weather/design"
 )
 
 var _ = API("Weather Forecaster Service API", func() {

@@ -8,8 +8,8 @@ import (
 
 	redis "github.com/redis/go-redis/v9"
 	"goa.design/clue/log"
-	"goa.design/ponos/ponos"
-	"goa.design/ponos/pool"
+	"goa.design/pulse/pool"
+	"goa.design/pulse/pulse"
 )
 
 func main() {
@@ -22,7 +22,7 @@ func main() {
 	// Create client for node named "example"
 	node, err := pool.AddNode(ctx, "example", rdb,
 		pool.WithClientOnly(),
-		pool.WithLogger(ponos.ClueLogger(ctx)),
+		pool.WithLogger(pulse.ClueLogger(ctx)),
 	)
 	if err != nil {
 		panic(err)

@@ -1,4 +1,4 @@
-module goa.design/ponos
+module goa.design/pulse
 
 go 1.20
 

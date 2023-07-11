@@ -3,7 +3,7 @@
 // Poller HTTP client CLI support package
 //
 // Command:
-// $ goa gen goa.design/ponos/examples/weather/services/poller/design -o
+// $ goa gen goa.design/pulse/examples/weather/services/poller/design -o
 // services/poller
 
 package client
@@ -12,7 +12,7 @@ import (
 	"unicode/utf8"
 
 	goa "goa.design/goa/v3/pkg"
-	poller "goa.design/ponos/examples/weather/services/poller/gen/poller"
+	poller "goa.design/pulse/examples/weather/services/poller/gen/poller"
 )
 
 // BuildAddLocationPayload builds the payload for the Poller add_location

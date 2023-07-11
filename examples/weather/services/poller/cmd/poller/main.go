@@ -23,11 +23,11 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"goa.design/ponos/examples/weather/services/poller"
-	"goa.design/ponos/examples/weather/services/poller/clients/nominatim"
-	"goa.design/ponos/examples/weather/services/poller/clients/weathergov"
-	genhttp "goa.design/ponos/examples/weather/services/poller/gen/http/poller/server"
-	genpoller "goa.design/ponos/examples/weather/services/poller/gen/poller"
+	"goa.design/pulse/examples/weather/services/poller"
+	"goa.design/pulse/examples/weather/services/poller/clients/nominatim"
+	"goa.design/pulse/examples/weather/services/poller/clients/weathergov"
+	genhttp "goa.design/pulse/examples/weather/services/poller/gen/http/poller/server"
+	genpoller "goa.design/pulse/examples/weather/services/poller/gen/poller"
 )
 
 func main() {

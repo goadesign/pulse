@@ -10,8 +10,8 @@ import (
 	redis "github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"goa.design/ponos/ponos"
-	"goa.design/ponos/streaming/options"
+	"goa.design/pulse/pulse"
+	"goa.design/pulse/streaming/options"
 )
 
 func TestNewReader(t *testing.T) {
@@ -19,7 +19,7 @@ func TestNewReader(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	defer cleanup(t, rdb, testName)
 	ctx := testContext(t)
-	s, err := NewStream(testName, rdb, options.WithStreamLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	reader, err := s.NewReader(ctx)
 	assert.NoError(t, err)
@@ -32,7 +32,7 @@ func TestReaderReadOnce(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	defer cleanup(t, rdb, testName)
 	ctx := testContext(t)
-	s, err := NewStream(testName, rdb, options.WithStreamLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	reader, err := s.NewReader(ctx, options.WithReaderStartAtOldest(), options.WithReaderBlockDuration(testBlockDuration))
 	require.NoError(t, err)
@@ -51,7 +51,7 @@ func TestReaderReadSinceLastEvent(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	defer cleanup(t, rdb, testName)
 	ctx := testContext(t)
-	s, err := NewStream(testName, rdb, options.WithStreamLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
 
 	// Add and read 2 events consecutively
@@ -98,7 +98,7 @@ func TestCleanupReader(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	defer cleanup(t, rdb, testName)
 	ctx := testContext(t)
-	s, err := NewStream(testName, rdb, options.WithStreamLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	reader, err := s.NewReader(ctx, options.WithReaderStartAtOldest(), options.WithReaderBlockDuration(testBlockDuration))
 	require.NoError(t, err)
@@ -124,11 +124,11 @@ func TestAddReaderStream(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	defer cleanup(t, rdb, testName)
 	ctx := testContext(t)
-	s, err := NewStream("testAddStream", rdb, options.WithStreamLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream("testAddStream", rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	reader, err := s.NewReader(ctx, options.WithReaderStartAtOldest(), options.WithReaderBlockDuration(testBlockDuration))
 	require.NoError(t, err)
-	s2, err := NewStream("testAddStream2", rdb, options.WithStreamLogger(ponos.ClueLogger(ctx)))
+	s2, err := NewStream("testAddStream2", rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	assert.NoError(t, reader.AddStream(ctx, s2))
 	assert.NoError(t, reader.AddStream(ctx, s2)) // Make sure it's idempotent
@@ -156,9 +156,9 @@ func TestRemoveReaderStream(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	defer cleanup(t, rdb, testName)
 	ctx := testContext(t)
-	s, err := NewStream("testRemoveStream", rdb, options.WithStreamLogger(ponos.ClueLogger(ctx)))
+	s, err := NewStream("testRemoveStream", rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
-	s2, err := NewStream("testRemoveStream2", rdb, options.WithStreamLogger(ponos.ClueLogger(ctx)))
+	s2, err := NewStream("testRemoveStream2", rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	reader, err := s.NewReader(ctx, options.WithReaderStartAtOldest(), options.WithReaderBlockDuration(testBlockDuration))
 	require.NoError(t, err)

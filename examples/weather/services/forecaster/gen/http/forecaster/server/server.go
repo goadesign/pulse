@@ -3,7 +3,7 @@
 // Forecaster HTTP server
 //
 // Command:
-// $ goa gen goa.design/ponos/examples/weather/services/forecaster/design -o
+// $ goa gen goa.design/pulse/examples/weather/services/forecaster/design -o
 // services/forecaster
 
 package server
@@ -14,7 +14,7 @@ import (
 
 	goahttp "goa.design/goa/v3/http"
 	goa "goa.design/goa/v3/pkg"
-	forecaster "goa.design/ponos/examples/weather/services/forecaster/gen/forecaster"
+	forecaster "goa.design/pulse/examples/weather/services/forecaster/gen/forecaster"
 )
 
 // Server lists the Forecaster service endpoint HTTP handlers.

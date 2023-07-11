@@ -24,10 +24,10 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"goa.design/ponos/examples/weather/services/forecaster"
-	"goa.design/ponos/examples/weather/services/forecaster/clients/poller"
-	genforecaster "goa.design/ponos/examples/weather/services/forecaster/gen/forecaster"
-	genhttp "goa.design/ponos/examples/weather/services/forecaster/gen/http/forecaster/server"
+	"goa.design/pulse/examples/weather/services/forecaster"
+	"goa.design/pulse/examples/weather/services/forecaster/clients/poller"
+	genforecaster "goa.design/pulse/examples/weather/services/forecaster/gen/forecaster"
+	genhttp "goa.design/pulse/examples/weather/services/forecaster/gen/http/forecaster/server"
 )
 
 func main() {
@@ -89,7 +89,7 @@ func main() {
 	httpc := http.Client{Transport: transport}
 	pc := poller.New(scheme, host, &httpc)
 
-	// Ponos replicated map for forecast cache
+	// Pulse replicated map for forecast cache
 	opt, err := redis.ParseURL(*redisurl)
 	if err != nil {
 		log.Errorf(ctx, err, "failed to parse Redis URL")

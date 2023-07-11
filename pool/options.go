@@ -3,7 +3,7 @@ package pool
 import (
 	"time"
 
-	"goa.design/ponos/ponos"
+	"goa.design/pulse/pulse"
 )
 
 type (
@@ -17,7 +17,7 @@ type (
 		maxQueuedJobs        int
 		clientOnly           bool
 		jobSinkBlockDuration time.Duration
-		logger               ponos.Logger
+		logger               pulse.Logger
 	}
 )
 
@@ -72,7 +72,7 @@ func WithJobSinkBlockDuration(d time.Duration) NodeOption {
 }
 
 // WithLogger sets the handler used to report temporary errors.
-func WithLogger(logger ponos.Logger) NodeOption {
+func WithLogger(logger pulse.Logger) NodeOption {
 	return func(o *nodeOptions) {
 		o.logger = logger
 	}
@@ -96,6 +96,6 @@ func defaultPoolOptions() *nodeOptions {
 		workerShutdownTTL:    2 * time.Minute,
 		maxQueuedJobs:        1000,
 		jobSinkBlockDuration: 5 * time.Second,
-		logger:               ponos.NoopLogger(),
+		logger:               pulse.NoopLogger(),
 	}
 }

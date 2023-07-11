@@ -3,14 +3,14 @@
 // Poller HTTP client types
 //
 // Command:
-// $ goa gen goa.design/ponos/examples/weather/services/poller/design -o
+// $ goa gen goa.design/pulse/examples/weather/services/poller/design -o
 // services/poller
 
 package client
 
 import (
 	goa "goa.design/goa/v3/pkg"
-	poller "goa.design/ponos/examples/weather/services/poller/gen/poller"
+	poller "goa.design/pulse/examples/weather/services/poller/gen/poller"
 )
 
 // SubscribeResponseBody is the type of the "Poller" service "subscribe"

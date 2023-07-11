@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"goa.design/ponos/ponos"
+	"goa.design/pulse/pulse"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -30,7 +30,7 @@ type (
 		ichan   chan struct{}         // internal channel to send notifications
 		done    chan struct{}         // channel to signal shutdown
 		wait    sync.WaitGroup        // wait for read goroutine to exit
-		logger  ponos.Logger          // logger
+		logger  pulse.Logger          // logger
 		sub     *redis.PubSub         // subscription to map updates
 		set     *redis.Script
 		append  *redis.Script
@@ -136,7 +136,7 @@ const luaRemove = `
 // resources resulting in a read-only point-in-time copy.
 func Join(ctx context.Context, name string, rdb *redis.Client, opts ...MapOption) (*Map, error) {
 	if !isValidRedisKeyName(name) {
-		return nil, fmt.Errorf("ponos map: not a valid map name %q", name)
+		return nil, fmt.Errorf("pulse map: not a valid map name %q", name)
 	}
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
@@ -249,7 +249,7 @@ func (sm *Map) Set(ctx context.Context, key, value string) (string, error) {
 	sm.lock.Lock()
 	defer sm.lock.Unlock()
 	if sm.closing {
-		return "", fmt.Errorf("ponos map: %s is stopped", sm.Name)
+		return "", fmt.Errorf("pulse map: %s is stopped", sm.Name)
 	}
 	prev, err := sm.runLuaScript(ctx, "set", sm.set, key, value)
 	if err != nil {
@@ -275,7 +275,7 @@ func (sm *Map) SetAndWait(ctx context.Context, key, value string) (string, error
 			return "", ctx.Err()
 		case _, ok := <-sm.ichan:
 			if !ok {
-				return "", fmt.Errorf("ponos map: %s is stopped", sm.Name)
+				return "", fmt.Errorf("pulse map: %s is stopped", sm.Name)
 			}
 			if v, ok := sm.content[key]; ok && v == value {
 				return prev, nil
@@ -291,7 +291,7 @@ func (sm *Map) Inc(ctx context.Context, key string, delta int) (int, error) {
 	sm.lock.Lock()
 	defer sm.lock.Unlock()
 	if sm.closing {
-		return 0, fmt.Errorf("ponos map: %s is stopped", sm.Name)
+		return 0, fmt.Errorf("pulse map: %s is stopped", sm.Name)
 	}
 	res, err := sm.runLuaScript(ctx, "incr", sm.incr, key, delta)
 	if err != nil {
@@ -299,7 +299,7 @@ func (sm *Map) Inc(ctx context.Context, key string, delta int) (int, error) {
 	}
 	v, err := strconv.ParseInt(res.(string), 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("ponos map: %s: %s", key, err)
+		return 0, fmt.Errorf("pulse map: %s: %s", key, err)
 	}
 	return int(v), nil
 }
@@ -312,7 +312,7 @@ func (sm *Map) AppendValues(ctx context.Context, key string, items ...string) ([
 	sm.lock.Lock()
 	defer sm.lock.Unlock()
 	if sm.closing {
-		return nil, fmt.Errorf("ponos map: %s is stopped", sm.Name)
+		return nil, fmt.Errorf("pulse map: %s is stopped", sm.Name)
 	}
 	sitems := strings.Join(items, ",")
 	res, err := sm.runLuaScript(ctx, "append", sm.append, key, sitems)
@@ -333,7 +333,7 @@ func (sm *Map) RemoveValues(ctx context.Context, key string, items ...string) ([
 	sm.lock.Lock()
 	defer sm.lock.Unlock()
 	if sm.closing {
-		return nil, fmt.Errorf("ponos map: %s is stopped", sm.Name)
+		return nil, fmt.Errorf("pulse map: %s is stopped", sm.Name)
 	}
 	sitems := strings.Join(items, ",")
 	res, err := sm.runLuaScript(ctx, "remove", sm.remove, key, sitems)
@@ -354,7 +354,7 @@ func (sm *Map) Delete(ctx context.Context, key string) (string, error) {
 	sm.lock.Lock()
 	defer sm.lock.Unlock()
 	if sm.closing {
-		return "", fmt.Errorf("ponos map: %s is stopped", sm.Name)
+		return "", fmt.Errorf("pulse map: %s is stopped", sm.Name)
 	}
 	prev, err := sm.runLuaScript(ctx, "delete", sm.del, key)
 	if err != nil {
@@ -371,7 +371,7 @@ func (sm *Map) Reset(ctx context.Context) error {
 	sm.lock.Lock()
 	defer sm.lock.Unlock()
 	if sm.closing {
-		return fmt.Errorf("ponos map: %s is stopped", sm.Name)
+		return fmt.Errorf("pulse map: %s is stopped", sm.Name)
 	}
 	_, err := sm.runLuaScript(ctx, "reset", sm.reset, "*")
 	return err
@@ -399,7 +399,7 @@ func (sm *Map) init(ctx context.Context) error {
 	// Make sure scripts are cached.
 	for _, script := range []string{luaSet, luaDelete, luaReset, luaIncr, luaAppend, luaRemove} {
 		if err := sm.rdb.ScriptLoad(ctx, script).Err(); err != nil {
-			return fmt.Errorf("ponos map: %s failed to load Lua scripts %q: %w", sm.Name, script, err)
+			return fmt.Errorf("pulse map: %s failed to load Lua scripts %q: %w", sm.Name, script, err)
 		}
 	}
 
@@ -407,7 +407,7 @@ func (sm *Map) init(ctx context.Context) error {
 	sm.sub = sm.rdb.Subscribe(ctx, sm.chankey)
 	_, err := sm.sub.Receive(ctx) // Fail fast if we can't subscribe.
 	if err != nil {
-		return fmt.Errorf("ponos map: %s failed to join: %w", sm.Name, err)
+		return fmt.Errorf("pulse map: %s failed to join: %w", sm.Name, err)
 	}
 	sm.msgch = sm.sub.Channel()
 
@@ -418,7 +418,7 @@ func (sm *Map) init(ctx context.Context) error {
 	// local copy with the same data.
 	cmd := sm.rdb.HGetAll(ctx, sm.hashkey)
 	if err := cmd.Err(); err != nil {
-		return fmt.Errorf("ponos map: %s failed to read initial content: %w", sm.Name, err)
+		return fmt.Errorf("pulse map: %s failed to read initial content: %w", sm.Name, err)
 	}
 	sm.content = cmd.Val()
 
@@ -490,10 +490,10 @@ func (sm *Map) run() {
 func (sm *Map) runLuaScript(ctx context.Context, name string, script *redis.Script, args ...any) (any, error) {
 	key := args[0].(string)
 	if len(key) == 0 {
-		return nil, fmt.Errorf("ponos map: %s key cannot be empty in %q", sm.Name, name)
+		return nil, fmt.Errorf("pulse map: %s key cannot be empty in %q", sm.Name, name)
 	}
 	if strings.Contains(key, "=") {
-		return nil, fmt.Errorf("ponos map: %s key %q cannot contain '=' in %q", sm.Name, key, name)
+		return nil, fmt.Errorf("pulse map: %s key %q cannot contain '=' in %q", sm.Name, key, name)
 	}
 	res, err := script.Eval(
 		ctx,
@@ -502,7 +502,7 @@ func (sm *Map) runLuaScript(ctx context.Context, name string, script *redis.Scri
 		args...,
 	).Result()
 	if err != nil && err != redis.Nil {
-		return nil, fmt.Errorf("ponos map: %s failed to run %q for key %s: %w", sm.Name, name, key, err)
+		return nil, fmt.Errorf("pulse map: %s failed to run %q for key %s: %w", sm.Name, name, key, err)
 	}
 
 	return res, nil

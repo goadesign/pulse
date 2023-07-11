@@ -1,6 +1,6 @@
-# Ponos
+# Pulse
 
-Ponos consists of a set of packages that enable event driven distributed
+Pulse consists of a set of packages that enable event driven distributed
 architectures at scale. Each package is designed to be used independently but
 they can also be combined to implement more complex architectures.
 
@@ -19,10 +19,10 @@ flowchart LR
     Map-.->|Update|B
 
     classDef userCode fill:#9A6D1F, stroke:#D9B871, stroke-width:2px, color:#FFF2CC;
-    classDef ponos fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
+    classDef pulse fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
 
     class A,B userCode;
-    class Map ponos;
+    class Map pulse;
 
     linkStyle 0 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
     linkStyle 1 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
@@ -32,7 +32,7 @@ See the [rmap package README](rmap/README.md) for more details.
 
 ## Streaming
 
-Ponos streams provide a flexible mechanism for routing events across a fleet of
+Pulse streams provide a flexible mechanism for routing events across a fleet of
 microservices. Streams can be used to implement pub/sub, fan-out and fan-in
 topologies.
 
@@ -53,10 +53,10 @@ flowchart LR
     TB-.->|Event|B
 
     classDef userCode fill:#9A6D1F, stroke:#D9B871, stroke-width:2px, color:#FFF2CC;
-    classDef ponos fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
+    classDef pulse fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
 
     class A,B userCode;
-    class SA,SB,TA,TB ponos;
+    class SA,SB,TA,TB pulse;
 
     linkStyle 0 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
     linkStyle 1 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
@@ -68,7 +68,7 @@ See the [streaming package README](streaming/README.md) for more details.
 
 ## Dedicated Worker Pool
 
-Ponos builds on top of [replicated maps](rmap/README.md) and
+Pulse builds on top of [replicated maps](rmap/README.md) and
 [streaming](streaming/README.md) to implement a dedicated worker pool where jobs
 are dipatched to workers based on their key and a consistent hashing algorithm.
 
@@ -88,10 +88,10 @@ flowchart LR
     Reader-.->|Job|B
 
     classDef userCode fill:#9A6D1F, stroke:#D9B871, stroke-width:2px, color:#FFF2CC;
-    classDef ponos fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
+    classDef pulse fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
 
     class A,B userCode;
-    class Pool,Sink,Reader,Worker ponos;
+    class Pool,Sink,Reader,Worker pulse;
 
     linkStyle 0 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
     linkStyle 1 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
@@ -105,12 +105,12 @@ See the [pool package README](pool/README.md) for more details.
 See the [examples](examples) directory for examples of how to use the packages
 in this repository.
 
-If you are looking for a more complete example of how to use Ponos to build a
+If you are looking for a more complete example of how to use Pulse to build a
 distributed system, check out the [weather](examples/weather) example.
 
 ## License
 
-Ponos is licensed under the MIT license. See [LICENSE](LICENSE) for the full
+Pulse is licensed under the MIT license. See [LICENSE](LICENSE) for the full
 license text.
 
 ## Contributing
@@ -122,8 +122,8 @@ contribution workflow.
 
 This project adheres to the Contributor Covenant [code of conduct](CODE_OF_CONDUCT.md).
 By participating, you are expected to uphold this code. Please report unacceptable
-behavior to [ponos@goa.design](mailto:ponos@goa.design).
+behavior to [pulse@goa.design](mailto:pulse@goa.design).
 
 ## Credits
 
-Ponos was originally created by [Raphael Simon](https://github.com/raphael).
+Pulse was originally created by [Raphael Simon](https://github.com/raphael).

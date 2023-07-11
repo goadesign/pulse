@@ -1,4 +1,4 @@
-package ponos
+package pulse
 
 import (
 	"context"
@@ -9,7 +9,7 @@ import (
 )
 
 type (
-	// Interface used by Ponos to write log entries.
+	// Interface used by pulse to write log entries.
 	Logger interface {
 		// EnableDebug turns on debug logging.
 		EnableDebug()
@@ -51,12 +51,12 @@ func NoopLogger() Logger {
 	return &noopLogger{}
 }
 
-// StdLogger adapts a Go standard library logger to a ponos logger.
+// StdLogger adapts a Go standard library logger to a pulse logger.
 func StdLogger(logger *stdlog.Logger) Logger {
 	return &stdLogger{logger: logger}
 }
 
-// ClueLogger adapts a clue logger to a ponos logger.
+// ClueLogger adapts a clue logger to a pulse logger.
 func ClueLogger(logCtx context.Context) Logger {
 	cluelog.MustContainLogger(logCtx)
 	return &clueLogger{logCtx}

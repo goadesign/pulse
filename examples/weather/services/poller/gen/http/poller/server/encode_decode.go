@@ -3,7 +3,7 @@
 // Poller HTTP server encoders and decoders
 //
 // Command:
-// $ goa gen goa.design/ponos/examples/weather/services/poller/design -o
+// $ goa gen goa.design/pulse/examples/weather/services/poller/design -o
 // services/poller
 
 package server
@@ -16,7 +16,7 @@ import (
 
 	goahttp "goa.design/goa/v3/http"
 	goa "goa.design/goa/v3/pkg"
-	poller "goa.design/ponos/examples/weather/services/poller/gen/poller"
+	poller "goa.design/pulse/examples/weather/services/poller/gen/poller"
 )
 
 // EncodeAddLocationResponse returns an encoder for responses returned by the

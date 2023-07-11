@@ -6,8 +6,8 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
-	"goa.design/ponos/ponos"
-	"goa.design/ponos/streaming/options"
+	"goa.design/pulse/pulse"
+	"goa.design/pulse/streaming/options"
 )
 
 var redisPwd = "redispassword"
@@ -43,7 +43,7 @@ func TestOptions(t *testing.T) {
 	s, err := NewStream("testOptions", nil, options.WithStreamMaxLen(10), options.WithStreamLogger(nil))
 	assert.NoError(t, err)
 	assert.Equal(t, 10, s.MaxLen)
-	assert.Equal(t, ponos.NoopLogger(), s.logger)
+	assert.Equal(t, pulse.NoopLogger(), s.logger)
 }
 
 func TestAdd(t *testing.T) {

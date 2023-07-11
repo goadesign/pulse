@@ -3,14 +3,14 @@
 // Forecaster HTTP server types
 //
 // Command:
-// $ goa gen goa.design/ponos/examples/weather/services/forecaster/design -o
+// $ goa gen goa.design/pulse/examples/weather/services/forecaster/design -o
 // services/forecaster
 
 package server
 
 import (
 	goa "goa.design/goa/v3/pkg"
-	forecaster "goa.design/ponos/examples/weather/services/forecaster/gen/forecaster"
+	forecaster "goa.design/pulse/examples/weather/services/forecaster/gen/forecaster"
 )
 
 // ForecastResponseBody is the type of the "Forecaster" service "forecast"

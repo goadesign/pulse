@@ -12,8 +12,8 @@ import (
 	goahttp "goa.design/goa/v3/http"
 	goa "goa.design/goa/v3/pkg"
 
-	genpollerc "goa.design/ponos/examples/weather/services/poller/gen/http/poller/client"
-	genpoller "goa.design/ponos/examples/weather/services/poller/gen/poller"
+	genpollerc "goa.design/pulse/examples/weather/services/poller/gen/http/poller/client"
+	genpoller "goa.design/pulse/examples/weather/services/poller/gen/poller"
 )
 
 type (

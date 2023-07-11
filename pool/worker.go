@@ -10,10 +10,10 @@ import (
 	"time"
 
 	"github.com/oklog/ulid/v2"
-	"goa.design/ponos/ponos"
-	"goa.design/ponos/rmap"
-	"goa.design/ponos/streaming"
-	soptions "goa.design/ponos/streaming/options"
+	"goa.design/pulse/pulse"
+	"goa.design/pulse/rmap"
+	"goa.design/pulse/streaming"
+	soptions "goa.design/pulse/streaming/options"
 )
 
 type (
@@ -36,7 +36,7 @@ type (
 		workerTTL         time.Duration
 		workerShutdownTTL time.Duration
 		pendingJobTTL     time.Duration
-		logger            ponos.Logger
+		logger            pulse.Logger
 		wg                sync.WaitGroup
 
 		lock        sync.Mutex

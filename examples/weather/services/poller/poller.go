@@ -8,14 +8,14 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"goa.design/clue/log"
-	"goa.design/ponos/ponos"
-	"goa.design/ponos/pool"
-	"goa.design/ponos/streaming"
-	"goa.design/ponos/streaming/options"
+	"goa.design/pulse/pool"
+	"goa.design/pulse/pulse"
+	"goa.design/pulse/streaming"
+	"goa.design/pulse/streaming/options"
 
-	"goa.design/ponos/examples/weather/services/poller/clients/nominatim"
-	"goa.design/ponos/examples/weather/services/poller/clients/weathergov"
-	genpoller "goa.design/ponos/examples/weather/services/poller/gen/poller"
+	"goa.design/pulse/examples/weather/services/poller/clients/nominatim"
+	"goa.design/pulse/examples/weather/services/poller/clients/weathergov"
+	genpoller "goa.design/pulse/examples/weather/services/poller/gen/poller"
 )
 
 type (
@@ -33,11 +33,11 @@ const poolName = "forecast-pollers"
 
 // New instantiates a new poller service.
 func New(ctx context.Context, nominatimc nominatim.Client, weatherc weathergov.Client, rdb *redis.Client) (*Service, error) {
-	stream, err := streaming.NewStream(forecastStream, rdb, options.WithStreamLogger(ponos.ClueLogger(ctx)))
+	stream, err := streaming.NewStream(forecastStream, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create stream: %s", err)
 	}
-	node, err := pool.AddNode(ctx, poolName, rdb, pool.WithLogger(ponos.ClueLogger(ctx)))
+	node, err := pool.AddNode(ctx, poolName, rdb, pool.WithLogger(pulse.ClueLogger(ctx)))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create node: %s", err)
 	}

@@ -14,19 +14,19 @@ To run the example, follow these steps:
 
 3. Open a terminal or command prompt.
 
-4. Clone the `goadesign/ponos` repository by running the following command:
+4. Clone the `goadesign/pulse` repository by running the following command:
    ```
-   git clone https://github.com/goadesign/ponos.git
+   git clone https://github.com/goadesign/pulse.git
    ```
 
 5. Change into the `examples/rmap/multi-nodes` directory:
    ```
-   cd ponos/examples/rmap/multi-nodes
+   cd pulse/examples/rmap/multi-nodes
    ```
 
 6. Install the required dependencies by running the following command:
    ```
-   go get github.com/redis/go-redis/v9 goa.design/ponos/rmap
+   go get github.com/redis/go-redis/v9 goa.design/pulse/rmap
    ```
 
 7. Build the Go program by executing the following command:

@@ -3,7 +3,7 @@
 // Forecaster HTTP client CLI support package
 //
 // Command:
-// $ goa gen goa.design/ponos/examples/weather/services/forecaster/design -o
+// $ goa gen goa.design/pulse/examples/weather/services/forecaster/design -o
 // services/forecaster
 
 package client
@@ -12,7 +12,7 @@ import (
 	"unicode/utf8"
 
 	goa "goa.design/goa/v3/pkg"
-	forecaster "goa.design/ponos/examples/weather/services/forecaster/gen/forecaster"
+	forecaster "goa.design/pulse/examples/weather/services/forecaster/gen/forecaster"
 )
 
 // BuildForecastPayload builds the payload for the Forecaster forecast endpoint

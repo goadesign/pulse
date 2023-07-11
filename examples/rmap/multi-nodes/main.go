@@ -8,7 +8,7 @@ import (
 	"sync"
 
 	"github.com/redis/go-redis/v9"
-	"goa.design/ponos/rmap"
+	"goa.design/pulse/rmap"
 )
 
 // Number of items to write to the map
