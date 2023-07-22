@@ -20,28 +20,39 @@ type (
 	// change. Multiple processes can join the same replicated map and
 	// update it.
 	Map struct {
-		Name    string
-		closing bool                  // true if Close was called
-		closed  bool                  // stopped is true once Close finishes.
-		chankey string                // Redis pubsub channel name
-		hashkey string                // Redis hash key
-		msgch   <-chan *redis.Message // channel to receive map updates
-		chans   []chan struct{}       // channels to send notifications
-		ichan   chan struct{}         // internal channel to send notifications
-		done    chan struct{}         // channel to signal shutdown
-		wait    sync.WaitGroup        // wait for read goroutine to exit
-		logger  pulse.Logger          // logger
-		sub     *redis.PubSub         // subscription to map updates
-		set     *redis.Script
-		append  *redis.Script
-		remove  *redis.Script
-		incr    *redis.Script
-		del     *redis.Script
-		reset   *redis.Script
-		rdb     *redis.Client
-		lock    sync.Mutex
-		content map[string]string
+		Name       string
+		closing    bool                  // true if Close was called
+		closed     bool                  // stopped is true once Close finishes.
+		chankey    string                // Redis pubsub channel name
+		hashkey    string                // Redis hash key
+		msgch      <-chan *redis.Message // channel to receive map updates
+		chans      []chan EventKind      // channels to send notifications
+		ichan      chan struct{}         // internal channel to send notifications
+		done       chan struct{}         // channel to signal shutdown
+		wait       sync.WaitGroup        // wait for read goroutine to exit
+		logger     pulse.Logger          // logger
+		sub        *redis.PubSub         // subscription to map updates
+		set        *redis.Script
+		testAndSet *redis.Script
+		append     *redis.Script
+		remove     *redis.Script
+		incr       *redis.Script
+		del        *redis.Script
+		reset      *redis.Script
+		rdb        *redis.Client
+		lock       sync.Mutex
+		content    map[string]string
 	}
+
+	// EventKind is the type of map event.
+	EventKind int
+)
+
+const (
+	// EventChange is the event emitted when a key is added, changed or deleted.
+	EventChange EventKind = iota + 1
+	// EventReset is the event emitted when the map is reset.
+	EventReset
 )
 
 // luaSet is the Lua script used to set a key and return its previous value.  We
@@ -60,6 +71,16 @@ const luaDelete = `
    local v = redis.call("HGET", KEYS[1], ARGV[1])
    redis.call("HDEL", KEYS[1], ARGV[1])
    redis.call("PUBLISH", KEYS[2], ARGV[1].."=")
+   return v
+`
+
+// luaTestAndSet is the Lua script used to set a key if it has a specific value.
+const luaTestAndSet = `
+   local v = redis.call("HGET", KEYS[1], ARGV[1])
+   if v == ARGV[2] then
+      redis.call("HSET", KEYS[1], ARGV[1], ARGV[3])
+      redis.call("PUBLISH", KEYS[2], ARGV[1].."="..ARGV[3])
+   end
    return v
 `
 
@@ -143,20 +164,21 @@ func Join(ctx context.Context, name string, rdb *redis.Client, opts ...MapOption
 	}
 	o := parseOptions(opts...)
 	sm := &Map{
-		Name:    name,
-		chankey: fmt.Sprintf("map:%s:updates", name),
-		hashkey: fmt.Sprintf("map:%s:content", name),
-		ichan:   make(chan struct{}, 1),
-		done:    make(chan struct{}),
-		logger:  o.Logger.WithPrefix("map", name),
-		rdb:     rdb,
-		set:     redis.NewScript(luaSet),
-		incr:    redis.NewScript(luaIncr),
-		append:  redis.NewScript(luaAppend),
-		remove:  redis.NewScript(luaRemove),
-		del:     redis.NewScript(luaDelete),
-		reset:   redis.NewScript(luaReset),
-		content: make(map[string]string),
+		Name:       name,
+		chankey:    fmt.Sprintf("map:%s:updates", name),
+		hashkey:    fmt.Sprintf("map:%s:content", name),
+		ichan:      make(chan struct{}, 1),
+		done:       make(chan struct{}),
+		logger:     o.Logger.WithPrefix("map", name),
+		rdb:        rdb,
+		set:        redis.NewScript(luaSet),
+		testAndSet: redis.NewScript(luaTestAndSet),
+		incr:       redis.NewScript(luaIncr),
+		append:     redis.NewScript(luaAppend),
+		remove:     redis.NewScript(luaRemove),
+		del:        redis.NewScript(luaDelete),
+		reset:      redis.NewScript(luaReset),
+		content:    make(map[string]string),
 	}
 	if err := sm.init(ctx); err != nil {
 		return nil, err
@@ -201,19 +223,19 @@ func (sm *Map) Keys() []string {
 // allows the notification to be sent without blocking. Multiple remote updates
 // may result in a single notification.
 // Subscribe returns nil if the map is stopped.
-func (sm *Map) Subscribe() <-chan struct{} {
+func (sm *Map) Subscribe() <-chan EventKind {
 	sm.lock.Lock()
 	defer sm.lock.Unlock()
 	if sm.closing {
 		return nil
 	}
-	c := make(chan struct{}, 1) // Buffer 1 notification so we don't have to block.
+	c := make(chan EventKind, 1) // Buffer 1 notification so we don't have to block.
 	sm.chans = append(sm.chans, c)
 	return c
 }
 
 // Unsubscribe removes the given channel from the list of subscribers and closes it.
-func (sm *Map) Unsubscribe(c <-chan struct{}) {
+func (sm *Map) Unsubscribe(c <-chan EventKind) {
 	sm.lock.Lock()
 	defer sm.lock.Unlock()
 	if sm.closing {
@@ -282,6 +304,25 @@ func (sm *Map) SetAndWait(ctx context.Context, key, value string) (string, error
 			}
 		}
 	}
+}
+
+// TestAndSet sets the value for the given key if the current value matches the
+// given test value. The previous value is returned. An error is returned if the
+// key is empty or contains an equal sign.
+func (sm *Map) TestAndSet(ctx context.Context, key, test, value string) (string, error) {
+	sm.lock.Lock()
+	defer sm.lock.Unlock()
+	if sm.closing {
+		return "", fmt.Errorf("pulse map: %s is stopped", sm.Name)
+	}
+	prev, err := sm.runLuaScript(ctx, "testAndSet", sm.testAndSet, key, test, value)
+	if err != nil {
+		return "", err
+	}
+	if prev == nil {
+		return "", nil
+	}
+	return prev.(string), nil
 }
 
 // Inc increments the value for the given key and returns the result, the value
@@ -444,10 +485,12 @@ func (sm *Map) run() {
 			}
 			key, val := parts[0], parts[1]
 			sm.lock.Lock()
+			kind := EventChange
 			switch {
 			case key == "*":
 				sm.content = make(map[string]string)
 				sm.logger.Debug("reset")
+				kind = EventReset
 			case val == "":
 				delete(sm.content, key)
 				sm.logger.Debug("deleted", "key", key)
@@ -461,7 +504,7 @@ func (sm *Map) run() {
 			}
 			for _, c := range sm.chans {
 				select {
-				case c <- struct{}{}:
+				case c <- kind:
 				default:
 				}
 			}

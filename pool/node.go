@@ -34,6 +34,7 @@ type (
 		workerMap         *rmap.Map         // worker creation times by ID
 		keepAliveMap      *rmap.Map         // worker keep-alive timestamps indexed by ID
 		shutdownMap       *rmap.Map         // key is node ID that requested shutdown
+		tickerMap         *rmap.Map         // ticker next tick time indexed by name
 		workerTTL         time.Duration     // Worker considered dead if keep-alive not updated after this duration
 		workerShutdownTTL time.Duration     // Worker considered dead if not shutdown after this duration
 		pendingJobTTL     time.Duration     // Job lease expires if not acked after this duration
@@ -105,6 +106,7 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...NodeOp
 	var (
 		wm         *rmap.Map
 		km         *rmap.Map
+		tm         *rmap.Map
 		poolSink   *streaming.Sink
 		nodeStream *streaming.Stream
 		nodeReader *streaming.Reader
@@ -117,6 +119,10 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...NodeOp
 		km, err = rmap.Join(ctx, keepAliveMapName(name), rdb, rmap.WithLogger(logger))
 		if err != nil {
 			return nil, fmt.Errorf("failed to join pool keep-alive replicated map %q: %w", keepAliveMapName(name), err)
+		}
+		tm, err = rmap.Join(ctx, tickerMapName(name), rdb, rmap.WithLogger(logger))
+		if err != nil {
+			return nil, fmt.Errorf("failed to join pool ticker replicated map %q: %w", tickerMapName(name), err)
 		}
 		poolSink, err = poolStream.NewSink(ctx, "events",
 			soptions.WithSinkBlockDuration(o.jobSinkBlockDuration))
@@ -139,6 +145,7 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...NodeOp
 		keepAliveMap:      km,
 		workerMap:         wm,
 		shutdownMap:       wsm,
+		tickerMap:         tm,
 		workerStreams:     make(map[string]*streaming.Stream),
 		pendingJobs:       make(map[string]chan error),
 		pendingEvents:     make(map[string]*streaming.Event),
@@ -211,7 +218,7 @@ func (node *Node) RemoveWorker(ctx context.Context, w *Worker) error {
 	return nil
 }
 
-// Workers returns the list of workers in the pool.
+// Workers returns the list of workers running in the local node.
 func (node *Node) Workers() []*Worker {
 	node.lock.Lock()
 	defer node.lock.Unlock()
@@ -234,25 +241,6 @@ func (node *Node) DispatchJob(ctx context.Context, key string, payload []byte) e
 		node.lock.Unlock()
 	}()
 	return <-cherr
-}
-
-// lockAndDispatch helps with locking.
-func (node *Node) lockAndDispatch(ctx context.Context, key string, payload []byte) (chan error, error) {
-	node.lock.Lock()
-	defer node.lock.Unlock()
-	if _, ok := node.pendingJobs[key]; ok {
-		return nil, fmt.Errorf("job with key %q is already pending", key)
-	}
-	if node.closing || node.shuttingDown {
-		return nil, fmt.Errorf("pool %q is closed", node.Name)
-	}
-	job := marshalJob(&Job{Key: key, Payload: payload, CreatedAt: time.Now()})
-	if _, err := node.poolStream.Add(ctx, evStartJob, job); err != nil {
-		return nil, fmt.Errorf("failed to add job to stream %q: %w", node.poolStream.Name, err)
-	}
-	cherr := make(chan error, 1)
-	node.pendingJobs[key] = cherr
-	return cherr, nil
 }
 
 // StopJob stops the job with the given key.
@@ -317,6 +305,7 @@ func (node *Node) Shutdown(ctx context.Context) error {
 	node.lock.Lock()
 	defer node.lock.Unlock()
 	node.cleanup() // cleanup first then close maps
+	node.tickerMap.Close()
 	node.keepAliveMap.Close()
 	node.workerMap.Close()
 	node.shutdownMap.Close()
@@ -352,6 +341,7 @@ func (node *Node) Close(ctx context.Context) error {
 	node.localWorkers = nil
 	if !node.clientOnly {
 		node.poolSink.Close()
+		node.tickerMap.Close()
 		node.keepAliveMap.Close()
 		node.workerMap.Close()
 		node.shutdownMap.Close()
@@ -458,15 +448,17 @@ func (node *Node) handleNodeEvents(c <-chan *streaming.Event) {
 				node.lock.Unlock()
 				continue
 			}
-			p, ok := node.pendingJobs[unmarshalJobKey(pending.Payload)]
-			if !ok {
-				node.logger.Error(fmt.Errorf("received event %s from worker %s that was not dispatched", ack.EventID, workerID))
-			} else {
-				var err error
-				if ack.Error != "" {
-					err = errors.New(ack.Error)
+			if pending.EventName == evStartJob {
+				p, ok := node.pendingJobs[unmarshalJobKey(pending.Payload)]
+				if !ok {
+					node.logger.Error(fmt.Errorf("pending job for event %s worker %s not found", pending.ID, workerID))
+				} else {
+					var err error
+					if ack.Error != "" {
+						err = errors.New(ack.Error)
+					}
+					p <- err
 				}
-				p <- err
 			}
 			if err := node.poolSink.Ack(ctx, pending); err != nil {
 				node.logger.Error(fmt.Errorf("failed to ack event: %w", err), "event", pending.EventName, "event-id", pending.ID)
@@ -491,6 +483,25 @@ func (node *Node) handleNodeEvents(c <-chan *streaming.Event) {
 			return
 		}
 	}
+}
+
+// lockAndDispatch helps with locking.
+func (node *Node) lockAndDispatch(ctx context.Context, key string, payload []byte) (chan error, error) {
+	node.lock.Lock()
+	defer node.lock.Unlock()
+	if _, ok := node.pendingJobs[key]; ok {
+		return nil, fmt.Errorf("job with key %q is already pending", key)
+	}
+	if node.closing || node.shuttingDown {
+		return nil, fmt.Errorf("pool %q is closed", node.Name)
+	}
+	job := marshalJob(&Job{Key: key, Payload: payload, CreatedAt: time.Now()})
+	if _, err := node.poolStream.Add(ctx, evStartJob, job); err != nil {
+		return nil, fmt.Errorf("failed to add job to stream %q: %w", node.poolStream.Name, err)
+	}
+	cherr := make(chan error, 1)
+	node.pendingJobs[key] = cherr
+	return cherr, nil
 }
 
 // manageWorkers receives notifications from the workers replicated map and
@@ -659,6 +670,9 @@ func (node *Node) cleanup() error {
 	if err := node.workerMap.Reset(ctx); err != nil {
 		node.logger.Error(fmt.Errorf("failed to reset workers map: %w", err))
 	}
+	if err := node.tickerMap.Reset(ctx); err != nil {
+		node.logger.Error(fmt.Errorf("failed to reset tickers map: %w", err))
+	}
 	if err := node.poolStream.Destroy(ctx); err != nil {
 		node.logger.Error(fmt.Errorf("failed to destroy job stream: %w", err))
 	}
@@ -725,6 +739,12 @@ func workerMapName(pool string) string {
 // worker keep-alive timestamps.
 func keepAliveMapName(pool string) string {
 	return fmt.Sprintf("%s:keepalive", pool)
+}
+
+// tickerMapName returns the name of the replicated map used to store ticker
+// ticks.
+func tickerMapName(pool string) string {
+	return fmt.Sprintf("%s:tickers", pool)
 }
 
 // shutdownMapName returns the name of the replicated map used to store the
