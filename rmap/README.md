@@ -33,6 +33,9 @@ The `Join` function creates a new replicated map or joins an existing one.  The
 
 [![Replicated Map Set](../snippets/rmap-set.png)](../examples/rmap/basics/main.go#L41-L46)
 
+* The `TestAndSet` method sets the value for a given key if the current value
+  matches the expected value. It returns the previous value.
+
 * The `AppendValues` and `RemoveValues` methods append or remove values to or from a list. 
 
 [![Replicated Map Append](../snippets/rmap-append.png)](../examples/rmap/basics/main.go#L60-L72)
