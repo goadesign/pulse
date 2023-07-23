@@ -15,6 +15,12 @@ func marshalJob(job *Job) []byte {
 	if err := binary.Write(&buf, binary.LittleEndian, []byte(job.Key)); err != nil {
 		panic(err)
 	}
+	if err := binary.Write(&buf, binary.LittleEndian, int32(len(job.NodeID))); err != nil {
+		panic(err)
+	}
+	if err := binary.Write(&buf, binary.LittleEndian, []byte(job.NodeID)); err != nil {
+		panic(err)
+	}
 	if err := binary.Write(&buf, binary.LittleEndian, int32(len(job.Payload))); err != nil {
 		panic(err)
 	}
@@ -38,6 +44,15 @@ func unmarshalJob(data []byte) *Job {
 	if err := binary.Read(reader, binary.LittleEndian, &keyBytes); err != nil {
 		panic(err)
 	}
+	var nodeIDLength int32
+	if err := binary.Read(reader, binary.LittleEndian, &nodeIDLength); err != nil {
+		panic(err)
+	}
+	nodeIDBytes := make([]byte, nodeIDLength)
+	if err := binary.Read(reader, binary.LittleEndian, &nodeIDBytes); err != nil {
+		panic(err)
+	}
+	nodeID := string(nodeIDBytes)
 	var payloadLength int32
 	if err := binary.Read(reader, binary.LittleEndian, &payloadLength); err != nil {
 		panic(err)
@@ -57,6 +72,7 @@ func unmarshalJob(data []byte) *Job {
 		Key:       string(keyBytes),
 		Payload:   payload,
 		CreatedAt: time.Unix(0, createdAtTimestamp).UTC(),
+		NodeID:    nodeID,
 	}
 }
 
@@ -83,6 +99,27 @@ func unmarshalJobKey(data []byte) string {
 		panic(err)
 	}
 	return string(keyBytes)
+}
+
+func unmarshalJobKeyAndNodeID(data []byte) (string, string) {
+	reader := bytes.NewReader(data)
+	var keyLength int32
+	if err := binary.Read(reader, binary.LittleEndian, &keyLength); err != nil {
+		panic(err)
+	}
+	keyBytes := make([]byte, keyLength)
+	if err := binary.Read(reader, binary.LittleEndian, &keyBytes); err != nil {
+		panic(err)
+	}
+	var nodeIDLength int32
+	if err := binary.Read(reader, binary.LittleEndian, &nodeIDLength); err != nil {
+		panic(err)
+	}
+	nodeIDBytes := make([]byte, nodeIDLength)
+	if err := binary.Read(reader, binary.LittleEndian, &nodeIDBytes); err != nil {
+		panic(err)
+	}
+	return string(keyBytes), string(nodeIDBytes)
 }
 
 func marshalNotification(key string, payload []byte) []byte {

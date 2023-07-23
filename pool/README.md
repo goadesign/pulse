@@ -160,6 +160,16 @@ The `StopJob` method is used to stop a job. It takes a job key as input and
 returns an error if the job could not be stopped. This can happen if the job key
 is invalid, the node is closed or the pool shutdown.
 
+## Scheduling
+
+The `Schedule` method of the `Node` struct can be used to schedule jobs to be
+dispatched or stopped on a recurring basis. The method takes as input a job
+producer and invokes it at the specified interval. The job producer returns
+a list of jobs to be started and stopped.
+
+`Schedule` makes it possible to maintain a pool of jobs for example in a
+multi-tenant system. See the [examples](../examples/pool) for more details.
+
 ## Data Flows
 
 The following sections provide additional details on the internal data flows

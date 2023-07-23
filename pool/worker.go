@@ -55,6 +55,8 @@ type (
 		CreatedAt time.Time
 		// Worker is the worker that handles the job.
 		Worker *Worker
+		// NodeID is the ID of the node that created the job.
+		NodeID string
 	}
 
 	// JobHandler starts and stops jobs.

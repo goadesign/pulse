@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"time"
 
@@ -13,48 +12,60 @@ import (
 )
 
 func main() {
-	ctx := log.Context(context.Background(), log.WithDebug())
+	// Setup Redis connection
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     "localhost:6379",
 		Password: os.Getenv("REDIS_PASSWORD"),
 	})
 
-	// Create client for node named "example"
-	node, err := pool.AddNode(ctx, "example", rdb,
+	// Setup clue logger.
+	ctx := log.Context(context.Background())
+	log.FlushAndDisableBuffering(ctx)
+
+	var logger pulse.Logger
+	if len(os.Args) > 1 && os.Args[1] == "-v" {
+		logger = pulse.ClueLogger(ctx)
+	}
+
+	// Create client for worker pool "example"
+	client, err := pool.AddNode(ctx, "example", rdb,
 		pool.WithClientOnly(),
-		pool.WithLogger(pulse.ClueLogger(ctx)),
+		pool.WithLogger(logger),
 	)
 	if err != nil {
 		panic(err)
 	}
 
-	// Cleanup node on exit.
-	defer func() {
-		if err := node.Close(ctx); err != nil {
-			panic(err)
-		}
-	}()
-
 	// Start 2 jobs
-	fmt.Println("** Starting job one...")
-	if err := node.DispatchJob(ctx, "one", nil); err != nil {
+	log.Infof(ctx, "starting job one")
+	if err := client.DispatchJob(ctx, "alpha", nil); err != nil {
 		panic(err)
 	}
-	fmt.Println("** Starting job two...")
-	if err := node.DispatchJob(ctx, "two", nil); err != nil {
+	log.Infof(ctx, "starting job two")
+	if err := client.DispatchJob(ctx, "beta", nil); err != nil {
 		panic(err)
 	}
 	time.Sleep(200 * time.Millisecond) // emulate delay
-	fmt.Println("Stopping job one...")
-	if err := node.StopJob(ctx, "one"); err != nil {
+
+	// Stop job one
+	log.Infof(ctx, "stopping job one")
+	if err := client.StopJob(ctx, "alpha"); err != nil {
 		panic(err)
 	}
-	fmt.Println("Notifying worker for job two...")
-	if err := node.NotifyWorker(ctx, "two", []byte("hello")); err != nil {
+
+	// Notify and then stop job two
+	log.Infof(ctx, "notifying job two worker")
+	if err := client.NotifyWorker(ctx, "beta", []byte("hello")); err != nil {
 		panic(err)
 	}
-	fmt.Println("Stopping job two...")
-	if err := node.StopJob(ctx, "two"); err != nil {
+	log.Infof(ctx, "stopping job two")
+	if err := client.StopJob(ctx, "beta"); err != nil {
+		panic(err)
+	}
+
+	// Cleanup client on exit.
+	log.Infof(ctx, "done")
+	if err := client.Close(ctx); err != nil {
 		panic(err)
 	}
 }

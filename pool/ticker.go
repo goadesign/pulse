@@ -33,6 +33,9 @@ type (
 // instead delivers the current time on the channel to only one of the nodes
 // that invoked NewTicker with the same name.
 func (node *Node) NewTicker(ctx context.Context, name string, d time.Duration, opts ...TickerOption) (*Ticker, error) {
+	if node.clientOnly {
+		return nil, fmt.Errorf("cannot create ticker on client-only node")
+	}
 	o := parseTickerOptions(opts...)
 	logger := o.logger
 	if logger == nil {

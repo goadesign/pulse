@@ -73,6 +73,9 @@ const (
 	evShutdown string = "x"
 	// evAck is the worker event used to ack a pool event.
 	evAck string = "a"
+	// evDispatchReturn is the event used to forward the worker start return
+	// status to the node that dispatched the job.
+	evDispatchReturn string = "d"
 )
 
 // AddNode adds a new node to the pool with the given name and returns it. The
@@ -129,14 +132,14 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...NodeOp
 		if err != nil {
 			return nil, fmt.Errorf("failed to create events sink for stream %q: %w", poolStreamName(name), err)
 		}
-		nodeStream, err = streaming.NewStream(nodeStreamName(name, nodeID), rdb, soptions.WithStreamLogger(logger))
-		if err != nil {
-			return nil, fmt.Errorf("failed to create node event stream %q: %w", nodeStreamName(name, nodeID), err)
-		}
-		nodeReader, err = nodeStream.NewReader(ctx, soptions.WithReaderBlockDuration(o.jobSinkBlockDuration), soptions.WithReaderStartAtOldest())
-		if err != nil {
-			return nil, fmt.Errorf("failed to create node event reader for stream %q: %w", nodeStreamName(name, nodeID), err)
-		}
+	}
+	nodeStream, err = streaming.NewStream(nodeStreamName(name, nodeID), rdb, soptions.WithStreamLogger(logger))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create node event stream %q: %w", nodeStreamName(name, nodeID), err)
+	}
+	nodeReader, err = nodeStream.NewReader(ctx, soptions.WithReaderBlockDuration(o.jobSinkBlockDuration), soptions.WithReaderStartAtOldest())
+	if err != nil {
+		return nil, fmt.Errorf("failed to create node event reader for stream %q: %w", nodeStreamName(name, nodeID), err)
 	}
 
 	p := &Node{
@@ -163,16 +166,18 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...NodeOp
 		rdb:               rdb,
 	}
 
+	nch := nodeReader.Subscribe()
+
 	if o.clientOnly {
 		logger.Info("client-only")
-		p.wg.Add(1)
+		p.wg.Add(2)
 		go p.manageShutdown()
+		go p.handleNodeEvents(nch) // to handle job acks
 		return p, nil
 	}
 
 	p.wg.Add(4)
 	pch := poolSink.Subscribe()
-	nch := nodeReader.Subscribe()
 	go p.handlePoolEvents(pch) // handleXXX handles streaming events
 	go p.handleNodeEvents(nch)
 	go p.manageWorkers() // manageXXX handles map updates
@@ -230,17 +235,33 @@ func (node *Node) Workers() []*Worker {
 // DispatchJob dispatches a job to the proper worker in the pool.
 // It returns the error returned by the worker's start handler if any.
 func (node *Node) DispatchJob(ctx context.Context, key string, payload []byte) error {
-	cherr, err := node.lockAndDispatch(ctx, key, payload)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		node.lock.Lock()
-		delete(node.pendingJobs, key)
-		close(cherr)
+	var cherr chan error
+
+	// Send job to pool stream.
+	node.lock.Lock()
+	if node.closing || node.shuttingDown {
 		node.lock.Unlock()
-	}()
-	return <-cherr
+		return fmt.Errorf("pool %q is closed", node.Name)
+	}
+	job := marshalJob(&Job{Key: key, Payload: payload, CreatedAt: time.Now(), NodeID: node.NodeID})
+	eventID, err := node.poolStream.Add(ctx, evStartJob, job)
+	if err != nil {
+		node.lock.Unlock()
+		return fmt.Errorf("failed to add job to stream %q: %w", node.poolStream.Name, err)
+	}
+	cherr = make(chan error, 1)
+	node.pendingJobs[eventID] = cherr
+	node.lock.Unlock()
+
+	// Wait for return status.
+	err = <-cherr
+
+	// Cleanup
+	node.lock.Lock()
+	defer node.lock.Unlock()
+	delete(node.pendingJobs, key)
+	close(cherr)
+	return err
 }
 
 // StopJob stops the job with the given key.
@@ -345,9 +366,9 @@ func (node *Node) Close(ctx context.Context) error {
 		node.keepAliveMap.Close()
 		node.workerMap.Close()
 		node.shutdownMap.Close()
-		node.nodeReader.Close()
-		node.nodeStream.Destroy(ctx)
 	}
+	node.nodeReader.Close()
+	node.nodeStream.Destroy(ctx)
 	node.closed = true
 	close(node.stop)
 	node.lock.Unlock()
@@ -388,7 +409,7 @@ func (node *Node) handlePoolEvents(c <-chan *streaming.Event) {
 				node.logger.Error(fmt.Errorf("failed to route event: %w, will retry after %v", err, node.pendingJobTTL), "event", ev.EventName, "event-id", ev.ID)
 			}
 		case evShutdown:
-			node.poolSink.Close() // Closes p.eventSink.C
+			node.poolSink.Close() // Closes c
 			if _, err := node.shutdownMap.Set(ctx, "shutdown", node.NodeID); err != nil {
 				node.logger.Error(fmt.Errorf("failed to set shutdown status in shutdown map: %w", err))
 			}
@@ -438,45 +459,14 @@ func (node *Node) handleNodeEvents(c <-chan *streaming.Event) {
 			if !ok {
 				return
 			}
-			node.lock.Lock()
-			workerID, payload := unmarshalEnvelope(ev.Payload)
-			ack := unmarshalAck(payload)
-			key := workerID + ":" + ack.EventID
-			pending, ok := node.pendingEvents[key]
-			if !ok {
-				node.logger.Error(fmt.Errorf("received event %s from worker %s that was not dispatched", ack.EventID, workerID))
-				node.lock.Unlock()
-				continue
+			switch ev.EventName {
+			case evAck:
+				// Event sent by worker to ack a dispatched job.
+				node.ackWorkerEvent(ctx, ev)
+			case evDispatchReturn:
+				// Event sent by pool node to node that originally dispatched the job.
+				node.returnDispatchStatus(ctx, ev)
 			}
-			if pending.EventName == evStartJob {
-				p, ok := node.pendingJobs[unmarshalJobKey(pending.Payload)]
-				if !ok {
-					node.logger.Error(fmt.Errorf("pending job for event %s worker %s not found", pending.ID, workerID))
-				} else {
-					var err error
-					if ack.Error != "" {
-						err = errors.New(ack.Error)
-					}
-					p <- err
-				}
-			}
-			if err := node.poolSink.Ack(ctx, pending); err != nil {
-				node.logger.Error(fmt.Errorf("failed to ack event: %w", err), "event", pending.EventName, "event-id", pending.ID)
-			}
-			delete(node.pendingEvents, key)
-
-			// Garbage collect stale events.
-			var staleKeys []string
-			for key, ev := range node.pendingEvents {
-				if time.Since(ev.CreatedAt()) > 2*node.pendingJobTTL {
-					staleKeys = append(staleKeys, key)
-				}
-			}
-			for _, key := range staleKeys {
-				node.logger.Error(fmt.Errorf("stale event, removing from pending events"), "event", node.pendingEvents[key].EventName, "key", key)
-				delete(node.pendingEvents, key)
-			}
-			node.lock.Unlock()
 		case <-node.stop:
 			node.nodeReader.Close()
 			node.nodeStream.Destroy(ctx)
@@ -485,23 +475,73 @@ func (node *Node) handleNodeEvents(c <-chan *streaming.Event) {
 	}
 }
 
-// lockAndDispatch helps with locking.
-func (node *Node) lockAndDispatch(ctx context.Context, key string, payload []byte) (chan error, error) {
+// ackWorkerEvent acks the pending event that corresponds to the acked job.  If
+// the event was a dispatched job then it sends a dispatch return event to the
+// node that dispatched the job.
+func (node *Node) ackWorkerEvent(ctx context.Context, ev *streaming.Event) {
 	node.lock.Lock()
 	defer node.lock.Unlock()
-	if _, ok := node.pendingJobs[key]; ok {
-		return nil, fmt.Errorf("job with key %q is already pending", key)
+
+	workerID, payload := unmarshalEnvelope(ev.Payload)
+	ack := unmarshalAck(payload)
+	key := workerID + ":" + ack.EventID
+	pending, ok := node.pendingEvents[key]
+	if !ok {
+		node.logger.Error(fmt.Errorf("received event %s from worker %s that was not dispatched", ack.EventID, workerID))
+		node.lock.Unlock()
+		return
 	}
-	if node.closing || node.shuttingDown {
-		return nil, fmt.Errorf("pool %q is closed", node.Name)
+
+	// If a dispatched job then send a return event to the node that
+	// dispatched the job.
+	if pending.EventName == evStartJob {
+		_, nodeID := unmarshalJobKeyAndNodeID(pending.Payload)
+		stream, err := streaming.NewStream(nodeStreamName(node.Name, nodeID), node.rdb, soptions.WithStreamLogger(node.logger))
+		if err != nil {
+			node.logger.Error(fmt.Errorf("failed to create node event stream %q: %w", nodeStreamName(node.Name, nodeID), err))
+			return
+		}
+		ack.EventID = pending.ID
+		if _, err := stream.Add(ctx, evDispatchReturn, marshalAck(ack)); err != nil {
+			node.logger.Error(fmt.Errorf("failed to dispatch return to stream %q: %w", nodeStreamName(node.Name, nodeID), err))
+		}
 	}
-	job := marshalJob(&Job{Key: key, Payload: payload, CreatedAt: time.Now()})
-	if _, err := node.poolStream.Add(ctx, evStartJob, job); err != nil {
-		return nil, fmt.Errorf("failed to add job to stream %q: %w", node.poolStream.Name, err)
+
+	// Ack the sink event so it does not get redelivered.
+	if err := node.poolSink.Ack(ctx, pending); err != nil {
+		node.logger.Error(fmt.Errorf("failed to ack event: %w", err), "event", pending.EventName, "event-id", pending.ID)
 	}
-	cherr := make(chan error, 1)
-	node.pendingJobs[key] = cherr
-	return cherr, nil
+	delete(node.pendingEvents, key)
+
+	// Garbage collect stale events.
+	var staleKeys []string
+	for key, ev := range node.pendingEvents {
+		if time.Since(ev.CreatedAt()) > 2*node.pendingJobTTL {
+			staleKeys = append(staleKeys, key)
+		}
+	}
+	for _, key := range staleKeys {
+		node.logger.Error(fmt.Errorf("stale event, removing from pending events"), "event", node.pendingEvents[key].EventName, "key", key)
+		delete(node.pendingEvents, key)
+	}
+}
+
+// returnDispatchStatus returns the start job result to the caller.
+func (node *Node) returnDispatchStatus(ctx context.Context, ev *streaming.Event) {
+	node.lock.Lock()
+	defer node.lock.Unlock()
+
+	ack := unmarshalAck(ev.Payload)
+	cherr, ok := node.pendingJobs[ack.EventID]
+	if !ok {
+		node.logger.Error(fmt.Errorf("received dispatch return for unknown event %s", ack.EventID))
+		return
+	}
+	var err error
+	if ack.Error != "" {
+		err = errors.New(ack.Error)
+	}
+	cherr <- err
 }
 
 // manageWorkers receives notifications from the workers replicated map and
