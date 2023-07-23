@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"strings"
@@ -25,17 +26,6 @@ func init() {
 		redisPwd = p
 	}
 }
-
-type workerMock struct {
-	startFunc  func(job *Job) error
-	stopFunc   func(key string) error
-	notifyFunc func(payload []byte) error
-	jobs       map[string]*Job
-}
-
-func (w *workerMock) Start(job *Job) error  { return w.startFunc(job) }
-func (w *workerMock) Stop(key string) error { return w.stopFunc(key) }
-func (w *workerMock) Notify(p []byte) error { return w.notifyFunc(p) }
 
 func TestDispatchJobOneWorker(t *testing.T) {
 	var (
@@ -129,6 +119,12 @@ func testContext(t *testing.T) context.Context {
 	return log.Context(context.Background(), log.WithDebug())
 }
 
+func testLogContext(t *testing.T) (context.Context, *bytes.Buffer) {
+	t.Helper()
+	var buf bytes.Buffer
+	return log.Context(context.Background(), log.WithOutput(&buf), log.WithFormat(log.FormatText), log.WithDebug()), &buf
+}
+
 func numJobs(t *testing.T, w *Worker) int {
 	t.Helper()
 	w.lock.Lock()
@@ -152,3 +148,14 @@ func cleanup(t *testing.T, rdb *redis.Client, checkClean bool, testName string) 
 	}
 	assert.NoError(t, rdb.FlushDB(ctx).Err())
 }
+
+type workerMock struct {
+	startFunc  func(job *Job) error
+	stopFunc   func(key string) error
+	notifyFunc func(payload []byte) error
+	jobs       map[string]*Job
+}
+
+func (w *workerMock) Start(job *Job) error  { return w.startFunc(job) }
+func (w *workerMock) Stop(key string) error { return w.stopFunc(key) }
+func (w *workerMock) Notify(p []byte) error { return w.notifyFunc(p) }

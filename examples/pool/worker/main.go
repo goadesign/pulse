@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"sync"
 	"time"
 
@@ -22,8 +23,8 @@ type (
 		executions map[string]*Execution
 		// node is the node the worker is registered with.
 		node *pool.Node
-		// done is closed when the worker is stopped.
-		done chan struct{}
+		// logctx is the logger context.
+		logctx context.Context
 	}
 
 	// Execution represents a single execution.
@@ -34,31 +35,42 @@ type (
 )
 
 func main() {
-	ctx := log.Context(context.Background(), log.WithDebug())
+	// Setup Redis connection
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     "localhost:6379",
 		Password: os.Getenv("REDIS_PASSWORD"),
 	})
 
+	// Setup clue logger.
+	ctx := log.Context(context.Background())
+	log.FlushAndDisableBuffering(ctx)
+
+	var logger pulse.Logger
+	if len(os.Args) > 1 && os.Args[1] == "-v" {
+		logger = pulse.ClueLogger(ctx)
+	}
+
 	// Create node for pool "example".
-	node, err := pool.AddNode(ctx,
-		"example",
-		rdb,
-		pool.WithLogger(pulse.ClueLogger(ctx)))
+	node, err := pool.AddNode(ctx, "example", rdb, pool.WithLogger(logger))
 	if err != nil {
 		panic(err)
 	}
 
 	// Create a new worker for pool "example".
-	c := make(chan struct{})
-	handler := &JobHandler{executions: make(map[string]*Execution), node: node, done: c}
+	handler := &JobHandler{executions: make(map[string]*Execution), node: node, logctx: ctx}
 	if _, err := node.AddWorker(ctx, handler); err != nil {
 		panic(err)
 	}
 
 	// Wait for jobs to complete.
-	fmt.Println("Waiting for jobs...")
-	<-c
+	log.Infof(ctx, "Waiting for jobs... CTRL+C to stop.")
+
+	// Close done channel on CTRL-C.
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, os.Interrupt)
+	<-sigc
+	close(sigc)
+
 	if err := node.Shutdown(ctx); err != nil {
 		panic(err)
 	}
@@ -70,7 +82,7 @@ func (w *JobHandler) Start(job *pool.Job) error {
 	defer w.lock.Unlock()
 	exec := &Execution{c: make(chan struct{})}
 	w.executions[job.Key] = exec
-	go exec.Start(job)
+	go exec.Start(w.logctx, job)
 	return nil
 }
 
@@ -84,23 +96,21 @@ func (w *JobHandler) Stop(key string) error {
 	}
 	close(exec.c)
 	delete(w.executions, key)
-	if key == "two" {
-		close(w.done)
-	}
 	return nil
 }
 
 // Print notification.
 func (w *JobHandler) HandleNotification(key string, payload []byte) error {
-	fmt.Printf(">> Notification: %s\n", string(payload))
+	log.Info(w.logctx, log.Fields{"msg": "notification", "key": key, "payload": string(payload)})
 	return nil
 }
 
 // Start execution.
-func (c *Execution) Start(job *pool.Job) {
-	defer fmt.Printf("Worker %s, Job %s, Done\n", job.Worker.ID, job.Key)
+func (c *Execution) Start(ctx context.Context, job *pool.Job) {
+	log.Info(ctx, log.Fields{"msg": "job started", "worker-id": job.Worker.ID, "job": job.Key})
+	defer log.Info(ctx, log.Fields{"msg": "job done", "worker-id": job.Worker.ID, "job": job.Key})
 	i := 1
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {
@@ -108,7 +118,7 @@ func (c *Execution) Start(job *pool.Job) {
 			return
 		case <-ticker.C:
 			i++
-			fmt.Printf(">> Worker %s, Job %s, Iteration %d\n", job.Worker.ID, job.Key, i)
+			log.Info(ctx, log.Fields{"msg": "tick", "worker-id": job.Worker.ID, "job": job.Key, "i": i})
 		}
 	}
 }

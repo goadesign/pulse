@@ -55,6 +55,8 @@ type (
 		CreatedAt time.Time
 		// Worker is the worker that handles the job.
 		Worker *Worker
+		// NodeID is the ID of the node that created the job.
+		NodeID string
 	}
 
 	// JobHandler starts and stops jobs.
@@ -173,9 +175,10 @@ func (w *Worker) handleEvents(c <-chan *streaming.Event) {
 				}
 				w.ackPoolEvent(ctx, nodeID, ev.ID, err)
 				w.logger.Error(fmt.Errorf("%s handler failed: %w", ev.EventName, err), "event-id", ev.ID)
+				continue
 			}
 			w.ackPoolEvent(ctx, nodeID, ev.ID, nil)
-			w.logger.Info("handled "+ev.EventName, "worker", w.ID)
+			w.logger.Info("handled", "event-id", ev.ID, "event-name", ev.EventName)
 		case <-w.done:
 			return
 		}

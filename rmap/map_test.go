@@ -164,6 +164,31 @@ func TestMapLocal(t *testing.T) {
 	cleanup(t, m)
 }
 
+func TestTestAndSet(t *testing.T) {
+	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+	ctx := context.Background()
+	m, err := Join(ctx, "test", rdb)
+	require.NoError(t, err)
+	defer cleanup(t, m)
+	const key, testVal, val = "foo", "bar", "baz"
+
+	old, err := m.Set(ctx, key, testVal)
+	assert.NoError(t, err)
+	assert.Equal(t, "", old)
+	assert.Eventually(t, func() bool { return m.Map()[key] == testVal }, wf, tck)
+
+	old, err = m.TestAndSet(ctx, key, testVal, val)
+	assert.NoError(t, err)
+	assert.Equal(t, testVal, old)
+	assert.Eventually(t, func() bool { return m.Map()[key] == val }, wf, tck)
+
+	old, err = m.TestAndSet(ctx, key, "", testVal)
+	assert.NoError(t, err)
+	assert.Equal(t, val, old)
+	time.Sleep(50 * time.Millisecond)
+	assert.Equal(t, val, m.Map()[key])
+}
+
 func TestArrays(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	ctx := context.Background()
