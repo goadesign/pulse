@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -20,12 +21,16 @@ func TestSchedule(t *testing.T) {
 		worker   = newTestWorker(t, ctx, node)
 		d        = 10 * time.Millisecond
 		iter     = 0
+		lock     sync.Mutex
 	)
 	defer cleanup(t, rdb, false, testName)
 
+	inc := func() { lock.Lock(); iter++; lock.Unlock() }
+	it := func() int { lock.Lock(); defer lock.Unlock(); return iter }
+
 	producer := newTestProducer(testName, func() (*JobPlan, error) {
-		iter++
-		switch iter {
+		inc()
+		switch it() {
 		case 1:
 			assert.Equal(t, 0, numJobs(t, worker), "unexpected number of jobs")
 			// First iteration: start a job
@@ -60,17 +65,19 @@ func TestSchedule(t *testing.T) {
 			// Seventh iteration: stop schedule
 			return nil, ErrScheduleStop
 		}
-		t.Errorf("unexpected iteration %d", iter)
+		t.Errorf("unexpected iteration %d", it())
 		return nil, nil
 	})
 
 	// Observe call to reset
-	jobMap, err := rmap.Join(ctx, testName, rdb)
+	jobMap, err := rmap.Join(ctx, testName+":"+testName, rdb)
 	require.NoError(t, err)
 	var reset bool
 	c := jobMap.Subscribe()
 	defer jobMap.Unsubscribe(c)
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		for ev := range c {
 			if ev == rmap.EventReset {
 				reset = true
@@ -82,9 +89,14 @@ func TestSchedule(t *testing.T) {
 	err = node.Schedule(ctx, producer, d)
 	require.NoError(t, err)
 
-	jobMap.Subscribe()
-	assert.Eventually(t, func() bool { return iter == 7 }, max, delay, "schedule should have stopped")
-	assert.Eventually(t, func() bool { return reset }, max, delay, "job map should have been reset")
+	assert.Eventually(t, func() bool { return it() == 7 }, max, delay, "schedule should have stopped")
+	select {
+	case <-done:
+		reset = true
+	case <-time.After(time.Second):
+		break
+	}
+	assert.True(t, reset, "job map should have been reset")
 	assert.NotContains(t, buf.String(), "level=error", "unexpected logged error")
 }
 
