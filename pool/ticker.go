@@ -36,6 +36,7 @@ func (node *Node) NewTicker(ctx context.Context, name string, d time.Duration, o
 	if node.clientOnly {
 		return nil, fmt.Errorf("cannot create ticker on client-only node")
 	}
+	name = node.Name + ":" + name
 	o := parseTickerOptions(opts...)
 	logger := o.logger
 	if logger == nil {

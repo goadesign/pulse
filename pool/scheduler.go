@@ -71,16 +71,17 @@ var ErrScheduleStop = fmt.Errorf("stop")
 // returns ErrScheduleStop. Plan is called on only one of the nodes that
 // scheduled the same producer.
 func (node *Node) Schedule(ctx context.Context, producer JobProducer, interval time.Duration) error {
-	jobMap, err := rmap.Join(ctx, producer.Name(), node.rdb, rmap.WithLogger(node.logger))
+	name := node.Name + ":" + producer.Name()
+	jobMap, err := rmap.Join(ctx, name, node.rdb, rmap.WithLogger(node.logger))
 	if err != nil {
-		return fmt.Errorf("failed to join job map: %w", err)
+		return fmt.Errorf("failed to join job map %s: %w", name, err)
 	}
 	ticker, err := node.NewTicker(ctx, producer.Name(), interval)
 	if err != nil {
-		return fmt.Errorf("failed to create ticker: %w", err)
+		return fmt.Errorf("failed to create ticker %s: %w", name, err)
 	}
 	sched := &scheduler{
-		name:     producer.Name(),
+		name:     name,
 		interval: interval,
 		producer: producer,
 		node:     node,

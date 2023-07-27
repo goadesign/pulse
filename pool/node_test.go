@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -119,9 +120,9 @@ func testContext(t *testing.T) context.Context {
 	return log.Context(context.Background(), log.WithDebug())
 }
 
-func testLogContext(t *testing.T) (context.Context, *bytes.Buffer) {
+func testLogContext(t *testing.T) (context.Context, *buffer) {
 	t.Helper()
-	var buf bytes.Buffer
+	var buf buffer
 	return log.Context(context.Background(), log.WithOutput(&buf), log.WithFormat(log.FormatText), log.WithDebug()), &buf
 }
 
@@ -159,3 +160,21 @@ type workerMock struct {
 func (w *workerMock) Start(job *Job) error  { return w.startFunc(job) }
 func (w *workerMock) Stop(key string) error { return w.stopFunc(key) }
 func (w *workerMock) Notify(p []byte) error { return w.notifyFunc(p) }
+
+// buffer is a goroutine safe bytes.Buffer
+type buffer struct {
+	buffer bytes.Buffer
+	mutex  sync.Mutex
+}
+
+func (s *buffer) Write(p []byte) (n int, err error) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	return s.buffer.Write(p)
+}
+
+func (s *buffer) String() string {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	return s.buffer.String()
+}
