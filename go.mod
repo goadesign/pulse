@@ -10,7 +10,7 @@ require (
 	goa.design/clue v0.18.0
 	goa.design/goa/v3 v3.11.3
 	goa.design/model v1.8.0
-	google.golang.org/grpc v1.55.0
+	google.golang.org/grpc v1.56.3
 )
 
 require (
