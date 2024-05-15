@@ -488,7 +488,6 @@ func (node *Node) ackWorkerEvent(ctx context.Context, ev *streaming.Event) {
 	pending, ok := node.pendingEvents[key]
 	if !ok {
 		node.logger.Error(fmt.Errorf("received event %s from worker %s that was not dispatched", ack.EventID, workerID))
-		node.lock.Unlock()
 		return
 	}
 
