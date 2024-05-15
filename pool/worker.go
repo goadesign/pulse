@@ -192,7 +192,7 @@ func (w *Worker) stop(ctx context.Context) {
 	w.lock.Lock()
 	defer w.lock.Unlock()
 	if w.stopped {
-		w.lock.Unlock()
+		return
 	}
 	w.stopped = true
 	var err error
@@ -233,7 +233,6 @@ func (w *Worker) startJob(ctx context.Context, job *Job) error {
 	w.lock.Lock()
 	defer w.lock.Unlock()
 	if w.stopped {
-		w.lock.Unlock()
 		return fmt.Errorf("worker %q stopped", w.ID)
 	}
 	job.Worker = w
@@ -251,7 +250,6 @@ func (w *Worker) stopJob(ctx context.Context, key string) error {
 	w.lock.Lock()
 	defer w.lock.Unlock()
 	if w.stopped {
-		w.lock.Unlock()
 		return nil
 	}
 	if _, ok := w.jobs[key]; !ok {
@@ -270,7 +268,6 @@ func (w *Worker) notify(ctx context.Context, key string, payload []byte) error {
 	w.lock.Lock()
 	defer w.lock.Unlock()
 	if w.stopped {
-		w.lock.Unlock()
 		w.logger.Debug("worker stopped, ignoring notification")
 		return nil
 	}

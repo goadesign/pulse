@@ -1,5 +1,5 @@
 /*
-Package poller implments a simple poller for the weather service.
+Package poller implements a simple poller for the weather service.
 It consists of a Pulse worker that periodically calls the weather service
 to retrieve the weather forecast for given US cities.
 */
