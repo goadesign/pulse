@@ -5,7 +5,6 @@ set -e
 mkdir -p /tmp/cortex/rule
 mkdir -p /tmp/tempo
 
-
 GIT_ROOT=$(git rev-parse --show-toplevel)
 
 echo "Starting Redis..."
@@ -25,7 +24,7 @@ else
     export HOST_GATEWAY='host-gateway'
 fi
 
-docker-compose -f docker-compose/docker-compose-grafana.yaml up -d 
+docker-compose -f signoz/deploy/docker/clickhouse-setup/docker-compose.yaml up -d 
 
 overmind start --timeout 60
 

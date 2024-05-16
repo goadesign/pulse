@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"os/signal"
@@ -14,14 +15,15 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/httptrace/otelhttptrace"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"goa.design/clue/clue"
 	"goa.design/clue/debug"
 	"goa.design/clue/health"
 	"goa.design/clue/log"
-	"goa.design/clue/metrics"
-	"goa.design/clue/trace"
 	goahttp "goa.design/goa/v3/http"
-	goahttpmiddleware "goa.design/goa/v3/http/middleware"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"goa.design/pulse/examples/weather/services/forecaster"
@@ -33,10 +35,10 @@ import (
 func main() {
 	var (
 		httpaddr    = flag.String("http-addr", ":8080", "HTTP listen address")
-		metricsAddr = flag.String("metrics-addr", ":8081", "metrics listen address")
+		metricsAddr = flag.String("metrics-addr", ":8085", "metrics listen address")
 		polleraddr  = flag.String("poller-addr", ":8082", "Poller service HTTP address")
 		redisurl    = flag.String("redis-url", "redis://default:"+os.Getenv("REDIS_PASSWORD")+"@localhost:6379/0", "Redis URL")
-		agentaddr   = flag.String("agent-addr", ":4317", "Grafana agent listen address")
+		coladdr     = flag.String("otel-addr", ":4317", "OpenTelemetry collector listen address")
 		debugf      = flag.Bool("debug", false, "Enable debug logs")
 	)
 	flag.Parse()
@@ -46,31 +48,50 @@ func main() {
 	if log.IsTerminal() {
 		format = log.FormatTerminal
 	}
-	ctx := log.Context(context.Background(), log.WithFormat(format), log.WithFunc(trace.Log))
+	ctx := log.Context(context.Background(), log.WithFormat(format), log.WithFunc(log.Span))
 	ctx = log.With(ctx, log.KV{K: "svc", V: genforecaster.ServiceName})
 	if *debugf {
 		ctx = log.Context(ctx, log.WithDebug())
 		log.Debugf(ctx, "debug logs enabled")
 	}
 
-	// 2. Setup tracing
-	log.Debugf(ctx, "connecting to Grafana agent %s", *agentaddr)
-	conn, err := grpc.DialContext(ctx, *agentaddr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock())
+	// 2. Setup instrumentation
+	spanExporter, err := otlptracegrpc.New(ctx,
+		otlptracegrpc.WithEndpoint(*coladdr),
+		otlptracegrpc.WithTLSCredentials(insecure.NewCredentials()))
 	if err != nil {
-		log.Errorf(ctx, err, "failed to connect to Grafana agent")
-		os.Exit(1)
+		log.Fatalf(ctx, err, "failed to initialize tracing")
 	}
-	log.Debugf(ctx, "connected to Grafana agent %s", *agentaddr)
-	ctx, err = trace.Context(ctx, genforecaster.ServiceName, trace.WithGRPCExporter(conn))
+	defer func() {
+		// Create new context in case the parent context has been canceled.
+		ctx := log.Context(context.Background(), log.WithFormat(format))
+		if err := spanExporter.Shutdown(ctx); err != nil {
+			log.Errorf(ctx, err, "failed to shutdown tracing")
+		}
+	}()
+	metricExporter, err := otlpmetricgrpc.New(ctx,
+		otlpmetricgrpc.WithEndpoint(*coladdr),
+		otlpmetricgrpc.WithTLSCredentials(insecure.NewCredentials()))
 	if err != nil {
-		log.Errorf(ctx, err, "failed to initialize tracing")
-		os.Exit(1)
+		log.Fatalf(ctx, err, "failed to initialize metrics")
 	}
-
-	// 3. Setup metrics
-	ctx = metrics.Context(ctx, genforecaster.ServiceName)
+	defer func() {
+		// Create new context in case the parent context has been canceled.
+		ctx := log.Context(context.Background(), log.WithFormat(format))
+		if err := metricExporter.Shutdown(ctx); err != nil {
+			log.Errorf(ctx, err, "failed to shutdown metrics")
+		}
+	}()
+	cfg, err := clue.NewConfig(ctx,
+		genforecaster.ServiceName,
+		genforecaster.APIVersion,
+		metricExporter,
+		spanExporter,
+	)
+	if err != nil {
+		log.Fatalf(ctx, err, "failed to initialize instrumentation")
+	}
+	clue.ConfigureOpenTelemetry(ctx, cfg)
 
 	// 4. Create clients
 
@@ -85,9 +106,15 @@ func main() {
 		os.Exit(1)
 	}
 	scheme, host := u.Scheme, u.Host
-	transport := trace.Client(ctx, log.Client(http.DefaultTransport))
-	httpc := http.Client{Transport: transport}
-	pc := poller.New(scheme, host, &httpc)
+	httpc := &http.Client{
+		Transport: log.Client(
+			otelhttp.NewTransport(
+				http.DefaultTransport,
+				otelhttp.WithClientTrace(func(ctx context.Context) *httptrace.ClientTrace {
+					return otelhttptrace.NewClientTrace(ctx)
+				}),
+			))}
+	pc := poller.New(scheme, host, httpc)
 
 	// Pulse replicated map for forecast cache
 	opt, err := redis.ParseURL(*redisurl)
@@ -101,9 +128,9 @@ func main() {
 	check := health.Handler(health.NewChecker(
 		health.NewPinger("pc", *polleraddr),
 	))
+	check = log.HTTP(ctx)(check).(http.HandlerFunc) // Log health-check errors
 	http.Handle("/healthz", check)
 	http.Handle("/livez", check)
-	http.Handle("/metrics", metrics.Handler(ctx).(http.HandlerFunc))
 	metricsServer := &http.Server{Addr: *metricsAddr}
 
 	// 6. Create service & endpoints
@@ -114,15 +141,13 @@ func main() {
 
 	// 7. Create transport
 	mux := goahttp.NewMuxer()
-	mux.Use(metrics.HTTP(ctx))
 	debug.MountDebugLogEnabler(debug.Adapt(mux))
+	debug.MountPprofHandlers(debug.Adapt(mux))
+	handler := otelhttp.NewHandler(mux, genforecaster.ServiceName) // 3. Add OpenTelemetry instrumentation
+	handler = debug.HTTP()(handler)                                // 2. Add debug endpoints
+	handler = log.HTTP(ctx)(handler)                               // 1. Add logger to request context
 	server := genhttp.New(endpoints, mux, goahttp.RequestDecoder, goahttp.ResponseEncoder, nil, nil)
 	genhttp.Mount(mux, server)
-	handler := debug.HTTP()(mux)                                               // 5. Manage debug logs dynamically
-	handler = trace.HTTP(ctx)(handler)                                         // 4. Trace request (adds Trace ID to context)
-	handler = goahttpmiddleware.LogContext(log.AsGoaMiddlewareLogger)(handler) // 3. Log request and response
-	handler = log.HTTP(ctx)(handler)                                           // 2. Add logger to request context
-	handler = goahttpmiddleware.RequestID()(handler)                           // 1. Add request ID to context
 	for _, m := range server.Mounts {
 		log.Print(ctx, log.KV{K: "method", V: m.Method}, log.KV{K: "endpoint", V: m.Verb + " " + m.Pattern})
 	}

@@ -2,7 +2,7 @@ swagger: "2.0"
 info:
     title: The Poller Service API
     description: US weather forecast poller service API
-    version: ""
+    version: 0.0.1
 host: localhost:80
 basePath: /poller
 consumes:
@@ -326,7 +326,7 @@ definitions:
             temporary:
                 type: boolean
                 description: Is the error temporary?
-                example: false
+                example: true
             timeout:
                 type: boolean
                 description: Is the error a timeout?
@@ -337,7 +337,7 @@ definitions:
             id: 123abc
             message: parameter 'p' must be an integer
             name: bad_request
-            temporary: false
+            temporary: true
             timeout: false
         required:
             - name
@@ -364,46 +364,6 @@ definitions:
                     $ref: '#/definitions/JobResponseBody'
                 description: Worker poll jobs
                 example:
-                    - created_at: "2020-09-01T12:00:00Z"
-                      key: "1"
-                      payload:
-                        - 123
-                        - 34
-                        - 115
-                        - 116
-                        - 97
-                        - 116
-                        - 101
-                        - 34
-                        - 58
-                        - 34
-                        - 67
-                        - 65
-                        - 34
-                        - 44
-                        - 34
-                        - 99
-                        - 105
-                        - 116
-                        - 121
-                        - 34
-                        - 58
-                        - 34
-                        - 83
-                        - 97
-                        - 110
-                        - 116
-                        - 97
-                        - 32
-                        - 66
-                        - 97
-                        - 114
-                        - 98
-                        - 97
-                        - 114
-                        - 97
-                        - 34
-                        - 125
                     - created_at: "2020-09-01T12:00:00Z"
                       key: "1"
                       payload:
@@ -568,86 +528,6 @@ definitions:
                     - 97
                     - 34
                     - 125
-                - created_at: "2020-09-01T12:00:00Z"
-                  key: "1"
-                  payload:
-                    - 123
-                    - 34
-                    - 115
-                    - 116
-                    - 97
-                    - 116
-                    - 101
-                    - 34
-                    - 58
-                    - 34
-                    - 67
-                    - 65
-                    - 34
-                    - 44
-                    - 34
-                    - 99
-                    - 105
-                    - 116
-                    - 121
-                    - 34
-                    - 58
-                    - 34
-                    - 83
-                    - 97
-                    - 110
-                    - 116
-                    - 97
-                    - 32
-                    - 66
-                    - 97
-                    - 114
-                    - 98
-                    - 97
-                    - 114
-                    - 97
-                    - 34
-                    - 125
-                - created_at: "2020-09-01T12:00:00Z"
-                  key: "1"
-                  payload:
-                    - 123
-                    - 34
-                    - 115
-                    - 116
-                    - 97
-                    - 116
-                    - 101
-                    - 34
-                    - 58
-                    - 34
-                    - 67
-                    - 65
-                    - 34
-                    - 44
-                    - 34
-                    - 99
-                    - 105
-                    - 116
-                    - 121
-                    - 34
-                    - 58
-                    - 34
-                    - 83
-                    - 97
-                    - 110
-                    - 116
-                    - 97
-                    - 32
-                    - 66
-                    - 97
-                    - 114
-                    - 98
-                    - 97
-                    - 114
-                    - 97
-                    - 34
-                    - 125
         required:
             - id
             - jobs
@@ -675,18 +555,18 @@ definitions:
             temporary:
                 type: boolean
                 description: Is the error temporary?
-                example: true
+                example: false
             timeout:
                 type: boolean
                 description: Is the error a timeout?
                 example: false
         description: Only one worker left (default view)
         example:
-            fault: false
+            fault: true
             id: 123abc
             message: parameter 'p' must be an integer
             name: bad_request
-            temporary: false
+            temporary: true
             timeout: true
         required:
             - name
@@ -705,6 +585,46 @@ definitions:
                     $ref: '#/definitions/JobResponseBody'
                 description: Location poll jobs
                 example:
+                    - created_at: "2020-09-01T12:00:00Z"
+                      key: "1"
+                      payload:
+                        - 123
+                        - 34
+                        - 115
+                        - 116
+                        - 97
+                        - 116
+                        - 101
+                        - 34
+                        - 58
+                        - 34
+                        - 67
+                        - 65
+                        - 34
+                        - 44
+                        - 34
+                        - 99
+                        - 105
+                        - 116
+                        - 121
+                        - 34
+                        - 58
+                        - 34
+                        - 83
+                        - 97
+                        - 110
+                        - 116
+                        - 97
+                        - 32
+                        - 66
+                        - 97
+                        - 114
+                        - 98
+                        - 97
+                        - 114
+                        - 97
+                        - 34
+                        - 125
                     - created_at: "2020-09-01T12:00:00Z"
                       key: "1"
                       payload:
@@ -914,6 +834,46 @@ definitions:
                             - 97
                             - 34
                             - 125
+                        - created_at: "2020-09-01T12:00:00Z"
+                          key: "1"
+                          payload:
+                            - 123
+                            - 34
+                            - 115
+                            - 116
+                            - 97
+                            - 116
+                            - 101
+                            - 34
+                            - 58
+                            - 34
+                            - 67
+                            - 65
+                            - 34
+                            - 44
+                            - 34
+                            - 99
+                            - 105
+                            - 116
+                            - 121
+                            - 34
+                            - 58
+                            - 34
+                            - 83
+                            - 97
+                            - 110
+                            - 116
+                            - 97
+                            - 32
+                            - 66
+                            - 97
+                            - 114
+                            - 98
+                            - 97
+                            - 114
+                            - 97
+                            - 34
+                            - 125
                     - created_at: "2020-09-01T12:00:00Z"
                       id: "1"
                       jobs:
@@ -997,8 +957,88 @@ definitions:
                             - 97
                             - 34
                             - 125
+                        - created_at: "2020-09-01T12:00:00Z"
+                          key: "1"
+                          payload:
+                            - 123
+                            - 34
+                            - 115
+                            - 116
+                            - 97
+                            - 116
+                            - 101
+                            - 34
+                            - 58
+                            - 34
+                            - 67
+                            - 65
+                            - 34
+                            - 44
+                            - 34
+                            - 99
+                            - 105
+                            - 116
+                            - 121
+                            - 34
+                            - 58
+                            - 34
+                            - 83
+                            - 97
+                            - 110
+                            - 116
+                            - 97
+                            - 32
+                            - 66
+                            - 97
+                            - 114
+                            - 98
+                            - 97
+                            - 114
+                            - 97
+                            - 34
+                            - 125
         example:
             jobs:
+                - created_at: "2020-09-01T12:00:00Z"
+                  key: "1"
+                  payload:
+                    - 123
+                    - 34
+                    - 115
+                    - 116
+                    - 97
+                    - 116
+                    - 101
+                    - 34
+                    - 58
+                    - 34
+                    - 67
+                    - 65
+                    - 34
+                    - 44
+                    - 34
+                    - 99
+                    - 105
+                    - 116
+                    - 121
+                    - 34
+                    - 58
+                    - 34
+                    - 83
+                    - 97
+                    - 110
+                    - 116
+                    - 97
+                    - 32
+                    - 66
+                    - 97
+                    - 114
+                    - 98
+                    - 97
+                    - 114
+                    - 97
+                    - 34
+                    - 125
                 - created_at: "2020-09-01T12:00:00Z"
                   key: "1"
                   payload:
@@ -1203,6 +1243,46 @@ definitions:
                         - 97
                         - 34
                         - 125
+                    - created_at: "2020-09-01T12:00:00Z"
+                      key: "1"
+                      payload:
+                        - 123
+                        - 34
+                        - 115
+                        - 116
+                        - 97
+                        - 116
+                        - 101
+                        - 34
+                        - 58
+                        - 34
+                        - 67
+                        - 65
+                        - 34
+                        - 44
+                        - 34
+                        - 99
+                        - 105
+                        - 116
+                        - 121
+                        - 34
+                        - 58
+                        - 34
+                        - 83
+                        - 97
+                        - 110
+                        - 116
+                        - 97
+                        - 32
+                        - 66
+                        - 97
+                        - 114
+                        - 98
+                        - 97
+                        - 114
+                        - 97
+                        - 34
+                        - 125
                 - created_at: "2020-09-01T12:00:00Z"
                   id: "1"
                   jobs:
@@ -1286,9 +1366,89 @@ definitions:
                         - 97
                         - 34
                         - 125
+                    - created_at: "2020-09-01T12:00:00Z"
+                      key: "1"
+                      payload:
+                        - 123
+                        - 34
+                        - 115
+                        - 116
+                        - 97
+                        - 116
+                        - 101
+                        - 34
+                        - 58
+                        - 34
+                        - 67
+                        - 65
+                        - 34
+                        - 44
+                        - 34
+                        - 99
+                        - 105
+                        - 116
+                        - 121
+                        - 34
+                        - 58
+                        - 34
+                        - 83
+                        - 97
+                        - 110
+                        - 116
+                        - 97
+                        - 32
+                        - 66
+                        - 97
+                        - 114
+                        - 98
+                        - 97
+                        - 114
+                        - 97
+                        - 34
+                        - 125
                 - created_at: "2020-09-01T12:00:00Z"
                   id: "1"
                   jobs:
+                    - created_at: "2020-09-01T12:00:00Z"
+                      key: "1"
+                      payload:
+                        - 123
+                        - 34
+                        - 115
+                        - 116
+                        - 97
+                        - 116
+                        - 101
+                        - 34
+                        - 58
+                        - 34
+                        - 67
+                        - 65
+                        - 34
+                        - 44
+                        - 34
+                        - 99
+                        - 105
+                        - 116
+                        - 121
+                        - 34
+                        - 58
+                        - 34
+                        - 83
+                        - 97
+                        - 110
+                        - 116
+                        - 97
+                        - 32
+                        - 66
+                        - 97
+                        - 114
+                        - 98
+                        - 97
+                        - 114
+                        - 97
+                        - 34
+                        - 125
                     - created_at: "2020-09-01T12:00:00Z"
                       key: "1"
                       payload:
@@ -1396,12 +1556,6 @@ definitions:
                       summary: Clear
                       temperature: 70
                       temperatureUnit: F
-                    - endTime: "2020-01-01T00:00:00Z"
-                      name: Morning
-                      startTime: "2020-01-01T00:00:00Z"
-                      summary: Clear
-                      temperature: 70
-                      temperatureUnit: F
         example:
             location:
                 city: Santa Barbara
@@ -1409,18 +1563,6 @@ definitions:
                 long: -119.7049146
                 state: CA
             periods:
-                - endTime: "2020-01-01T00:00:00Z"
-                  name: Morning
-                  startTime: "2020-01-01T00:00:00Z"
-                  summary: Clear
-                  temperature: 70
-                  temperatureUnit: F
-                - endTime: "2020-01-01T00:00:00Z"
-                  name: Morning
-                  startTime: "2020-01-01T00:00:00Z"
-                  summary: Clear
-                  temperature: 70
-                  temperatureUnit: F
                 - endTime: "2020-01-01T00:00:00Z"
                   name: Morning
                   startTime: "2020-01-01T00:00:00Z"
@@ -1539,6 +1681,86 @@ definitions:
             created_at: "2020-09-01T12:00:00Z"
             id: "1"
             jobs:
+                - created_at: "2020-09-01T12:00:00Z"
+                  key: "1"
+                  payload:
+                    - 123
+                    - 34
+                    - 115
+                    - 116
+                    - 97
+                    - 116
+                    - 101
+                    - 34
+                    - 58
+                    - 34
+                    - 67
+                    - 65
+                    - 34
+                    - 44
+                    - 34
+                    - 99
+                    - 105
+                    - 116
+                    - 121
+                    - 34
+                    - 58
+                    - 34
+                    - 83
+                    - 97
+                    - 110
+                    - 116
+                    - 97
+                    - 32
+                    - 66
+                    - 97
+                    - 114
+                    - 98
+                    - 97
+                    - 114
+                    - 97
+                    - 34
+                    - 125
+                - created_at: "2020-09-01T12:00:00Z"
+                  key: "1"
+                  payload:
+                    - 123
+                    - 34
+                    - 115
+                    - 116
+                    - 97
+                    - 116
+                    - 101
+                    - 34
+                    - 58
+                    - 34
+                    - 67
+                    - 65
+                    - 34
+                    - 44
+                    - 34
+                    - 99
+                    - 105
+                    - 116
+                    - 121
+                    - 34
+                    - 58
+                    - 34
+                    - 83
+                    - 97
+                    - 110
+                    - 116
+                    - 97
+                    - 32
+                    - 66
+                    - 97
+                    - 114
+                    - 98
+                    - 97
+                    - 114
+                    - 97
+                    - 34
+                    - 125
                 - created_at: "2020-09-01T12:00:00Z"
                   key: "1"
                   payload:
