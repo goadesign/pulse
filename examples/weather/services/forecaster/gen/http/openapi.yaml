@@ -2,7 +2,7 @@ swagger: "2.0"
 info:
     title: The Forecaster Service API
     description: A fast US weather forecast service API
-    version: ""
+    version: 0.0.1
 host: localhost:80
 basePath: /forecast
 consumes:
@@ -79,12 +79,6 @@ definitions:
                       summary: Clear
                       temperature: 70
                       temperatureUnit: F
-                    - endTime: "2020-01-01T00:00:00Z"
-                      name: Morning
-                      startTime: "2020-01-01T00:00:00Z"
-                      summary: Clear
-                      temperature: 70
-                      temperatureUnit: F
         example:
             location:
                 city: Santa Barbara
@@ -92,6 +86,12 @@ definitions:
                 long: -119.7049146
                 state: CA
             periods:
+                - endTime: "2020-01-01T00:00:00Z"
+                  name: Morning
+                  startTime: "2020-01-01T00:00:00Z"
+                  summary: Clear
+                  temperature: 70
+                  temperatureUnit: F
                 - endTime: "2020-01-01T00:00:00Z"
                   name: Morning
                   startTime: "2020-01-01T00:00:00Z"
@@ -130,18 +130,18 @@ definitions:
             temporary:
                 type: boolean
                 description: Is the error temporary?
-                example: false
+                example: true
             timeout:
                 type: boolean
                 description: Is the error a timeout?
-                example: true
+                example: false
         description: Timeout retrieving forecast (default view)
         example:
-            fault: false
+            fault: true
             id: 123abc
             message: parameter 'p' must be an integer
             name: bad_request
-            temporary: false
+            temporary: true
             timeout: false
         required:
             - name

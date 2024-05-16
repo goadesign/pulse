@@ -2,7 +2,7 @@ openapi: 3.0.3
 info:
     title: The Forecaster Service API
     description: A fast US weather forecast service API
-    version: "1.0"
+    version: 0.0.1
 servers:
     - url: http://localhost:80
       description: Default server for Weather Forecaster Service API
@@ -104,9 +104,12 @@ components:
                     example: true
             description: Timeout retrieving forecast
             example:
-                id: 3F1FKVRR
-                message: Value of ID must be an integer
+                fault: false
+                id: 123abc
+                message: parameter 'p' must be an integer
                 name: bad_request
+                temporary: true
+                timeout: true
             required:
                 - name
                 - id
@@ -137,18 +140,6 @@ components:
                           summary: Clear
                           temperature: 70
                           temperatureUnit: F
-                        - endTime: "2020-01-01T00:00:00Z"
-                          name: Morning
-                          startTime: "2020-01-01T00:00:00Z"
-                          summary: Clear
-                          temperature: 70
-                          temperatureUnit: F
-                        - endTime: "2020-01-01T00:00:00Z"
-                          name: Morning
-                          startTime: "2020-01-01T00:00:00Z"
-                          summary: Clear
-                          temperature: 70
-                          temperatureUnit: F
             example:
                 location:
                     city: Santa Barbara
@@ -156,6 +147,18 @@ components:
                     long: -119.7049146
                     state: CA
                 periods:
+                    - endTime: "2020-01-01T00:00:00Z"
+                      name: Morning
+                      startTime: "2020-01-01T00:00:00Z"
+                      summary: Clear
+                      temperature: 70
+                      temperatureUnit: F
+                    - endTime: "2020-01-01T00:00:00Z"
+                      name: Morning
+                      startTime: "2020-01-01T00:00:00Z"
+                      summary: Clear
+                      temperature: 70
+                      temperatureUnit: F
                     - endTime: "2020-01-01T00:00:00Z"
                       name: Morning
                       startTime: "2020-01-01T00:00:00Z"
