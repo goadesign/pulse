@@ -170,7 +170,7 @@ func (sched *scheduler) stopJobs(ctx context.Context, plan *JobPlan) error {
 }
 
 // handleStop handles the scheduler stop signal.
-func (sched *scheduler) handleStop(ctx context.Context) {
+func (sched *scheduler) handleStop(_ context.Context) {
 	ch := sched.jobMap.Subscribe()
 	for ev := range ch {
 		if ev == rmap.EventReset {

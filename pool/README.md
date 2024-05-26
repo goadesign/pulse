@@ -20,7 +20,6 @@ Pulse uses the [Jump Consistent Hash](https://arxiv.org/abs/1406.2294) algorithm
 to assign jobs to workers which provides a good balance between load balancing
 and worker assignment stability.
 
-
 ```mermaid
 %%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
 flowchart LR
@@ -216,12 +215,12 @@ flowchart TD
     end
     pr --1. DispatchJob--> no
     no --2. Add Job--> js
-    js -.3. Job.-> ps
+    js --3. Job--> ps
     ps --4. Add Job--> ws
-    ws -.5. Job.-> r
+    ws --5. Job--> r
     r --6. Start Job--> u
     r --7. Add Ack--> rs
-    rs -.7. Ack.-> nr
+    rs --7. Ack--> nr
     nr --8. Ack Add Job Event--> js
     
     classDef userCode fill:#9A6D1F, stroke:#D9B871, stroke-width:2px, color:#FFF2CC;

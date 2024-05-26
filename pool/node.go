@@ -526,7 +526,7 @@ func (node *Node) ackWorkerEvent(ctx context.Context, ev *streaming.Event) {
 }
 
 // returnDispatchStatus returns the start job result to the caller.
-func (node *Node) returnDispatchStatus(ctx context.Context, ev *streaming.Event) {
+func (node *Node) returnDispatchStatus(_ context.Context, ev *streaming.Event) {
 	node.lock.Lock()
 	defer node.lock.Unlock()
 
@@ -738,7 +738,7 @@ func (node *Node) deleteWorker(ctx context.Context, id string) error {
 
 // workerStream retrieves the stream for a worker. It caches the result in the
 // workerStreams map. Caller is responsible for locking.
-func (node *Node) workerStream(ctx context.Context, id string) (*streaming.Stream, error) {
+func (node *Node) workerStream(_ context.Context, id string) (*streaming.Stream, error) {
 	stream, ok := node.workerStreams[id]
 	if !ok {
 		s, err := streaming.NewStream(workerStreamName(id), node.rdb, soptions.WithStreamLogger(node.logger))

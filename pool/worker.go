@@ -163,7 +163,9 @@ func (w *Worker) handleEvents(c <-chan *streaming.Event) {
 			case evStartJob:
 				err = w.startJob(ctx, unmarshalJob(payload))
 			case evStopJob:
+				w.lock.Lock()
 				err = w.stopJob(ctx, unmarshalJobKey(payload))
+				w.lock.Unlock()
 			case evNotify:
 				key, payload := unmarshalNotification(payload)
 				err = w.notify(ctx, key, payload)
@@ -229,7 +231,7 @@ func (w *Worker) stopAndWait(ctx context.Context) {
 }
 
 // startJob starts a job.
-func (w *Worker) startJob(ctx context.Context, job *Job) error {
+func (w *Worker) startJob(_ context.Context, job *Job) error {
 	w.lock.Lock()
 	defer w.lock.Unlock()
 	if w.stopped {
@@ -246,12 +248,8 @@ func (w *Worker) startJob(ctx context.Context, job *Job) error {
 }
 
 // stopJob stops a job.
-func (w *Worker) stopJob(ctx context.Context, key string) error {
-	w.lock.Lock()
-	defer w.lock.Unlock()
-	if w.stopped {
-		return nil
-	}
+// worker.lock must be held when calling this method.
+func (w *Worker) stopJob(_ context.Context, key string) error {
 	if _, ok := w.jobs[key]; !ok {
 		return fmt.Errorf("job %s not found", key)
 	}
@@ -264,7 +262,7 @@ func (w *Worker) stopJob(ctx context.Context, key string) error {
 }
 
 // notify notifies the worker with the given payload.
-func (w *Worker) notify(ctx context.Context, key string, payload []byte) error {
+func (w *Worker) notify(_ context.Context, key string, payload []byte) error {
 	w.lock.Lock()
 	defer w.lock.Unlock()
 	if w.stopped {
@@ -335,6 +333,9 @@ func (w *Worker) requeueJobs(ctx context.Context) {
 	w.lock.Lock()
 	defer w.lock.Unlock()
 	for _, job := range w.jobs {
+		if err := w.stopJob(ctx, job.Key); err != nil {
+			w.logger.Error(fmt.Errorf("failed to stop job %q: %w", job.Key, err))
+		}
 		if _, err := w.Node.poolStream.Add(ctx, evStartJob, marshalJob(job)); err != nil {
 			w.logger.Error(fmt.Errorf("failed to requeue job %q: %w", job.Key, err))
 		}
