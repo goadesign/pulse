@@ -9,9 +9,15 @@ pushd ${GIT_ROOT}
 
 staticcheck ./...
 
+# If --force is passed, add --count=1 to the go test command
+if [[ "$1" == "--force" ]]; then
+    shift
+    OPTIONS="--count=1"
+fi
+
 # Run tests one package at a time to avoid Redis race conditions
-go test -race goa.design/pulse/rmap/... 
-go test -race goa.design/pulse/streaming/...
-go test -race goa.design/pulse/pool/...
+go test -race goa.design/pulse/rmap/... $OPTIONS
+go test -race goa.design/pulse/streaming/... $OPTIONS
+go test -race goa.design/pulse/pool/... $OPTIONS
 
 popd

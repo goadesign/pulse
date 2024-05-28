@@ -76,9 +76,13 @@ func TestRemoveWorkerThenShutdown(t *testing.T) {
 		rdb      = redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 		node     = newTestNode(t, ctx, rdb, testName)
 		worker   = newTestWorker(t, ctx, node)
+		handler  = worker.handler.(*mockHandler)
 	)
 	defer cleanup(t, rdb, true, testName)
+	assert.NoError(t, node.DispatchJob(ctx, testName, []byte("payload")))
+	assert.Eventually(t, func() bool { return len(handler.jobs) == 1 }, max, delay)
 	assert.NoError(t, node.RemoveWorker(ctx, worker))
+	assert.Eventually(t, func() bool { return len(handler.jobs) == 0 }, max, delay)
 	assert.NoError(t, node.Shutdown(ctx))
 }
 
@@ -88,9 +92,14 @@ func TestClose(t *testing.T) {
 		testName = strings.Replace(t.Name(), "/", "_", -1)
 		rdb      = redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 		node     = newTestNode(t, ctx, rdb, testName)
+		worker   = newTestWorker(t, ctx, node)
+		handler  = worker.handler.(*mockHandler)
 	)
 	defer cleanup(t, rdb, false, testName)
+	assert.NoError(t, node.DispatchJob(ctx, testName, []byte("payload")))
+	assert.Eventually(t, func() bool { return len(handler.jobs) == 1 }, max, delay)
 	assert.NoError(t, node.Close(ctx))
+	assert.Eventually(t, func() bool { return len(handler.jobs) == 0 }, max, delay)
 }
 
 func newTestNode(t *testing.T, ctx context.Context, rdb *redis.Client, name string) *Node {
@@ -106,11 +115,11 @@ func newTestNode(t *testing.T, ctx context.Context, rdb *redis.Client, name stri
 
 func newTestWorker(t *testing.T, ctx context.Context, node *Node) *Worker {
 	t.Helper()
-	wm := &workerMock{jobs: make(map[string]*Job)}
-	wm.startFunc = func(job *Job) error { wm.jobs[job.Key] = job; return nil }
-	wm.stopFunc = func(key string) error { delete(wm.jobs, key); return nil }
-	wm.notifyFunc = func(payload []byte) error { return nil }
-	worker, err := node.AddWorker(ctx, wm)
+	handler := &mockHandler{jobs: make(map[string]*Job)}
+	handler.startFunc = func(job *Job) error { handler.jobs[job.Key] = job; return nil }
+	handler.stopFunc = func(key string) error { delete(handler.jobs, key); return nil }
+	handler.notifyFunc = func(payload []byte) error { return nil }
+	worker, err := node.AddWorker(ctx, handler)
 	require.NoError(t, err)
 	return worker
 }
@@ -150,16 +159,16 @@ func cleanup(t *testing.T, rdb *redis.Client, checkClean bool, testName string) 
 	assert.NoError(t, rdb.FlushDB(ctx).Err())
 }
 
-type workerMock struct {
+type mockHandler struct {
 	startFunc  func(job *Job) error
 	stopFunc   func(key string) error
 	notifyFunc func(payload []byte) error
 	jobs       map[string]*Job
 }
 
-func (w *workerMock) Start(job *Job) error  { return w.startFunc(job) }
-func (w *workerMock) Stop(key string) error { return w.stopFunc(key) }
-func (w *workerMock) Notify(p []byte) error { return w.notifyFunc(p) }
+func (w *mockHandler) Start(job *Job) error  { return w.startFunc(job) }
+func (w *mockHandler) Stop(key string) error { return w.stopFunc(key) }
+func (w *mockHandler) Notify(p []byte) error { return w.notifyFunc(p) }
 
 // buffer is a goroutine safe bytes.Buffer
 type buffer struct {
