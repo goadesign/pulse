@@ -278,7 +278,7 @@ func TestLogs(t *testing.T) {
 
 	// Check that the logs contain the expected messages
 	assert.Contains(t, buf.String(), `joined`)
-	assert.Contains(t, buf.String(), `foo=bar`)
+	assert.Contains(t, buf.String(), `key=foo val=bar`)
 	assert.Contains(t, buf.String(), `msg=deleted key=foo`)
 	assert.Contains(t, buf.String(), `reset`)
 	assert.Contains(t, buf.String(), `stopped`)

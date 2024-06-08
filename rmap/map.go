@@ -496,7 +496,7 @@ func (sm *Map) run() {
 				sm.logger.Debug("deleted", "key", key)
 			default:
 				sm.content[key] = val
-				sm.logger.Debug("set", key, val)
+				sm.logger.Debug("set", "key", key, "val", val)
 			}
 			select {
 			case sm.ichan <- struct{}{}:
