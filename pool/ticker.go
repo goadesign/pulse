@@ -53,8 +53,12 @@ func (node *Node) NewTicker(ctx context.Context, name string, d time.Duration, o
 		logger:    logger,
 	}
 	if current, ok := node.tickerMap.Get(name); ok {
-		t.next = current
-	} else {
+		_, curd := deserialize(current)
+		if d == curd {
+			t.next = current
+		}
+	}
+	if t.next == "" {
 		next := serialize(time.Now().Add(d), d)
 		if _, err := t.tickerMap.Set(ctx, t.name, next); err != nil {
 			return nil, fmt.Errorf("failed to store tick and duration: %s", err)
@@ -94,7 +98,9 @@ func (t *Ticker) Reset(d time.Duration) {
 func (t *Ticker) Stop() {
 	t.lock.Lock()
 	t.timer.Stop()
-	t.tickerMap.Delete(context.Background(), t.name)
+	if _, err := t.tickerMap.Delete(context.Background(), t.name); err != nil {
+		t.logger.Error(err, "msg", "failed to delete ticker")
+	}
 	t.tickerMap.Unsubscribe(t.mapch)
 	t.mapch = nil
 	t.lock.Unlock()
@@ -168,7 +174,7 @@ func (t *Ticker) handleTick() {
 // initTimer sets the timer to fire at the next tick.
 func (t *Ticker) initTimer() {
 	next, _ := deserialize(t.next)
-	d := next.Sub(time.Now())
+	d := time.Until(next)
 	if d < 0 {
 		d = 0
 	}

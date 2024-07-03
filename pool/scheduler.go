@@ -137,7 +137,10 @@ func (sched *scheduler) startJobs(ctx context.Context, jobs []*JobParam) error {
 			sched.logger.Error(err, "failed to dispatch job", "job", job.Key)
 			continue
 		}
-		sched.jobMap.Set(ctx, job.Key, time.Now().String())
+		if _, err := sched.jobMap.Set(ctx, job.Key, time.Now().String()); err != nil {
+			sched.logger.Error(err, "failed to store job", "job", job.Key)
+			continue
+		}
 	}
 	return nil
 }
@@ -164,7 +167,9 @@ func (sched *scheduler) stopJobs(ctx context.Context, plan *JobPlan) error {
 			sched.logger.Error(err, "failed to stop job", "job", key)
 			continue
 		}
-		sched.jobMap.Delete(ctx, key)
+		if _, err := sched.jobMap.Delete(ctx, key); err != nil {
+			sched.logger.Error(err, "failed to delete job", "job", key)
+		}
 	}
 	return nil
 }
