@@ -325,13 +325,17 @@ func (node *Node) Shutdown(ctx context.Context) error {
 	node.wg.Wait()
 	node.lock.Lock()
 	defer node.lock.Unlock()
-	node.cleanup() // cleanup first then close maps
+	if err := node.cleanup(); err != nil { // cleanup first then close maps
+		node.logger.Error(fmt.Errorf("failed to cleanup: %w", err))
+	}
 	node.tickerMap.Close()
 	node.keepAliveMap.Close()
 	node.workerMap.Close()
 	node.shutdownMap.Close()
 	node.nodeReader.Close()
-	node.nodeStream.Destroy(ctx)
+	if err := node.nodeStream.Destroy(ctx); err != nil {
+		node.logger.Error(fmt.Errorf("failed to destroy node event stream: %w", err))
+	}
 	node.shutdown = true
 	node.logger.Info("shutdown")
 	return nil
@@ -368,7 +372,9 @@ func (node *Node) Close(ctx context.Context) error {
 		node.shutdownMap.Close()
 	}
 	node.nodeReader.Close()
-	node.nodeStream.Destroy(ctx)
+	if err := node.nodeStream.Destroy(ctx); err != nil {
+		node.logger.Error(fmt.Errorf("failed to destroy node event stream: %w", err))
+	}
 	node.closed = true
 	close(node.stop)
 	node.lock.Unlock()
@@ -469,7 +475,9 @@ func (node *Node) handleNodeEvents(c <-chan *streaming.Event) {
 			}
 		case <-node.stop:
 			node.nodeReader.Close()
-			node.nodeStream.Destroy(ctx)
+			if err := node.nodeStream.Destroy(ctx); err != nil {
+				node.logger.Error(fmt.Errorf("failed to destroy node event stream: %w", err))
+			}
 			return
 		}
 	}
@@ -639,7 +647,9 @@ func (node *Node) handleShutdownMapUpdate() {
 	for _, w := range node.localWorkers {
 		// Add to stream instead of calling stop directly to ensure that the
 		// worker is stopped only after all pending events have been processed.
-		w.stream.Add(context.Background(), evShutdown, []byte(requestingNode))
+		if _, err := w.stream.Add(context.Background(), evShutdown, []byte(requestingNode)); err != nil {
+			node.logger.Error(fmt.Errorf("failed to add shutdown event to worker stream %q: %w", workerStreamName(w.ID), err))
+		}
 	}
 }
 
@@ -757,7 +767,7 @@ func (jh jumpHash) Hash(key string, numBuckets int64) int64 {
 	var j int64
 
 	jh.h.Reset()
-	io.WriteString(jh.h, key)
+	io.WriteString(jh.h, key) // nolint: errcheck
 	sum := jh.h.Sum64()
 
 	for j < numBuckets {
