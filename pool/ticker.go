@@ -110,7 +110,9 @@ func (t *Ticker) Stop() {
 // handleEvents handles events from the ticker timer and map.
 func (t *Ticker) handleEvents() {
 	defer t.wg.Done()
+	t.lock.Lock()
 	ch := t.mapch
+	t.lock.Unlock()
 	for {
 		select {
 		case _, ok := <-ch:
