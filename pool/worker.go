@@ -171,7 +171,7 @@ func (w *Worker) handleEvents(c <-chan *streaming.Event) {
 				err = w.notify(ctx, key, payload)
 			}
 			if err != nil {
-				if errors.Is(err, ErrRequeue) {
+				if errors.Is(err, errRequeue) {
 					w.logger.Info("requeue", ev.EventName, "after", w.pendingJobTTL, "error", err)
 					continue
 				}
