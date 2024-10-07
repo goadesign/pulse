@@ -8,6 +8,6 @@ pushd "${GIT_ROOT}"
 source ./scripts/utils/common.sh
 source .env
 
-docker-compose -p redis -f docker-compose/docker-compose-redis.yaml up -d --remove-orphans
+docker compose -p redis -f docker-compose/docker-compose-redis.yaml up -d --remove-orphans
 
 popd
