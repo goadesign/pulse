@@ -357,9 +357,19 @@ func (node *Node) Close(ctx context.Context) error {
 	}
 	node.logger.Info("closing")
 	node.closing = true
+
+	// Need to stop workers before requeueing jobs to prevent
+	// requeued jobs from being handled by this node.
+	var wg sync.WaitGroup
 	for _, w := range node.localWorkers {
-		go w.stopAndWait(ctx)
+		wg.Add(1)
+		go func(w *Worker) {
+			defer wg.Done()
+			w.stopAndWait(ctx)
+		}(w)
 	}
+	wg.Wait()
+
 	for _, w := range node.localWorkers {
 		w.requeueJobs(ctx)
 	}
