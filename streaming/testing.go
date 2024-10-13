@@ -27,7 +27,7 @@ func readOneEvent(t *testing.T, ctx context.Context, c <-chan *Event, sink *Sink
 		tck := time.NewTicker(time.Second)
 		select {
 		case read = <-c:
-			sink.Ack(ctx, read)
+			assert.NoError(t, sink.Ack(ctx, read))
 		case <-tck.C:
 			t.Error("timeout waiting for event")
 		}

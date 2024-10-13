@@ -19,7 +19,7 @@ func TestNewReader(t *testing.T) {
 	ctx := ptesting.NewTestContext(t)
 	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
-	reader, err := s.NewReader(ctx)
+	reader, err := s.NewReader(ctx, options.WithReaderBlockDuration(testBlockDuration))
 	assert.NoError(t, err)
 	assert.NotNil(t, reader)
 	defer cleanupReader(t, ctx, s, reader)
@@ -130,7 +130,7 @@ func TestAddReaderStream(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NoError(t, reader.AddStream(ctx, s2))
 	assert.NoError(t, reader.AddStream(ctx, s2)) // Make sure it's idempotent
-	defer s2.Destroy(ctx)
+	defer func() { assert.NoError(t, s2.Destroy(ctx)) }()
 	defer cleanupReader(t, ctx, s, reader)
 
 	// Add events to both streams
@@ -161,7 +161,7 @@ func TestRemoveReaderStream(t *testing.T) {
 	reader, err := s.NewReader(ctx, options.WithReaderStartAtOldest(), options.WithReaderBlockDuration(testBlockDuration))
 	require.NoError(t, err)
 	assert.NoError(t, reader.AddStream(ctx, s2))
-	defer s2.Destroy(ctx)
+	defer func() { assert.NoError(t, s2.Destroy(ctx)) }()
 	defer cleanupReader(t, ctx, s, reader)
 
 	// Read events from both streams

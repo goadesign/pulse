@@ -33,36 +33,36 @@ func TestSchedule(t *testing.T) {
 		inc()
 		switch it() {
 		case 1:
-			assert.Equal(t, 0, numJobs(t, worker), "unexpected number of jobs")
+			assert.Equal(t, 0, len(worker.Jobs()), "unexpected number of jobs")
 			// First iteration: start a job
 			return &JobPlan{Start: []*JobParam{{Key: testName, Payload: []byte("payload")}}}, nil
 		case 2:
-			assert.Eventually(t, func() bool { return numJobs(t, worker) == 1 }, max, delay, "job not started")
+			assert.Eventually(t, func() bool { return len(worker.Jobs()) == 1 }, max, delay, "job not started")
 			// Second iteration: stop job
 			return &JobPlan{Stop: []string{testName}}, nil
 		case 3:
-			assert.Eventually(t, func() bool { return numJobs(t, worker) == 0 }, max, delay, "job not stopped")
+			assert.Eventually(t, func() bool { return len(worker.Jobs()) == 0 }, max, delay, "job not stopped")
 			// Third iteration: start two jobs
 			return &JobPlan{Start: []*JobParam{
 				{Key: testName + "1", Payload: []byte("payload")},
 				{Key: testName + "2", Payload: []byte("payload")}}}, nil
 		case 4:
-			assert.Eventually(t, func() bool { return numJobs(t, worker) == 2 }, max, delay, "jobs not started")
+			assert.Eventually(t, func() bool { return len(worker.Jobs()) == 2 }, max, delay, "jobs not started")
 			// Fourth iteration: stop all jobs
 			return &JobPlan{StopAll: true}, nil
 		case 5:
-			assert.Eventually(t, func() bool { return numJobs(t, worker) == 0 }, max, delay, "jobs not stopped")
+			assert.Eventually(t, func() bool { return len(worker.Jobs()) == 0 }, max, delay, "jobs not stopped")
 			// Fifth iteration: start one
 			return &JobPlan{Start: []*JobParam{{Key: testName, Payload: []byte("payload")}}}, nil
 		case 6:
-			assert.Eventually(t, func() bool { return numJobs(t, worker) == 1 }, max, delay, "job not started")
+			assert.Eventually(t, func() bool { return len(worker.Jobs()) == 1 }, max, delay, "job not started")
 			//  Sixth iteration: start one, stop one
 			return &JobPlan{
 				Start:   []*JobParam{{Key: testName + "1", Payload: []byte("payload")}},
 				StopAll: true,
 			}, nil
 		case 7:
-			assert.Eventually(t, func() bool { return numJobs(t, worker) == 1 }, max, delay, "job not started")
+			assert.Eventually(t, func() bool { return len(worker.Jobs()) == 1 }, max, delay, "job not started")
 			// Seventh iteration: stop schedule
 			return nil, ErrScheduleStop
 		}
