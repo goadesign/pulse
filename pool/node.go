@@ -39,7 +39,7 @@ type (
 		workerShutdownTTL time.Duration     // Worker considered dead if not shutdown after this duration
 		pendingJobTTL     time.Duration     // Job lease expires if not acked after this duration
 		logger            pulse.Logger
-		h                 jumpHash
+		h                 hasher
 		stop              chan struct{}  // closed when node is stopped
 		wg                sync.WaitGroup // allows to wait until all goroutines exit
 		rdb               *redis.Client
@@ -47,13 +47,17 @@ type (
 		lock          sync.Mutex
 		localWorkers  []*Worker                    // workers created by this node
 		workerStreams map[string]*streaming.Stream // worker streams indexed by ID
-		pendingJobs   map[string]chan error        // channels used to send DispatchJob results
+		pendingJobs   map[string]chan error        // channels used to send DispatchJob results, nil if event is requeued
 		pendingEvents map[string]*streaming.Event  // pending events indexed by sender and event IDs
 		clientOnly    bool
 		closing       bool
-		shuttingDown  bool
-		closed        bool
 		shutdown      bool
+		closed        bool
+	}
+
+	// hasher is the interface implemented by types that can hash keys.
+	hasher interface {
+		Hash(key string, numBuckets int64) int64
 	}
 
 	// jumpHash implement Jump Consistent Hash.
@@ -69,8 +73,6 @@ const (
 	evNotify string = "n"
 	// evStopJob is the event used to stop a job.
 	evStopJob string = "s"
-	// evShutdown is the event used to shutdown the pool.
-	evShutdown string = "x"
 	// evAck is the worker event used to ack a pool event.
 	evAck string = "a"
 	// evDispatchReturn is the event used to forward the worker start return
@@ -128,7 +130,8 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...NodeOp
 			return nil, fmt.Errorf("failed to join pool ticker replicated map %q: %w", tickerMapName(name), err)
 		}
 		poolSink, err = poolStream.NewSink(ctx, "events",
-			soptions.WithSinkBlockDuration(o.jobSinkBlockDuration))
+			soptions.WithSinkBlockDuration(o.jobSinkBlockDuration),
+			soptions.WithSinkAckGracePeriod(o.ackGracePeriod))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create events sink for stream %q: %w", poolStreamName(name), err)
 		}
@@ -170,8 +173,7 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...NodeOp
 
 	if o.clientOnly {
 		logger.Info("client-only")
-		p.wg.Add(2)
-		go p.manageShutdown()
+		p.wg.Add(1)
 		go p.handleNodeEvents(nch) // to handle job acks
 		return p, nil
 	}
@@ -181,7 +183,7 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...NodeOp
 	go p.handlePoolEvents(pch) // handleXXX handles streaming events
 	go p.handleNodeEvents(nch)
 	go p.manageWorkers() // manageXXX handles map updates
-	go p.manageShutdown()
+	go p.manageShutdown(ctx)
 	return p, nil
 }
 
@@ -191,7 +193,7 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...NodeOp
 func (node *Node) AddWorker(ctx context.Context, handler JobHandler) (*Worker, error) {
 	node.lock.Lock()
 	defer node.lock.Unlock()
-	if node.closing || node.shuttingDown {
+	if node.closing {
 		return nil, fmt.Errorf("pool %q is closed", node.Name)
 	}
 	if node.clientOnly {
@@ -235,11 +237,9 @@ func (node *Node) Workers() []*Worker {
 // DispatchJob dispatches a job to the proper worker in the pool.
 // It returns the error returned by the worker's start handler if any.
 func (node *Node) DispatchJob(ctx context.Context, key string, payload []byte) error {
-	var cherr chan error
-
 	// Send job to pool stream.
 	node.lock.Lock()
-	if node.closing || node.shuttingDown {
+	if node.closing {
 		node.lock.Unlock()
 		return fmt.Errorf("pool %q is closed", node.Name)
 	}
@@ -249,17 +249,13 @@ func (node *Node) DispatchJob(ctx context.Context, key string, payload []byte) e
 		node.lock.Unlock()
 		return fmt.Errorf("failed to add job to stream %q: %w", node.poolStream.Name, err)
 	}
-	cherr = make(chan error, 1)
+	cherr := make(chan error, 1)
 	node.pendingJobs[eventID] = cherr
 	node.lock.Unlock()
 
 	// Wait for return status.
 	err = <-cherr
 
-	// Cleanup
-	node.lock.Lock()
-	defer node.lock.Unlock()
-	delete(node.pendingJobs, key)
 	close(cherr)
 	return err
 }
@@ -268,7 +264,7 @@ func (node *Node) DispatchJob(ctx context.Context, key string, payload []byte) e
 func (node *Node) StopJob(ctx context.Context, key string) error {
 	node.lock.Lock()
 	defer node.lock.Unlock()
-	if node.closing || node.shuttingDown {
+	if node.closing {
 		return fmt.Errorf("pool %q is closed", node.Name)
 	}
 	if _, err := node.poolStream.Add(ctx, evStopJob, marshalJobKey(key)); err != nil {
@@ -281,7 +277,7 @@ func (node *Node) StopJob(ctx context.Context, key string) error {
 func (node *Node) NotifyWorker(ctx context.Context, key string, payload []byte) error {
 	node.lock.Lock()
 	defer node.lock.Unlock()
-	if node.closing || node.shuttingDown {
+	if node.closing {
 		return fmt.Errorf("pool %q is closed", node.Name)
 	}
 	if _, err := node.poolStream.Add(ctx, evNotify, marshalNotification(key, payload)); err != nil {
@@ -295,62 +291,52 @@ func (node *Node) NotifyWorker(ctx context.Context, key string, payload []byte) 
 // from creating new workers and the pool workers from accepting new jobs.
 func (node *Node) Shutdown(ctx context.Context) error {
 	node.lock.Lock()
-	if node.shuttingDown {
-		node.lock.Unlock()
-		return nil
-	}
 	if node.closing {
 		node.lock.Unlock()
-		return fmt.Errorf("pool %q is closed", node.Name)
+		return nil
 	}
 	if node.clientOnly {
 		node.lock.Unlock()
 		return fmt.Errorf("pool %q is client-only", node.Name)
 	}
-	node.logger.Info("shutting down")
-	if _, err := node.poolStream.Add(ctx, evShutdown, []byte(node.NodeID)); err != nil {
-		node.lock.Unlock()
-		return fmt.Errorf("failed to add shutdown event to stream %q: %w", node.poolStream.Name, err)
-	}
-	// Copy to avoid races
-	wgs := make([]*sync.WaitGroup, 0, len(node.localWorkers))
-	for _, w := range node.localWorkers {
-		wgs = append(wgs, &w.wg)
-	}
 	node.lock.Unlock()
-	for _, wg := range wgs {
-		wg.Wait()
+	node.logger.Info("shutting down")
+
+	// Signal all nodes to shutdown.
+	if _, err := node.shutdownMap.SetAndWait(ctx, "shutdown", node.NodeID); err != nil {
+		node.logger.Error(fmt.Errorf("failed to set shutdown status in shutdown map: %w", err))
 	}
-	close(node.stop)
-	node.wg.Wait()
-	node.lock.Lock()
-	defer node.lock.Unlock()
-	if err := node.cleanup(); err != nil { // cleanup first then close maps
-		node.logger.Error(fmt.Errorf("failed to cleanup: %w", err))
+
+	<-node.stop // Wait for this node to be closed
+
+	// Destroy the pool stream.
+	if err := node.poolStream.Destroy(ctx); err != nil {
+		node.logger.Error(fmt.Errorf("failed to destroy pool stream: %w", err))
 	}
-	node.tickerMap.Close()
-	node.keepAliveMap.Close()
-	node.workerMap.Close()
-	node.shutdownMap.Close()
-	node.nodeReader.Close()
-	if err := node.nodeStream.Destroy(ctx); err != nil {
-		node.logger.Error(fmt.Errorf("failed to destroy node event stream: %w", err))
+
+	// Now clean up the shutdown replicated map.
+	wsm, err := rmap.Join(ctx, shutdownMapName(node.Name), node.rdb, rmap.WithLogger(node.logger))
+	if err != nil {
+		node.logger.Error(fmt.Errorf("failed to join shutdown map for cleanup: %w", err))
 	}
-	node.shutdown = true
-	node.logger.Info("shutdown")
+	if err := wsm.Reset(ctx); err != nil {
+		node.logger.Error(fmt.Errorf("failed to reset shutdown map: %w", err))
+	}
+
+	node.logger.Info("shutdown complete")
 	return nil
 }
 
 // Close stops the pool node workers and closes the Redis connection but does
 // not stop workers running in other nodes. It requeues all the jobs run by
-// workers of the node  One of Shutdown or Close should be called before the
+// workers of the node.  One of Shutdown or Close should be called before the
 // node is garbage collected unless it is client-only.
 func (node *Node) Close(ctx context.Context) error {
+	return node.close(ctx, true)
+}
+
+func (node *Node) close(ctx context.Context, requeue bool) error {
 	node.lock.Lock()
-	if node.shuttingDown {
-		node.lock.Unlock()
-		return fmt.Errorf("pool %q is shutdown", node.Name)
-	}
 	if node.closing {
 		node.lock.Unlock()
 		return nil
@@ -370,16 +356,17 @@ func (node *Node) Close(ctx context.Context) error {
 	}
 	wg.Wait()
 
-	for _, w := range node.localWorkers {
-		w.requeueJobs(ctx)
+	if requeue {
+		for _, w := range node.localWorkers {
+			w.requeueJobs(ctx)
+		}
 	}
+
 	node.localWorkers = nil
 	if !node.clientOnly {
 		node.poolSink.Close()
 		node.tickerMap.Close()
 		node.keepAliveMap.Close()
-		node.workerMap.Close()
-		node.shutdownMap.Close()
 	}
 	node.nodeReader.Close()
 	if err := node.nodeStream.Destroy(ctx); err != nil {
@@ -393,11 +380,11 @@ func (node *Node) Close(ctx context.Context) error {
 	return nil
 }
 
-// IsShutdown returns true if the node is shutdown.
+// IsShutdown returns true if the pool is shutdown.
 func (node *Node) IsShutdown() bool {
 	node.lock.Lock()
 	defer node.lock.Unlock()
-	return node.shuttingDown
+	return node.shutdown
 }
 
 // IsClosed returns true if the node is closed.
@@ -407,28 +394,19 @@ func (node *Node) IsClosed() bool {
 	return node.closed
 }
 
-// handlePoolEvents reads events from the pool job stream. If the event is a
-// dispatched job then it routes it to the appropriate worker. If the event is a
-// shutdown request then it writes to the shutdown map to notify all nodes.
+// handlePoolEvents reads events from the pool job stream.
 func (node *Node) handlePoolEvents(c <-chan *streaming.Event) {
 	defer node.wg.Done()
+	defer node.logger.Debug("handlePoolEvents: exiting")
 	ctx := context.Background()
 	for ev := range c {
-		switch ev.EventName {
-		case evStartJob, evNotify, evStopJob:
-			if node.IsShutdown() {
-				node.logger.Info("ignoring event, pool is shutdown", "event", ev.EventName, "event-id", ev.ID)
-				continue
-			}
-			node.logger.Debug("routing", "event", ev.EventName, "event-id", ev.ID)
-			if err := node.routeWorkerEvent(ctx, ev); err != nil {
-				node.logger.Error(fmt.Errorf("failed to route event: %w, will retry after %v", err, node.pendingJobTTL), "event", ev.EventName, "event-id", ev.ID)
-			}
-		case evShutdown:
-			node.poolSink.Close() // Closes c
-			if _, err := node.shutdownMap.Set(ctx, "shutdown", node.NodeID); err != nil {
-				node.logger.Error(fmt.Errorf("failed to set shutdown status in shutdown map: %w", err))
-			}
+		if node.IsClosed() {
+			node.logger.Info("ignoring event, node is closed", "event", ev.EventName, "id", ev.ID)
+			continue
+		}
+		node.logger.Debug("routing", "event", ev.EventName, "id", ev.ID)
+		if err := node.routeWorkerEvent(ctx, ev); err != nil {
+			node.logger.Error(fmt.Errorf("failed to route event: %w, will retry after %v", err, node.pendingJobTTL), "event", ev.EventName, "id", ev.ID)
 		}
 	}
 }
@@ -456,9 +434,9 @@ func (node *Node) routeWorkerEvent(ctx context.Context, ev *streaming.Event) err
 	if err != nil {
 		return fmt.Errorf("failed to add event %s to worker stream %q: %w", ev.EventName, workerStreamName(wid), err)
 	}
-	node.logger.Debug("routed", "event", ev.EventName, "event-id", ev.ID, "worker", wid, "worker-event-id", eventID)
+	node.logger.Debug("routed", "event", ev.EventName, "id", ev.ID, "worker", wid, "worker-event-id", eventID)
 
-	// Record the event in the pending event replicated map.
+	// Record the event in the pending events map for future ack.
 	node.pendingEvents[wid+":"+eventID] = ev
 
 	return nil
@@ -473,17 +451,21 @@ func (node *Node) handleNodeEvents(c <-chan *streaming.Event) {
 		select {
 		case ev, ok := <-c:
 			if !ok {
+				node.logger.Debug("handleNodeEvents: exiting")
 				return
 			}
 			switch ev.EventName {
 			case evAck:
 				// Event sent by worker to ack a dispatched job.
+				node.logger.Debug("handleNodeEvents: received ack", "event", ev.EventName, "id", ev.ID)
 				node.ackWorkerEvent(ctx, ev)
 			case evDispatchReturn:
 				// Event sent by pool node to node that originally dispatched the job.
+				node.logger.Debug("handleNodeEvents: received dispatch return", "event", ev.EventName, "id", ev.ID)
 				node.returnDispatchStatus(ctx, ev)
 			}
 		case <-node.stop:
+			node.logger.Debug("handleNodeEvents: received stop signal, exiting")
 			node.nodeReader.Close()
 			if err := node.nodeStream.Destroy(ctx); err != nil {
 				node.logger.Error(fmt.Errorf("failed to destroy node event stream: %w", err))
@@ -526,7 +508,7 @@ func (node *Node) ackWorkerEvent(ctx context.Context, ev *streaming.Event) {
 
 	// Ack the sink event so it does not get redelivered.
 	if err := node.poolSink.Ack(ctx, pending); err != nil {
-		node.logger.Error(fmt.Errorf("failed to ack event: %w", err), "event", pending.EventName, "event-id", pending.ID)
+		node.logger.Error(fmt.Errorf("failed to ack event: %w", err), "event", pending.EventName, "id", pending.ID)
 	}
 	delete(node.pendingEvents, key)
 
@@ -538,7 +520,7 @@ func (node *Node) ackWorkerEvent(ctx context.Context, ev *streaming.Event) {
 		}
 	}
 	for _, key := range staleKeys {
-		node.logger.Error(fmt.Errorf("stale event, removing from pending events"), "event", node.pendingEvents[key].EventName, "key", key)
+		node.logger.Error(fmt.Errorf("stale event, removing from pending events"), "event", node.pendingEvents[key].EventName, "id", key)
 		delete(node.pendingEvents, key)
 	}
 }
@@ -551,7 +533,13 @@ func (node *Node) returnDispatchStatus(_ context.Context, ev *streaming.Event) {
 	ack := unmarshalAck(ev.Payload)
 	cherr, ok := node.pendingJobs[ack.EventID]
 	if !ok {
-		node.logger.Error(fmt.Errorf("received dispatch return for unknown event %s", ack.EventID))
+		node.logger.Error(fmt.Errorf("received dispatch return for unknown event"), "id", ack.EventID)
+		return
+	}
+	node.logger.Debug("dispatch return", "event", ev.EventName, "id", ev.ID, "ack-id", ack.EventID)
+	delete(node.pendingJobs, ack.EventID)
+	if cherr == nil {
+		// Event was requeued.
 		return
 	}
 	var err error
@@ -561,18 +549,22 @@ func (node *Node) returnDispatchStatus(_ context.Context, ev *streaming.Event) {
 	cherr <- err
 }
 
-// manageWorkers receives notifications from the workers replicated map and
-// rebalances jobs across workers when a new worker is added or removed.
-// TBD: what to do if requeue fails?
+// manageWorkers monitors the workers replicated map and triggers job rebalancing
+// when workers are added or removed from the pool.
 func (node *Node) manageWorkers() {
 	defer node.wg.Done()
+	defer node.workerMap.Close()
+
 	ctx := context.Background()
-	c := node.workerMap.Subscribe()
+	workerMapUpdates := node.workerMap.Subscribe()
+
 	for {
 		select {
-		case <-c:
+		case <-workerMapUpdates:
+			node.logger.Debug("manageWorkers: worker map updated")
 			node.handleWorkerMapUpdate(ctx)
 		case <-node.stop:
+			node.logger.Debug("manageWorkers: received stop signal, exiting")
 			return
 		}
 	}
@@ -582,7 +574,7 @@ func (node *Node) manageWorkers() {
 func (node *Node) handleWorkerMapUpdate(ctx context.Context) {
 	node.lock.Lock()
 	defer node.lock.Unlock()
-	if node.closing || node.shuttingDown {
+	if node.closing {
 		return
 	}
 	activeIDs := node.activeWorkers(ctx)
@@ -619,48 +611,45 @@ func (node *Node) rebalanceWorker(ctx context.Context, worker *Worker, activeIDs
 	}
 }
 
-// manageShutdown listens to the pool shutdown map and stops all the workers
-// owned by the node when it is updated.
-func (node *Node) manageShutdown() {
+// manageShutdown monitors the pool shutdown map and initiates node shutdown when updated.
+func (node *Node) manageShutdown(ctx context.Context) {
 	defer node.wg.Done()
-	c := node.shutdownMap.Subscribe()
+	defer node.shutdownMap.Close()
+
+	shutdownUpdates := node.shutdownMap.Subscribe()
+
 	for {
 		select {
-		case <-c:
-			node.handleShutdownMapUpdate()
+		case <-shutdownUpdates:
+			node.logger.Debug("manageShutdown: shutdown map updated, initiating shutdown")
+			node.handleShutdownMapUpdate(ctx)
 		case <-node.stop:
+			node.logger.Debug("manageShutdown: received stop signal, exiting")
 			return
 		}
 	}
 }
 
-// handleShutdownMapUpdate is called when the shutdown map is updated.
-func (node *Node) handleShutdownMapUpdate() {
+// handleShutdownMapUpdate is called when the shutdown map is updated and closes
+// the node.
+func (node *Node) handleShutdownMapUpdate(ctx context.Context) {
 	node.lock.Lock()
-	defer node.lock.Unlock()
-	if node.closing || node.shuttingDown {
+	if node.closing {
+		node.lock.Unlock()
 		return
 	}
-	node.shuttingDown = true
-	if node.clientOnly {
-		node.shutdown = true
-		node.shutdownMap.Close()
-		return
-	}
+	node.shutdown = true
 	sm := node.shutdownMap.Map()
+	node.lock.Unlock()
 	var requestingNode string
 	for _, node := range sm {
 		// There is only one value in the map
 		requestingNode = node
 	}
 	node.logger.Info("shutdown", "requested-by", requestingNode)
-	for _, w := range node.localWorkers {
-		// Add to stream instead of calling stop directly to ensure that the
-		// worker is stopped only after all pending events have been processed.
-		if _, err := w.stream.Add(context.Background(), evShutdown, []byte(requestingNode)); err != nil {
-			node.logger.Error(fmt.Errorf("failed to add shutdown event to worker stream %q: %w", workerStreamName(w.ID), err))
-		}
-	}
+	node.close(ctx, false)
+
+	node.logger.Info("shutdown")
 }
 
 // jobWorker returns the ID of the worker that handles the job with the given key.
@@ -715,27 +704,6 @@ func (node *Node) activeWorkers(ctx context.Context) []string {
 		}
 	}
 	return activeIDs
-}
-
-// Delete all the Redis keys used by the pool.
-func (node *Node) cleanup() error {
-	ctx := context.Background()
-	if err := node.shutdownMap.Reset(ctx); err != nil {
-		node.logger.Error(fmt.Errorf("failed to delete shutdown map: %w", err))
-	}
-	if err := node.keepAliveMap.Reset(ctx); err != nil {
-		node.logger.Error(fmt.Errorf("failed to reset keep-alive map: %w", err))
-	}
-	if err := node.workerMap.Reset(ctx); err != nil {
-		node.logger.Error(fmt.Errorf("failed to reset workers map: %w", err))
-	}
-	if err := node.tickerMap.Reset(ctx); err != nil {
-		node.logger.Error(fmt.Errorf("failed to reset tickers map: %w", err))
-	}
-	if err := node.poolStream.Destroy(ctx); err != nil {
-		node.logger.Error(fmt.Errorf("failed to destroy job stream: %w", err))
-	}
-	return nil
 }
 
 // deleteWorker removes a worker from the pool deleting the worker stream.

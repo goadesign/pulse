@@ -6,16 +6,17 @@ import (
 	"time"
 
 	"github.com/oklog/ulid/v2"
-	redis "github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"goa.design/pulse/rmap"
+	ptesting "goa.design/pulse/testing"
 )
 
 func TestSchedule(t *testing.T) {
 	var (
-		rdb      = redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
-		ctx, buf = testLogContext(t)
+		rdb      = ptesting.NewRedisClient(t)
+		ctx, buf = ptesting.NewBufferedLogContext(t)
 		testName = ulid.Make().String()
 		node     = newTestNode(t, ctx, rdb, testName)
 		worker   = newTestWorker(t, ctx, node)
@@ -23,7 +24,7 @@ func TestSchedule(t *testing.T) {
 		iter     = 0
 		lock     sync.Mutex
 	)
-	defer cleanup(t, rdb, false, testName)
+	defer ptesting.CleanupRedis(t, rdb, false, testName)
 
 	inc := func() { lock.Lock(); iter++; lock.Unlock() }
 	it := func() int { lock.Lock(); defer lock.Unlock(); return iter }

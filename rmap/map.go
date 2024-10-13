@@ -20,28 +20,31 @@ type (
 	// change. Multiple processes can join the same replicated map and
 	// update it.
 	Map struct {
-		Name       string
-		closing    bool                  // true if Close was called
-		closed     bool                  // stopped is true once Close finishes.
-		chankey    string                // Redis pubsub channel name
-		hashkey    string                // Redis hash key
-		msgch      <-chan *redis.Message // channel to receive map updates
-		chans      []chan EventKind      // channels to send notifications
-		ichan      chan struct{}         // internal channel to send notifications
-		done       chan struct{}         // channel to signal shutdown
-		wait       sync.WaitGroup        // wait for read goroutine to exit
-		logger     pulse.Logger          // logger
-		sub        *redis.PubSub         // subscription to map updates
-		set        *redis.Script
-		testAndSet *redis.Script
-		append     *redis.Script
-		remove     *redis.Script
-		incr       *redis.Script
-		del        *redis.Script
-		reset      *redis.Script
-		rdb        *redis.Client
-		lock       sync.Mutex
-		content    map[string]string
+		Name         string
+		closing      bool                  // true if Close was called
+		closed       bool                  // stopped is true once Close finishes.
+		chankey      string                // Redis pubsub channel name
+		hashkey      string                // Redis hash key
+		msgch        <-chan *redis.Message // channel to receive map updates
+		chans        []chan EventKind      // channels to send notifications
+		ichan        chan struct{}         // internal channel to send notifications
+		done         chan struct{}         // channel to signal shutdown
+		wait         sync.WaitGroup        // wait for read goroutine to exit
+		logger       pulse.Logger          // logger
+		sub          *redis.PubSub         // subscription to map updates
+		set          *redis.Script
+		testAndSet   *redis.Script
+		append       *redis.Script
+		appendUnique *redis.Script
+		remove       *redis.Script
+		incr         *redis.Script
+		del          *redis.Script
+		testAndDel   *redis.Script
+		reset        *redis.Script
+		testAndReset *redis.Script
+		rdb          *redis.Client
+		lock         sync.Mutex
+		content      map[string]string
 	}
 
 	// EventKind is the type of map event.
@@ -74,6 +77,16 @@ const luaDelete = `
    return v
 `
 
+// luaTestAndDel is the Lua script used to delete a key if it has a specific value.
+const luaTestAndDel = `
+   local v = redis.call("HGET", KEYS[1], ARGV[1])
+   if v == ARGV[2] then
+      redis.call("HDEL", KEYS[1], ARGV[1])
+      redis.call("PUBLISH", KEYS[2], ARGV[1].."=")
+   end
+   return v
+`
+
 // luaTestAndSet is the Lua script used to set a key if it has a specific value.
 const luaTestAndSet = `
    local v = redis.call("HGET", KEYS[1], ARGV[1])
@@ -90,6 +103,23 @@ const luaReset = `
    redis.call("PUBLISH", KEYS[2], "*=")
 `
 
+// luaTestAndReset is the Lua script used to reset the map if all the given keys
+// have the given values.
+const luaTestAndReset = `
+  local hash = KEYS[1]
+  local n = (#ARGV - 1) / 2
+  
+  for i = 2, n + 1 do
+      if redis.call("HGET", hash, ARGV[i]) ~= ARGV[i + n] then
+          return 0
+      end
+  end
+  
+  redis.call("DEL", hash)
+  redis.call("PUBLISH", KEYS[2], "*=")
+  return 1
+`
+
 // luaIncr is the Lua script used to increment a key and return the new value.
 const luaIncr = `
    redis.call("HINCRBY", KEYS[1], ARGV[1], ARGV[2])
@@ -102,45 +132,94 @@ const luaIncr = `
 // return its new value.
 const luaAppend = `
    local v = redis.call("HGET", KEYS[1], ARGV[1])
-   if v then
-      v = v .. "," .. ARGV[2]
-   else
-      v = ARGV[2]
-   end
+
+   -- If the value exists, append the new value, otherwise assign ARGV[2] directly
+   v = (v and v .. "," .. ARGV[2]) or ARGV[2]
+
+   -- Set the updated value in the hash and publish the change
    redis.call("HSET", KEYS[1], ARGV[1], v)
-   redis.call("PUBLISH", KEYS[2], ARGV[1].."="..v)
+   redis.call("PUBLISH", KEYS[2], ARGV[1] .. "=" .. v)
+
    return v
+`
+
+// luaAppendUnique is the Lua script used to append an item to a set and return
+// the result.
+const luaAppendUnique = `
+  local v = redis.call("HGET", KEYS[1], ARGV[1])
+  local newValues = {}
+  local changed = false
+
+  -- Split ARGV[2] into a table of new values
+  for value in string.gmatch(ARGV[2], "[^,]+") do
+    table.insert(newValues, value)
+  end
+
+  -- If the value exists, process it, else set it directly
+  if v then
+    local existingValues = {}
+    -- Split existing values into a table
+    for value in string.gmatch(v, "[^,]+") do
+      existingValues[value] = true
+    end
+
+    -- Append unique new values to v
+    for _, newValue in ipairs(newValues) do
+      if not existingValues[newValue] then
+        v = (v == "") and newValue or v .. "," .. newValue
+        changed = true
+      end
+    end
+  else
+    v = table.concat(newValues, ",")
+    changed = true
+  end
+
+  -- If changes were made, update the hash and publish the event
+  if changed then
+    redis.call("HSET", KEYS[1], ARGV[1], v)
+    redis.call("PUBLISH", KEYS[2], ARGV[1] .. "=" .. v)
+  end
+
+  return v
 `
 
 // luaRemove is the Lua script used to remove an item from an array value and
 // return the result.
 const luaRemove = `
    local v = redis.call("HGET", KEYS[1], ARGV[1])
+
    if v then
+      -- Create a set of current values
       local curr = {}
       for s in string.gmatch(v, "[^,]+") do
-	 table.insert(curr, s)
+         curr[s] = true
       end
-      local args = {}
+
+      -- Remove specified values
       for s in string.gmatch(ARGV[2], "[^,]+") do
-	 table.insert(args, s)
+         curr[s] = nil
       end
-      for _, s in ipairs(args) do
-	 for i = #curr, 1, -1 do
-	    if curr[i] == s then
-	       table.remove(curr, i)
-	    end
-	 end
+
+      -- Collect the remaining values
+      local newValues = {}
+      for key, _ in pairs(curr) do
+         table.insert(newValues, key)
       end
-      if #curr == 0 then
+
+      -- Update the hash or delete the key if empty
+      if #newValues == 0 then
+         redis.call("HDEL", KEYS[1], ARGV[1])
          v = ""
-	 redis.call("HDEL", KEYS[1], ARGV[1])
       else
-         v = table.concat(curr, ",")
+         v = table.concat(newValues, ",")
          redis.call("HSET", KEYS[1], ARGV[1], v)
       end
-      redis.call("PUBLISH", KEYS[2], ARGV[1].."="..v)
+
+      -- Publish the result
+      redis.call("PUBLISH", KEYS[2], ARGV[1] .. "=" .. v)
    end
+
    return v
 `
 
@@ -164,21 +243,24 @@ func Join(ctx context.Context, name string, rdb *redis.Client, opts ...MapOption
 	}
 	o := parseOptions(opts...)
 	sm := &Map{
-		Name:       name,
-		chankey:    fmt.Sprintf("map:%s:updates", name),
-		hashkey:    fmt.Sprintf("map:%s:content", name),
-		ichan:      make(chan struct{}, 1),
-		done:       make(chan struct{}),
-		logger:     o.Logger.WithPrefix("map", name),
-		rdb:        rdb,
-		set:        redis.NewScript(luaSet),
-		testAndSet: redis.NewScript(luaTestAndSet),
-		incr:       redis.NewScript(luaIncr),
-		append:     redis.NewScript(luaAppend),
-		remove:     redis.NewScript(luaRemove),
-		del:        redis.NewScript(luaDelete),
-		reset:      redis.NewScript(luaReset),
-		content:    make(map[string]string),
+		Name:         name,
+		chankey:      fmt.Sprintf("map:%s:updates", name),
+		hashkey:      fmt.Sprintf("map:%s:content", name),
+		ichan:        make(chan struct{}, 1),
+		done:         make(chan struct{}),
+		logger:       o.Logger.WithPrefix("map", name),
+		rdb:          rdb,
+		set:          redis.NewScript(luaSet),
+		testAndSet:   redis.NewScript(luaTestAndSet),
+		incr:         redis.NewScript(luaIncr),
+		append:       redis.NewScript(luaAppend),
+		appendUnique: redis.NewScript(luaAppendUnique),
+		remove:       redis.NewScript(luaRemove),
+		del:          redis.NewScript(luaDelete),
+		testAndDel:   redis.NewScript(luaTestAndDel),
+		testAndReset: redis.NewScript(luaTestAndReset),
+		reset:        redis.NewScript(luaReset),
+		content:      make(map[string]string),
 	}
 	if err := sm.init(ctx); err != nil {
 		return nil, err
@@ -265,14 +347,20 @@ func (sm *Map) Get(key string) (string, bool) {
 	return res, ok
 }
 
+// GetValues returns the comma separated values for the given key.
+// This is a convenience method intended to be used in conjunction with
+// AppendValues and RemoveValues.
+func (sm *Map) GetValues(key string) ([]string, bool) {
+	val, ok := sm.Get(key)
+	if !ok {
+		return nil, false
+	}
+	return strings.Split(val, ","), true
+}
+
 // Set sets the value for the given key and returns the previous value. An error
 // is returned if the key is empty or contains an equal sign.
 func (sm *Map) Set(ctx context.Context, key, value string) (string, error) {
-	sm.lock.Lock()
-	defer sm.lock.Unlock()
-	if sm.closing {
-		return "", fmt.Errorf("pulse map: %s is stopped", sm.Name)
-	}
 	prev, err := sm.runLuaScript(ctx, "set", sm.set, key, value)
 	if err != nil {
 		return "", err
@@ -299,7 +387,10 @@ func (sm *Map) SetAndWait(ctx context.Context, key, value string) (string, error
 			if !ok {
 				return "", fmt.Errorf("pulse map: %s is stopped", sm.Name)
 			}
-			if v, ok := sm.content[key]; ok && v == value {
+			sm.lock.Lock()
+			v, ok := sm.content[key]
+			sm.lock.Unlock()
+			if ok && v == value {
 				return prev, nil
 			}
 		}
@@ -310,11 +401,6 @@ func (sm *Map) SetAndWait(ctx context.Context, key, value string) (string, error
 // given test value. The previous value is returned. An error is returned if the
 // key is empty or contains an equal sign.
 func (sm *Map) TestAndSet(ctx context.Context, key, test, value string) (string, error) {
-	sm.lock.Lock()
-	defer sm.lock.Unlock()
-	if sm.closing {
-		return "", fmt.Errorf("pulse map: %s is stopped", sm.Name)
-	}
 	prev, err := sm.runLuaScript(ctx, "testAndSet", sm.testAndSet, key, test, value)
 	if err != nil {
 		return "", err
@@ -329,11 +415,6 @@ func (sm *Map) TestAndSet(ctx context.Context, key, test, value string) (string,
 // must represent an integer. An error is returned if the key is empty, contains
 // an equal sign or if the value does not represent an integer.
 func (sm *Map) Inc(ctx context.Context, key string, delta int) (int, error) {
-	sm.lock.Lock()
-	defer sm.lock.Unlock()
-	if sm.closing {
-		return 0, fmt.Errorf("pulse map: %s is stopped", sm.Name)
-	}
 	res, err := sm.runLuaScript(ctx, "incr", sm.incr, key, delta)
 	if err != nil {
 		return 0, err
@@ -350,13 +431,24 @@ func (sm *Map) Inc(ctx context.Context, key string, delta int) (int, error) {
 // (so items should not have commas in them). An error is returned if the key is
 // empty or contains an equal sign.
 func (sm *Map) AppendValues(ctx context.Context, key string, items ...string) ([]string, error) {
-	sm.lock.Lock()
-	defer sm.lock.Unlock()
-	if sm.closing {
-		return nil, fmt.Errorf("pulse map: %s is stopped", sm.Name)
-	}
 	sitems := strings.Join(items, ",")
 	res, err := sm.runLuaScript(ctx, "append", sm.append, key, sitems)
+	if err != nil {
+		return nil, err
+	}
+	if res == nil {
+		return nil, nil
+	}
+	return strings.Split(res.(string), ","), nil
+}
+
+// AppendUniqueValues appends the given items to the value for the given key if
+// they are not already present and returns the result. The array of items is
+// stored as a comma-separated list (so items should not have commas in them).
+// An error is returned if the key is empty or contains an equal sign.
+func (sm *Map) AppendUniqueValues(ctx context.Context, key string, items ...string) ([]string, error) {
+	sitems := strings.Join(items, ",")
+	res, err := sm.runLuaScript(ctx, "appendUnique", sm.appendUnique, key, sitems)
 	if err != nil {
 		return nil, err
 	}
@@ -371,11 +463,6 @@ func (sm *Map) AppendValues(ctx context.Context, key string, items ...string) ([
 // If the removal results in an empty slice then the key is automatically
 // deleted. An error is returned if key is empty or contains an equal sign.
 func (sm *Map) RemoveValues(ctx context.Context, key string, items ...string) ([]string, error) {
-	sm.lock.Lock()
-	defer sm.lock.Unlock()
-	if sm.closing {
-		return nil, fmt.Errorf("pulse map: %s is stopped", sm.Name)
-	}
 	sitems := strings.Join(items, ",")
 	res, err := sm.runLuaScript(ctx, "remove", sm.remove, key, sitems)
 	if err != nil {
@@ -392,12 +479,20 @@ func (sm *Map) RemoveValues(ctx context.Context, key string, items ...string) ([
 
 // Delete deletes the value for the given key and returns the previous value.
 func (sm *Map) Delete(ctx context.Context, key string) (string, error) {
-	sm.lock.Lock()
-	defer sm.lock.Unlock()
-	if sm.closing {
-		return "", fmt.Errorf("pulse map: %s is stopped", sm.Name)
-	}
 	prev, err := sm.runLuaScript(ctx, "delete", sm.del, key)
+	if err != nil {
+		return "", err
+	}
+	if prev == nil {
+		return "", nil
+	}
+	return prev.(string), nil
+}
+
+// TestAndDelete tests that the value for the given key matches the test value
+// and deletes the key if it does.
+func (sm *Map) TestAndDelete(ctx context.Context, key, test string) (string, error) {
+	prev, err := sm.runLuaScript(ctx, "testAndDelete", sm.testAndDel, key, test)
 	if err != nil {
 		return "", err
 	}
@@ -409,13 +504,26 @@ func (sm *Map) Delete(ctx context.Context, key string) (string, error) {
 
 // Reset clears the map content.
 func (sm *Map) Reset(ctx context.Context) error {
-	sm.lock.Lock()
-	defer sm.lock.Unlock()
-	if sm.closing {
-		return fmt.Errorf("pulse map: %s is stopped", sm.Name)
-	}
 	_, err := sm.runLuaScript(ctx, "reset", sm.reset, "*")
 	return err
+}
+
+// TestAndReset tests that the values for the given keys match the test values
+// and clears the map if they do.
+func (sm *Map) TestAndReset(ctx context.Context, keys, tests []string) (bool, error) {
+	args := make([]any, 1+len(keys)+len(tests))
+	args[0] = "*"
+	for i, k := range keys {
+		args[i+1] = k
+	}
+	for i, t := range tests {
+		args[len(keys)+i+1] = t
+	}
+	res, err := sm.runLuaScript(ctx, "testAndReset", sm.testAndReset, args...)
+	if err != nil {
+		return false, err
+	}
+	return res.(int64) == 1, nil
 }
 
 // Close closes the connection to the map, freeing resources. It is safe to
@@ -438,7 +546,7 @@ func (sm *Map) Close() {
 // init initializes the map.
 func (sm *Map) init(ctx context.Context) error {
 	// Make sure scripts are cached.
-	for _, script := range []string{luaSet, luaDelete, luaReset, luaIncr, luaAppend, luaRemove} {
+	for _, script := range []string{luaSet, luaDelete, luaTestAndDel, luaTestAndReset, luaReset, luaIncr, luaAppend, luaAppendUnique, luaRemove} {
 		if err := sm.rdb.ScriptLoad(ctx, script).Err(); err != nil {
 			return fmt.Errorf("pulse map: %s failed to load Lua scripts %q: %w", sm.Name, script, err)
 		}
@@ -531,6 +639,11 @@ func (sm *Map) run() {
 // runLuaScript runs the given Lua script, the first argument must be the key.
 // It is the caller's responsibility to make sure the map is locked.
 func (sm *Map) runLuaScript(ctx context.Context, name string, script *redis.Script, args ...any) (any, error) {
+	sm.lock.Lock()
+	defer sm.lock.Unlock()
+	if sm.closing {
+		return "", fmt.Errorf("pulse map: %s is stopped", sm.Name)
+	}
 	key := args[0].(string)
 	if len(key) == 0 {
 		return nil, fmt.Errorf("pulse map: %s key cannot be empty in %q", sm.Name, name)
