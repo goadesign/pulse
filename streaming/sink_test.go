@@ -15,8 +15,8 @@ import (
 
 var (
 	testCheckIdlePeriod = 50 * time.Millisecond
-	testBlockDuration   = 100 * time.Millisecond
-	testAckDuration     = 100 * time.Millisecond
+	testBlockDuration   = 50 * time.Millisecond
+	testAckDuration     = 50 * time.Millisecond
 )
 
 func TestNewSink(t *testing.T) {
@@ -26,7 +26,7 @@ func TestNewSink(t *testing.T) {
 	ctx := ptesting.NewTestContext(t)
 	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
-	sink, err := s.NewSink(ctx, "sink")
+	sink, err := s.NewSink(ctx, "sink", options.WithSinkBlockDuration(testBlockDuration))
 	assert.NoError(t, err)
 	assert.NotNil(t, sink)
 	cleanupSink(t, ctx, s, sink)
@@ -403,33 +403,88 @@ func TestNonAckMessageDeliveredToAnotherConsumer(t *testing.T) {
 	assert.Equal(t, []byte("test_payload"), read2.Payload)
 }
 
-func TestNewSinkReusesUnusedConsumer(t *testing.T) {
+func TestStaleConsumerDeletionAndMessageClaiming(t *testing.T) {
 	testName := strings.Replace(t.Name(), "/", "_", -1)
+	var origCheckIdlePeriod time.Duration
+	origCheckIdlePeriod, checkIdlePeriod = checkIdlePeriod, testCheckIdlePeriod
+	defer func() { checkIdlePeriod = origCheckIdlePeriod }()
+
 	rdb := ptesting.NewRedisClient(t)
 	defer ptesting.CleanupRedis(t, rdb, false, "")
 	ctx := ptesting.NewTestContext(t)
+	logger := pulse.ClueLogger(ctx)
 
-	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
-	require.NoError(t, err)
+	// Create a stream
+	s, err := NewStream(testName, rdb, options.WithStreamLogger(logger))
+	assert.NoError(t, err)
 
 	// Create first sink
-	sink1, err := s.NewSink(ctx, "sink1",
+	sink1, err := s.NewSink(ctx, "sink",
 		options.WithSinkStartAtOldest(),
-		options.WithSinkBlockDuration(testBlockDuration))
+		options.WithSinkBlockDuration(testBlockDuration),
+		options.WithSinkAckGracePeriod(testAckDuration))
 	require.NoError(t, err)
-	defer cleanupSink(t, ctx, s, sink1)
 
-	// Close the first sink to mark its consumer as unused
-	sink1.Close()
-	assert.Eventually(t, func() bool { return sink1.IsClosed() }, time.Second, 10*time.Millisecond)
+	// Subscribe to sink1
+	c1 := sink1.Subscribe()
 
-	// Create second sink with the same name
-	sink2, err := s.NewSink(ctx, "sink1",
+	// Add an event to the stream
+	_, err = s.Add(ctx, "test_event", []byte("test_payload"))
+	assert.NoError(t, err)
+
+	// Read event but don't ack
+	var read *Event
+	select {
+	case read = <-c1:
+	case <-time.After(testAckDuration):
+		t.Fatal("Timeout waiting for event on first sink")
+	}
+	assert.Equal(t, "test_event", read.EventName)
+	assert.Equal(t, []byte("test_payload"), read.Payload)
+
+	// Create another sink with the same name
+	sink2, err := s.NewSink(ctx, "sink",
 		options.WithSinkStartAtOldest(),
-		options.WithSinkBlockDuration(testBlockDuration))
+		options.WithSinkBlockDuration(testBlockDuration),
+		options.WithSinkAckGracePeriod(testAckDuration))
 	require.NoError(t, err)
 	defer cleanupSink(t, ctx, s, sink2)
 
-	// Check if the second sink reused the consumer from the first sink
-	assert.Equal(t, sink1.consumer, sink2.consumer, "Second sink should reuse the consumer from the first sink")
+	// Verify that the two consumers are present
+	assert.Eventually(t, func() bool {
+		consumers, err := rdb.XInfoConsumers(ctx, s.key, "sink").Result()
+		if err != nil {
+			t.Logf("Error getting consumers: %v", err)
+			return false
+		}
+		return len(consumers) == 2
+	}, max, delay, "Expected two consumers")
+
+	// Close the sink to stop keep-alive refresh
+	sink1.Close()
+	assert.Eventually(t, func() bool { return sink1.IsClosed() }, max, delay)
+
+	// Verify that the stale consumer is deleted
+	assert.Eventually(t, func() bool {
+		consumers, err := rdb.XInfoConsumers(ctx, s.key, "sink").Result()
+		if err != nil {
+			t.Logf("Error getting consumers: %v", err)
+			return false
+		}
+		return len(consumers) == 1
+	}, max, delay, "Expected only one consumer to remain")
+
+	// Subscribe to sink2
+	c2 := sink2.Subscribe()
+
+	// Verify that the message is claimed by the remaining sink
+	var claimedRead *Event
+	select {
+	case claimedRead = <-c2:
+		assert.NoError(t, sink2.Ack(ctx, claimedRead))
+	case <-time.After(testAckDuration * 2):
+		t.Fatal("Timeout waiting for claimed event")
+	}
+	assert.Equal(t, "test_event", claimedRead.EventName)
+	assert.Equal(t, []byte("test_payload"), claimedRead.Payload)
 }

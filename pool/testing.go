@@ -15,7 +15,6 @@ type mockHandler struct {
 	startFunc  func(job *Job) error
 	stopFunc   func(key string) error
 	notifyFunc func(payload []byte) error
-	jobs       map[string]*Job
 }
 
 const (
@@ -45,21 +44,14 @@ func newTestNode(t *testing.T, ctx context.Context, rdb *redis.Client, name stri
 // worker to the given node.
 func newTestWorker(t *testing.T, ctx context.Context, node *Node) *Worker {
 	t.Helper()
-	handler := &mockHandler{jobs: make(map[string]*Job)}
-	handler.startFunc = func(job *Job) error { handler.jobs[job.Key] = job; return nil }
-	handler.stopFunc = func(key string) error { delete(handler.jobs, key); return nil }
-	handler.notifyFunc = func(payload []byte) error { return nil }
+	handler := &mockHandler{
+		startFunc:  func(job *Job) error { return nil },
+		stopFunc:   func(key string) error { return nil },
+		notifyFunc: func(payload []byte) error { return nil },
+	}
 	worker, err := node.AddWorker(ctx, handler)
 	require.NoError(t, err)
 	return worker
-}
-
-// numJobs returns the number of jobs in worker
-func numJobs(t *testing.T, w *Worker) int {
-	t.Helper()
-	w.lock.Lock()
-	defer w.lock.Unlock()
-	return len(w.jobs)
 }
 
 func (w *mockHandler) Start(job *Job) error  { return w.startFunc(job) }

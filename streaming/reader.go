@@ -206,7 +206,7 @@ func (r *Reader) read() {
 	ctx := context.Background()
 	defer r.cleanup()
 	for {
-		streamsEvents, err := readOnce(ctx, r.xread, r.streamschan, r.donechan, r.logger)
+		streamsEvents, err := r.xread(ctx)
 		r.logger.Info("read", "events", len(streamsEvents))
 		if r.isClosing() {
 			return
@@ -285,57 +285,6 @@ func (e *Event) CreatedAt() time.Time {
 	seconds := ts / 1000
 	nanos := (ts % 1000) * 1_000_000
 	return time.Unix(seconds, nanos)
-}
-
-// readOnce calls the provided readFn and returns the events or error.
-// NOTE: the Redis client does not currently support context cancellation.
-// See https://github.com/redis/go-redis/issues/2276. This means the read
-// will block until the timeout is reached.
-func readOnce(
-	ctx context.Context,
-	readFn func(context.Context) ([]redis.XStream, error),
-	streamschan chan struct{},
-	donechan chan struct{},
-	logger pulse.Logger,
-) ([]redis.XStream, error) {
-
-	readchan := make(chan []redis.XStream)
-	errchan := make(chan error)
-	defer close(readchan)
-	defer close(errchan)
-	cctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	go func() {
-		events, err := readFn(cctx)
-		if err != nil {
-			if cctx.Err() != nil {
-				err = nil
-			}
-			errchan <- err
-			return
-		}
-		readchan <- events
-	}()
-	select {
-	case events := <-readchan:
-		return events, nil
-	case err := <-errchan:
-		return nil, err
-	case <-streamschan:
-		cancel()
-		logger.Debug("reading aborted", "reason", "streams changed")
-	case <-donechan:
-		cancel()
-		logger.Debug("reading aborted", "reason", "reader stopped")
-	}
-	for {
-		select {
-		case events := <-readchan:
-			return events, nil
-		case err := <-errchan:
-			return nil, err
-		}
-	}
 }
 
 // streamEvents filters and streams the Redis messages as events to c.

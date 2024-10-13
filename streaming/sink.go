@@ -3,7 +3,9 @@ package streaming
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,8 +26,8 @@ var (
 	checkIdlePeriod = 500 * time.Millisecond
 )
 
-// acquireLeaseScript is the script used to acquire the stale check lease.
-var acquireLeaseScript = `
+// acquireLeaseScript is the script used to acquire the idle message check lease.
+var acquireLeaseScript = redis.NewScript(`
     local key = KEYS[1]
     local new_value = ARGV[1]
     local current_time = ARGV[2]
@@ -36,7 +38,7 @@ var acquireLeaseScript = `
         return 1
     end
     return 0
-`
+`)
 
 type (
 	// Sink represents a stream sink.
@@ -47,8 +49,8 @@ type (
 		closed bool
 		// consumer is the sink consumer name.
 		consumer string
-		// staleLockKeyName is the stale check lock key name.
-		staleLockKeyName []string
+		// leaseKeyName is the stale check lock key name.
+		leaseKeyName []string
 		// startID is the sink start event ID.
 		startID string
 		// noAck is true if there is no need to acknowledge events.
@@ -71,9 +73,6 @@ type (
 		chans []chan *Event
 		// donechan is the sink done channel.
 		donechan chan struct{}
-		// streamschan notifies the reader when streams are added or
-		// removed.
-		streamschan chan struct{}
 		// wait is the sink cleanup wait group.
 		wait sync.WaitGroup
 		// closing is true if Close was called.
@@ -120,6 +119,10 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...options.S
 		eventMatcher = func(e *Event) bool { return topicPatternRegexp.MatchString(e.Topic) }
 	}
 
+	if err := acquireLeaseScript.Load(ctx, stream.rdb).Err(); err != nil {
+		return nil, fmt.Errorf("failed to load stale check lease script: %w", err)
+	}
+
 	cm, err := rmap.Join(ctx, consumersMapName(stream), stream.rdb, rmap.WithLogger(stream.logger))
 	if err != nil {
 		return nil, fmt.Errorf("failed to join replicated map for sink %s: %w", name, err)
@@ -135,7 +138,7 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...options.S
 
 	sink := &Sink{
 		Name:                  name,
-		staleLockKeyName:      []string{staleLockName(name)},
+		leaseKeyName:          []string{staleLockName(name)},
 		startID:               o.LastEventID,
 		noAck:                 o.NoAck,
 		streams:               []*Stream{stream},
@@ -143,25 +146,24 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...options.S
 		blockDuration:         o.BlockDuration,
 		maxPolled:             o.MaxPolled,
 		bufferSize:            o.BufferSize,
-		streamschan:           make(chan struct{}),
 		donechan:              make(chan struct{}),
 		eventFilter:           eventMatcher,
 		consumersMap:          map[string]*rmap.Map{stream.Name: cm},
 		consumersKeepAliveMap: km,
 		ackGracePeriod:        o.AckGracePeriod,
 		logger:                stream.rootLogger.WithPrefix("sink", name),
-		acquireLease:          redis.NewScript(acquireLeaseScript),
+		acquireLease:          acquireLeaseScript,
 		rdb:                   stream.rdb,
 	}
-	consumer, err := sink.reuseOrCreateConsumer(ctx, stream)
+	consumer, err := sink.newConsumer(ctx, stream)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get or create consumer: %w", err)
+		return nil, fmt.Errorf("failed to create consumer: %w", err)
 	}
 	sink.consumer = consumer
 	sink.logger = sink.logger.WithPrefix("consumer", consumer)
 
 	sink.wait.Add(3)
-	go sink.read()
+	go sink.read(ctx)
 	go sink.periodicKeepAlive()
 	go sink.periodicIdleMessageCheck()
 
@@ -238,7 +240,6 @@ func (s *Sink) AddStream(ctx context.Context, stream *Stream, opts ...options.Ad
 		s.streamCursors[len(s.streams)+i] = ">"
 	}
 	s.consumersMap[stream.Name] = cm
-	s.notifyStreamChange()
 	s.logger.Info("added", "stream", stream.Name)
 	return nil
 }
@@ -272,13 +273,12 @@ func (s *Sink) RemoveStream(ctx context.Context, stream *Stream) error {
 			return err
 		}
 	}
-	s.notifyStreamChange()
 	s.logger.Info("removed", "stream", stream.Name)
 	return nil
 }
 
-// Close stops event polling and closes the sink channel. It is safe to call
-// Close multiple times.
+// Close stops event polling, waits for all events to be processed, and closes the sink channel.
+// It is safe to call Close multiple times.
 func (s *Sink) Close() {
 	s.lock.Lock()
 	if s.closing {
@@ -291,10 +291,11 @@ func (s *Sink) Close() {
 	s.wait.Wait()
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	s.recordUnusedConsumer(context.Background())
 	for _, c := range s.chans {
 		close(c)
 	}
+	// Note: we do not delete the consumer from the keep-alive and consumer maps
+	// so that another instance may claim any pending messages.
 	s.consumersKeepAliveMap.Close()
 	for _, cm := range s.consumersMap {
 		cm.Close()
@@ -310,44 +311,24 @@ func (s *Sink) IsClosed() bool {
 	return s.closed
 }
 
-// reuseOrCreateConsumer leverages the consumersKeepAliveMap replicated map to
-// atomically reuse an unused consumer or create a new one.
-func (s *Sink) reuseOrCreateConsumer(ctx context.Context, stream *Stream) (string, error) {
-	km := s.consumersKeepAliveMap.Map()
-	for consumer, ka := range km {
-		keepAlive, err := strconv.ParseInt(ka, 10, 64)
-		if err != nil {
-			s.logger.Error(fmt.Errorf("failed to parse keep-alive timestamp for consumer %s: %w", consumer, err))
-			continue
-		}
-		if time.Since(time.Unix(0, keepAlive)) < s.ackGracePeriod {
-			continue
-		}
-		newKeepAlive := time.Now().UnixNano()
-		prev, err := s.consumersKeepAliveMap.TestAndSet(ctx, consumer, ka, strconv.FormatInt(newKeepAlive, 10))
-		if err != nil {
-			s.logger.Error(fmt.Errorf("failed to test and set keep-alive for reused consumer: %v", err))
-			continue
-		}
-		if prev != ka {
-			continue
-		}
-		s.lastKeepAlive = newKeepAlive
-		s.logger.Debug("reusing stale consumer", "consumer", consumer)
-		return consumer, nil
-	}
-
+// newConsumer creates a new consumer and registers it in the consumers and
+// keep-alive maps.
+func (s *Sink) newConsumer(ctx context.Context, stream *Stream) (string, error) {
 	consumer := ulid.Make().String()
 	if err := stream.rdb.XGroupCreateConsumer(ctx, stream.key, s.Name, consumer).Err(); err != nil {
 		return "", fmt.Errorf("failed to create Redis consumer %s for consumer group %s: %w", consumer, s.Name, err)
 	}
 	if _, err := s.consumersMap[stream.Name].AppendValues(ctx, s.Name, consumer); err != nil {
-		s.recordUnusedConsumer(ctx)
+		if err := stream.rdb.XGroupDelConsumer(ctx, stream.key, s.Name, consumer).Err(); err != nil {
+			s.logger.Error(fmt.Errorf("failed to delete consumer %s after failed append: %w", consumer, err))
+		}
 		return "", fmt.Errorf("failed to append store consumer %s for sink %s: %w", consumer, s.Name, err)
 	}
 	s.lastKeepAlive = time.Now().UnixNano()
 	if _, err := s.consumersKeepAliveMap.Set(ctx, consumer, strconv.FormatInt(s.lastKeepAlive, 10)); err != nil {
-		s.recordUnusedConsumer(ctx)
+		if err := stream.rdb.XGroupDelConsumer(ctx, stream.key, s.Name, consumer).Err(); err != nil {
+			s.logger.Error(fmt.Errorf("failed to delete consumer %s after failed keep-alive set: %w", consumer, err))
+		}
 		return "", fmt.Errorf("failed to set sink keep-alive for new consumer %s: %w", consumer, err)
 	}
 	s.logger.Debug("created new consumer", "consumer", consumer)
@@ -355,11 +336,27 @@ func (s *Sink) reuseOrCreateConsumer(ctx context.Context, stream *Stream) (strin
 }
 
 // read reads events from the streams and sends them to the sink channel.
-func (s *Sink) read() {
+func (s *Sink) read(ctx context.Context) {
 	defer s.wait.Done()
-	ctx := context.Background()
 	for {
-		streamsEvents, err := readOnce(ctx, s.readGroup, s.streamschan, s.donechan, s.logger)
+		if err := s.ensureConsumer(ctx); err != nil {
+			time.Sleep(time.Duration(rand.Int63n(int64(s.blockDuration))))
+			continue
+		}
+		s.lock.Lock()
+		readStreams := make([]string, len(s.streamCursors))
+		copy(readStreams, s.streamCursors)
+		s.lock.Unlock()
+
+		streams, err := s.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+			Group:    s.Name,
+			Consumer: s.consumer,
+			Streams:  readStreams,
+			Count:    s.maxPolled,
+			Block:    s.blockDuration,
+			NoAck:    s.noAck,
+		}).Result()
+
 		s.lock.Lock()
 		if s.closing {
 			s.lock.Unlock()
@@ -374,7 +371,7 @@ func (s *Sink) read() {
 			s.lock.Unlock()
 			continue
 		}
-		for _, events := range streamsEvents {
+		for _, events := range streams {
 			streamName := events.Stream[len(streamKeyPrefix):]
 			streamEvents(streamName, events.Stream, s.Name, events.Messages, s.eventFilter, s.chans, s.rdb, s.logger)
 		}
@@ -382,10 +379,26 @@ func (s *Sink) read() {
 	}
 }
 
-// periodicKeepAlive updates this consumer keep-alive every half ack grace period
+// ensureConsumer ensures that the consumer is still alive.
+func (s *Sink) ensureConsumer(ctx context.Context) error {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	if time.Since(time.Unix(0, s.lastKeepAlive)) > 2*s.ackGracePeriod {
+		s.logger.Debug("consumer stale, creating new one")
+		var err error
+		s.consumer, err = s.newConsumer(ctx, s.streams[0])
+		if err != nil {
+			s.logger.Error(fmt.Errorf("failed to create new consumer: %w", err))
+			return err
+		}
+	}
+	return nil
+}
+
+// periodicKeepAlive updates this consumer keep-alive every half ack grace period.
 func (s *Sink) periodicKeepAlive() {
 	defer s.wait.Done()
-	ticker := time.NewTicker(s.ackGracePeriod / 2)
+	ticker := time.NewTicker(s.ackGracePeriod)
 	defer ticker.Stop()
 
 	ctx := context.Background()
@@ -409,28 +422,32 @@ func (s *Sink) periodicKeepAlive() {
 
 // periodicIdleMessageCheck claims any idle message every check stale period.
 // An idle message is one that has not been acked for more than the ack grace period.
+// Once all idle messages are claimed, any stale consumer is deleted.
 func (s *Sink) periodicIdleMessageCheck() {
 	defer s.wait.Done()
 	ticker := time.NewTicker(checkIdlePeriod)
 	defer ticker.Stop()
 
-	staleLeaseDuration := checkIdlePeriod.Milliseconds() - 5
+	leaseDuration := checkIdlePeriod.Milliseconds() - 5
 	ctx := context.Background()
 	for {
 		select {
 		case <-ticker.C:
 			now := time.Now().UnixNano() / int64(time.Millisecond)
-			newExpiration := now + staleLeaseDuration
-			result, err := s.acquireLease.Run(ctx, s.rdb, s.staleLockKeyName, newExpiration, now, staleLeaseDuration).Result()
+			newExpiration := now + leaseDuration
+			result, err := s.acquireLease.EvalSha(ctx, s.rdb, s.leaseKeyName, newExpiration, now, leaseDuration).Result()
 			if err != nil {
-				s.logger.Error(fmt.Errorf("failed to acquire stale check lease: %v", err))
+				s.logger.Error(fmt.Errorf("failed to acquire idle message check lease: %v", err))
 				continue
 			}
 			if result != int64(1) {
 				// Another sink instance claimed the lease.
 				continue
 			}
+			s.lock.Lock()
 			s.claimIdleMessages(ctx)
+			s.deleteStaleConsumers(ctx)
+			s.lock.Unlock()
 
 		case <-s.donechan:
 			return
@@ -439,12 +456,8 @@ func (s *Sink) periodicIdleMessageCheck() {
 }
 
 // claimIdleMessages claims idle messages from the streams.
+// s.lock must be held.
 func (s *Sink) claimIdleMessages(ctx context.Context) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
-	if s.closing {
-		return
-	}
 	for _, stream := range s.streams {
 		args := redis.XAutoClaimArgs{
 			Stream:   stream.key,
@@ -455,15 +468,55 @@ func (s *Sink) claimIdleMessages(ctx context.Context) {
 		}
 		start, err := s.claim(ctx, stream.Name, args)
 		if err != nil {
-			s.logger.Error(fmt.Errorf("failed to claim stale messages for stream %s: %w", stream.Name, err))
+			s.logger.Error(fmt.Errorf("failed to claim idle messages for stream %s: %w", stream.Name, err))
 			continue
 		}
 		for start != "0-0" {
 			args.Start = start
 			start, err = s.claim(ctx, stream.Name, args)
 			if err != nil {
-				s.logger.Error(fmt.Errorf("failed to claim stale messages for stream %s: %w", stream.Name, err))
+				s.logger.Error(fmt.Errorf("failed to claim idle messages for stream %s: %w", stream.Name, err))
 				break
+			}
+		}
+	}
+}
+
+// deleteStaleConsumers deletes stale consumers.
+// s.lock must be held.
+func (s *Sink) deleteStaleConsumers(ctx context.Context) {
+	keepAlives := s.consumersKeepAliveMap.Map()
+	var staleConsumers []string
+	for consumer, timestamp := range keepAlives {
+		ts, err := strconv.ParseInt(timestamp, 10, 64)
+		if err != nil {
+			s.logger.Error(fmt.Errorf("failed to parse timestamp for consumers: %w", err), "consumer", consumer)
+			continue
+		}
+		if time.Since(time.Unix(0, ts)) > 2*s.ackGracePeriod {
+			staleConsumers = append(staleConsumers, consumer)
+			s.logger.Debug("stale consumer", "consumer", consumer)
+		}
+	}
+	for _, stream := range s.streams {
+		sinks := s.consumersMap[stream.Name]
+		for _, sink := range sinks.Keys() {
+			consumers, _ := sinks.GetValues(sink)
+			for _, consumer := range consumers {
+				if !slices.Contains(staleConsumers, consumer) {
+					continue
+				}
+				if err := s.rdb.XGroupDelConsumer(ctx, stream.key, s.Name, consumer).Err(); err != nil {
+					s.logger.Error(fmt.Errorf("failed to delete stale consumer %s: %w", consumer, err))
+					continue
+				}
+				if _, err := s.consumersKeepAliveMap.Delete(ctx, consumer); err != nil {
+					s.logger.Error(fmt.Errorf("failed to delete sink keep-alive for stale consumer %s: %w", consumer, err))
+				}
+				if _, err := sinks.RemoveValues(ctx, s.Name, consumer); err != nil {
+					s.logger.Error(fmt.Errorf("failed to remove consumer from map: %w", err), "stream", stream.Name, "consumer", consumer)
+				}
+				s.logger.Debug("deleted stale consumer", "consumer", consumer)
 			}
 		}
 	}
@@ -479,46 +532,6 @@ func (s *Sink) claim(ctx context.Context, streamName string, args redis.XAutoCla
 	return start, err
 }
 
-// readGroup reads events from the streams using the sink consumer group.
-func (s *Sink) readGroup(ctx context.Context) ([]redis.XStream, error) {
-	s.lock.Lock()
-
-	// Make sure this consumer is still alive.
-	if time.Since(time.Unix(0, s.lastKeepAlive)) > s.ackGracePeriod {
-		s.logger.Debug("consumer stale, creating new one", "consumer", s.consumer)
-		var err error
-		s.consumer, err = s.reuseOrCreateConsumer(ctx, s.streams[0])
-		if err != nil {
-			s.logger.Error(fmt.Errorf("failed to create new consumer: %w", err))
-			s.lock.Unlock()
-			return nil, err
-		}
-	}
-
-	readStreams := make([]string, len(s.streamCursors))
-	copy(readStreams, s.streamCursors)
-	s.lock.Unlock()
-	if s.blockDuration > 4*time.Second {
-		s.logger.Debug("reading", "streams", readStreams, "max", s.maxPolled, "block", s.blockDuration)
-	}
-	return s.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
-		Group:    s.Name,
-		Consumer: s.consumer,
-		Streams:  readStreams,
-		Count:    s.maxPolled,
-		Block:    s.blockDuration,
-		NoAck:    s.noAck,
-	}).Result()
-}
-
-// notifyStreamChange notifies the reader that the streams have changed.
-func (s *Sink) notifyStreamChange() {
-	select {
-	case s.streamschan <- struct{}{}:
-	default:
-	}
-}
-
 // deleteConsumerGroup deletes the consumer group.
 func (s *Sink) deleteConsumerGroup(ctx context.Context, stream *Stream) error {
 	if err := s.rdb.XGroupDestroy(ctx, stream.key, s.Name).Err(); err != nil {
@@ -526,54 +539,6 @@ func (s *Sink) deleteConsumerGroup(ctx context.Context, stream *Stream) error {
 	}
 	delete(s.consumersMap, stream.Name)
 	return nil
-}
-
-// recordUnusedConsumer marks the consumer as unused by setting its keep-alive
-// timestamp to 0. It deletes the keep alive map if all consumers are unused.
-// s.lock must be held when calling this function.
-// TBD: also delete the redis consumer
-func (s *Sink) recordUnusedConsumer(ctx context.Context) {
-	s.logger.Debug("unused", "sink", s.Name, "consumer", s.consumer)
-	s.lastKeepAlive = 0
-	keepAlives := s.consumersKeepAliveMap.Map()
-	if len(keepAlives) == 0 {
-		return
-	}
-
-	// TBD: also delete the redis consumer
-	// allStale := true
-	// keys := make([]string, 0, len(keepAlives))
-	// vals := make([]string, 0, len(keepAlives))
-	// for k, ka := range keepAlives {
-	// 	keys = append(keys, k)
-	// 	vals = append(vals, ka)
-	// 	t, err := strconv.ParseInt(ka, 10, 64)
-	// 	if err != nil {
-	// 		s.logger.Error(fmt.Errorf("failed to parse keep-alive timestamp for consumer %s: %w", k, err))
-	// 		allStale = false
-	// 		break
-	// 	}
-	// 	if time.Since(time.Unix(0, t)) < s.ackGracePeriod {
-	// 		allStale = false
-	// 		break
-	// 	}
-	// }
-	// if allStale {
-	// 	reset, err := s.consumersKeepAliveMap.TestAndReset(ctx, keys, vals)
-	// 	if err != nil {
-	// 		s.logger.Error(fmt.Errorf("failed to test and reset unused consumer keep-alives: %w", err))
-	// 	}
-	// 	if reset {
-	// 		s.logger.Debug("deleted unused keep-alive map")
-	// 		return
-	// 	}
-	// }
-
-	// There are non-stale entries, mark this consumer as unused.
-
-	if _, err := s.consumersKeepAliveMap.Set(ctx, s.consumer, "0"); err != nil {
-		s.logger.Error(fmt.Errorf("failed to set unused consumer keep-alive: %w", err))
-	}
 }
 
 // isBusyGroupErr returns true if the error is a busy group error.
