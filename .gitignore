@@ -3,3 +3,4 @@ coverage.out
 examples/weather/bin/forecaster
 examples/weather/bin/poller
 examples/weather/signoz
+.DS_Store

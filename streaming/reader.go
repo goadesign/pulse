@@ -236,16 +236,14 @@ func (r *Reader) read() {
 }
 
 func (r *Reader) xread(ctx context.Context) ([]redis.XStream, error) {
+	// copy so no two goroutines can share the memory
 	r.lock.Lock()
-	// force copy so no two goroutines can share the memory
 	readStreams := make([]string, len(r.streamKeys))
 	copy(readStreams, r.streamKeys)
 	readStreams = append(readStreams, r.streamCursors...)
 	r.lock.Unlock()
 
-	// if r.blockDuration > 4*time.Second {
 	r.logger.Debug("reading", "streams", readStreams, "max", r.maxPolled, "block", r.blockDuration)
-	// }
 	return r.rdb.XRead(ctx, &redis.XReadArgs{
 		Streams: readStreams,
 		Count:   r.maxPolled,
@@ -290,8 +288,6 @@ func (e *Event) CreatedAt() time.Time {
 }
 
 // readOnce calls the provided readFn and returns the events or error.
-// readOnce cancels the context if the reader is stopping or if the streams
-// attached to the reader have changed.
 // NOTE: the Redis client does not currently support context cancellation.
 // See https://github.com/redis/go-redis/issues/2276. This means the read
 // will block until the timeout is reached.
@@ -373,10 +369,10 @@ func streamEvents(
 			rdb:        rdb,
 		}
 		if eventFilter != nil && !eventFilter(ev) {
-			logger.Debug("event did not match event matcher", "stream", streamName, "event", ev.ID)
+			logger.Debug("event filtered", "event", ev.EventName, "id", ev.ID, "stream", streamName)
 			continue
 		}
-		logger.Debug("event", "stream", streamName, "event", ev.ID)
+		logger.Debug("event", "stream", streamName, "event", ev.EventName, "id", ev.ID, "channels", len(chans))
 		for _, c := range chans {
 			c <- ev
 		}

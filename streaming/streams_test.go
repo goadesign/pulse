@@ -1,26 +1,19 @@
 package streaming
 
 import (
-	"os"
 	"testing"
 
-	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
+
 	"goa.design/pulse/pulse"
 	"goa.design/pulse/streaming/options"
+	ptesting "goa.design/pulse/testing"
 )
 
-var redisPwd = "redispassword"
-
-func init() {
-	if p := os.Getenv("REDIS_PASSWORD"); p != "" {
-		redisPwd = p
-	}
-}
-
 func TestDestroy(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
-	ctx := testContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx := ptesting.NewTestContext(t)
 
 	s, err := NewStream("testDestroy", rdb)
 	assert.NoError(t, err)
@@ -47,8 +40,9 @@ func TestOptions(t *testing.T) {
 }
 
 func TestAdd(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
-	ctx := testContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx := ptesting.NewTestContext(t)
 	s, err := NewStream("testAdd", rdb)
 	assert.NoError(t, err)
 
@@ -66,8 +60,9 @@ func TestAdd(t *testing.T) {
 }
 
 func TestRemove(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
-	ctx := testContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx := ptesting.NewTestContext(t)
 	s, err := NewStream("testRemove", rdb)
 	assert.NoError(t, err)
 
@@ -92,8 +87,9 @@ func TestRemove(t *testing.T) {
 }
 
 func TestTopic(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
-	ctx := testContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx := ptesting.NewTestContext(t)
 	s, err := NewStream("testTopic", rdb)
 	assert.NoError(t, err)
 

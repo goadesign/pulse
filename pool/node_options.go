@@ -17,6 +17,7 @@ type (
 		maxQueuedJobs        int
 		clientOnly           bool
 		jobSinkBlockDuration time.Duration
+		ackGracePeriod       time.Duration
 		logger               pulse.Logger
 	}
 )
@@ -71,6 +72,14 @@ func WithJobSinkBlockDuration(d time.Duration) NodeOption {
 	}
 }
 
+// WithAckGracePeriod sets the duration after which a job is made available to
+// other workers if it wasn't started. The default is 20s.
+func WithAckGracePeriod(ttl time.Duration) NodeOption {
+	return func(o *nodeOptions) {
+		o.ackGracePeriod = ttl
+	}
+}
+
 // WithLogger sets the handler used to report temporary errors.
 func WithLogger(logger pulse.Logger) NodeOption {
 	return func(o *nodeOptions) {
@@ -96,6 +105,7 @@ func defaultPoolOptions() *nodeOptions {
 		workerShutdownTTL:    2 * time.Minute,
 		maxQueuedJobs:        1000,
 		jobSinkBlockDuration: 5 * time.Second,
+		ackGracePeriod:       20 * time.Second,
 		logger:               pulse.NoopLogger(),
 	}
 }

@@ -217,7 +217,7 @@ patterns. For example:
 
 [![Pub/Sub](../snippets/pub-sub-pattern.png)](../examples/streaming/pub-sub/main.go#L76-L79)
 
-> Note: Event filtering is done locally in the sink or reader and does not
+> Note: Event filtering is done client-side in the sink or reader and does not
 > affect the underlying stream. This means that events are still stored in the
 > stream and can be consumed by other sinks.
 

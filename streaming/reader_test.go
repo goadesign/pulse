@@ -1,37 +1,35 @@
 package streaming
 
 import (
-	"context"
 	"strings"
-	"sync"
 	"testing"
-	"time"
 
-	redis "github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"goa.design/pulse/pulse"
 	"goa.design/pulse/streaming/options"
+	ptesting "goa.design/pulse/testing"
 )
 
 func TestNewReader(t *testing.T) {
 	testName := strings.Replace(t.Name(), "/", "_", -1)
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
-	defer cleanup(t, rdb, testName)
-	ctx := testContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	ctx := ptesting.NewTestContext(t)
 	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	reader, err := s.NewReader(ctx)
 	assert.NoError(t, err)
 	assert.NotNil(t, reader)
-	cleanupReader(t, ctx, s, reader)
+	defer cleanupReader(t, ctx, s, reader)
 }
 
 func TestReaderReadOnce(t *testing.T) {
 	testName := strings.Replace(t.Name(), "/", "_", -1)
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
-	defer cleanup(t, rdb, testName)
-	ctx := testContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	ctx := ptesting.NewTestContext(t)
 	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	reader, err := s.NewReader(ctx, options.WithReaderStartAtOldest(), options.WithReaderBlockDuration(testBlockDuration))
@@ -48,9 +46,9 @@ func TestReaderReadOnce(t *testing.T) {
 
 func TestReaderReadSinceLastEvent(t *testing.T) {
 	testName := strings.Replace(t.Name(), "/", "_", -1)
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
-	defer cleanup(t, rdb, testName)
-	ctx := testContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	ctx := ptesting.NewTestContext(t)
 	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
 
@@ -74,7 +72,7 @@ func TestReaderReadSinceLastEvent(t *testing.T) {
 	// Create new reader with last event ID set to first event and read last event
 	reader2, err := s.NewReader(ctx, options.WithReaderStartAfter(eventID), options.WithReaderBlockDuration(testBlockDuration))
 	require.NoError(t, err)
-	defer reader2.Close()
+	defer cleanupReader(t, ctx, s, reader2)
 	c2 := reader2.Subscribe()
 	read = readOneReaderEvent(t, c2)
 	assert.Equal(t, "event", read.EventName)
@@ -83,7 +81,7 @@ func TestReaderReadSinceLastEvent(t *testing.T) {
 	// Create new reader with last event ID set to 0 and read the 2 events
 	reader3, err := s.NewReader(ctx, options.WithReaderStartAfter("0"), options.WithReaderBlockDuration(testBlockDuration))
 	require.NoError(t, err)
-	defer reader3.Close()
+	defer cleanupReader(t, ctx, s, reader3)
 	c3 := reader3.Subscribe()
 	read = readOneReaderEvent(t, c3)
 	assert.Equal(t, "event", read.EventName)
@@ -95,9 +93,9 @@ func TestReaderReadSinceLastEvent(t *testing.T) {
 
 func TestCleanupReader(t *testing.T) {
 	testName := strings.Replace(t.Name(), "/", "_", -1)
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
-	defer cleanup(t, rdb, testName)
-	ctx := testContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	ctx := ptesting.NewTestContext(t)
 	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	reader, err := s.NewReader(ctx, options.WithReaderStartAtOldest(), options.WithReaderBlockDuration(testBlockDuration))
@@ -113,17 +111,17 @@ func TestCleanupReader(t *testing.T) {
 
 	// Stop reader, destroy stream and check Redis keys are gone
 	reader.Close()
-	assert.Eventually(t, func() bool { return reader.IsClosed() }, wf, tck)
+	assert.Eventually(t, func() bool { return reader.IsClosed() }, max, delay)
 	assert.Equal(t, rdb.Exists(ctx, s.key).Val(), int64(1))
 	assert.NoError(t, s.Destroy(ctx))
-	assert.Eventually(t, func() bool { return rdb.Exists(ctx, s.key).Val() == 0 }, wf, tck)
+	assert.Eventually(t, func() bool { return rdb.Exists(ctx, s.key).Val() == 0 }, max, delay)
 }
 
 func TestAddReaderStream(t *testing.T) {
 	testName := strings.Replace(t.Name(), "/", "_", -1)
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
-	defer cleanup(t, rdb, testName)
-	ctx := testContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	ctx := ptesting.NewTestContext(t)
 	s, err := NewStream("testAddStream", rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	reader, err := s.NewReader(ctx, options.WithReaderStartAtOldest(), options.WithReaderBlockDuration(testBlockDuration))
@@ -153,9 +151,9 @@ func TestAddReaderStream(t *testing.T) {
 
 func TestRemoveReaderStream(t *testing.T) {
 	testName := strings.Replace(t.Name(), "/", "_", -1)
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
-	defer cleanup(t, rdb, testName)
-	ctx := testContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	ctx := ptesting.NewTestContext(t)
 	s, err := NewStream("testRemoveStream", rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
 	s2, err := NewStream("testRemoveStream2", rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
@@ -186,47 +184,4 @@ func TestRemoveReaderStream(t *testing.T) {
 	read = readOneReaderEvent(t, c)
 	assert.Equal(t, "event3", read.EventName)
 	assert.Equal(t, []byte("payload3"), read.Payload)
-}
-
-func readOneReaderEvent(t *testing.T, c <-chan *Event) *Event {
-	t.Helper()
-	var read *Event
-	var w sync.WaitGroup
-	w.Add(1)
-	go func() {
-		defer w.Done()
-		tck := time.NewTicker(time.Second)
-		select {
-		case read = <-c:
-			return
-		case <-tck.C:
-			t.Error("timeout waiting for event")
-			return
-		}
-	}()
-	w.Wait()
-	require.NotNil(t, read)
-	return read
-}
-
-func cleanupReader(t *testing.T, ctx context.Context, s *Stream, reader *Reader) {
-	t.Helper()
-	reader.Close()
-	assert.Eventually(t, func() bool { return reader.IsClosed() }, wf, tck)
-	assert.NoError(t, s.Destroy(ctx))
-}
-
-func cleanup(t *testing.T, rdb *redis.Client, testName string) {
-	t.Helper()
-	ctx := context.Background()
-	keys, err := rdb.Keys(ctx, "*").Result()
-	require.NoError(t, err)
-	var filtered []string
-	for _, k := range keys {
-		if strings.Contains(k, testName) {
-			filtered = append(filtered, k)
-		}
-	}
-	assert.Len(t, filtered, 0)
-	assert.NoError(t, rdb.FlushDB(ctx).Err())
 }

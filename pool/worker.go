@@ -152,21 +152,19 @@ func (w *Worker) handleEvents(c <-chan *streaming.Event) {
 			if !ok {
 				return
 			}
-			if ev.EventName == evShutdown {
-				w.logger.Info("stop", "from", string(ev.Payload))
-				w.stop(ctx)
-				return
-			}
 			nodeID, payload := unmarshalEnvelope(ev.Payload)
 			var err error
 			switch ev.EventName {
 			case evStartJob:
+				w.logger.Debug("handleEvents: received start job", "event", ev.EventName, "id", ev.ID)
 				err = w.startJob(ctx, unmarshalJob(payload))
 			case evStopJob:
+				w.logger.Debug("handleEvents: received stop job", "event", ev.EventName, "id", ev.ID)
 				w.lock.Lock()
 				err = w.stopJob(ctx, unmarshalJobKey(payload))
 				w.lock.Unlock()
 			case evNotify:
+				w.logger.Debug("handleEvents: received notify", "event", ev.EventName, "id", ev.ID)
 				key, payload := unmarshalNotification(payload)
 				err = w.notify(ctx, key, payload)
 			}
@@ -176,12 +174,13 @@ func (w *Worker) handleEvents(c <-chan *streaming.Event) {
 					continue
 				}
 				w.ackPoolEvent(ctx, nodeID, ev.ID, err)
-				w.logger.Error(fmt.Errorf("%s handler failed: %w", ev.EventName, err), "event-id", ev.ID)
+				w.logger.Error(fmt.Errorf("handler failed: %w", err), "event", ev.EventName, "id", ev.ID)
 				continue
 			}
 			w.ackPoolEvent(ctx, nodeID, ev.ID, nil)
-			w.logger.Info("handled", "event-id", ev.ID, "event-name", ev.EventName)
+			w.logger.Info("handled", "event", ev.EventName, "id", ev.ID, "from-node", nodeID)
 		case <-w.done:
+			w.logger.Debug("handleEvents: exiting")
 			return
 		}
 	}
@@ -225,6 +224,7 @@ func (w *Worker) stopAndWait(ctx context.Context) {
 	}()
 	select {
 	case <-c:
+		w.logger.Debug("stopAndWait: worker stopped")
 	case <-time.After(w.workerShutdownTTL):
 		w.logger.Error(fmt.Errorf("stop timeout"), "after", w.workerShutdownTTL)
 	}
@@ -241,7 +241,7 @@ func (w *Worker) startJob(_ context.Context, job *Job) error {
 	if err := w.handler.Start(job); err != nil {
 		return err
 	}
-	w.logger.Info("started job", "key", job.Key)
+	w.logger.Info("started job", "job", job.Key)
 	job.Worker = w
 	w.jobs[job.Key] = job
 	return nil
@@ -256,7 +256,7 @@ func (w *Worker) stopJob(_ context.Context, key string) error {
 	if err := w.handler.Stop(key); err != nil {
 		return fmt.Errorf("failed to stop job %q: %w", key, err)
 	}
-	w.logger.Info("stopped job", "key", key)
+	w.logger.Info("stopped job", "job", key)
 	delete(w.jobs, key)
 	return nil
 }
@@ -322,6 +322,7 @@ func (w *Worker) keepAlive() {
 			}
 			w.lock.Unlock()
 		case <-w.done:
+			w.logger.Debug("keepAlive: exiting")
 			return
 		}
 	}
@@ -336,9 +337,12 @@ func (w *Worker) requeueJobs(ctx context.Context) {
 		if err := w.stopJob(ctx, job.Key); err != nil {
 			w.logger.Error(fmt.Errorf("failed to stop job %q: %w", job.Key, err))
 		}
-		if _, err := w.Node.poolStream.Add(ctx, evStartJob, marshalJob(job)); err != nil {
+		eventID, err := w.Node.poolStream.Add(ctx, evStartJob, marshalJob(job))
+		if err != nil {
 			w.logger.Error(fmt.Errorf("failed to requeue job %q: %w", job.Key, err))
 		}
+		w.Node.pendingJobs[eventID] = nil
+		w.logger.Info("requeued", "job", job.Key)
 	}
 	w.jobs = nil
 }

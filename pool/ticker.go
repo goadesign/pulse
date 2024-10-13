@@ -71,27 +71,6 @@ func (node *Node) NewTicker(ctx context.Context, name string, d time.Duration, o
 	return t, nil
 }
 
-// Reset stops a ticker and resets its period to the specified duration. The
-// next tick will arrive after the new period elapses. The duration d must be
-// greater than zero; if not, Reset will panic.
-func (t *Ticker) Reset(d time.Duration) {
-	t.lock.Lock()
-	defer t.lock.Unlock()
-	t.next = serialize(time.Now().Add(d), d)
-	_, err := t.tickerMap.Set(context.Background(), t.name, t.next)
-	if err != nil {
-		t.logger.Error(err, "msg", "failed to reset ticker")
-		return
-	}
-	t.initTimer()
-	if t.mapch == nil {
-		// ticker was previously stopped, restart it.
-		t.mapch = t.tickerMap.Subscribe()
-		t.wg.Add(1)
-		go t.handleEvents()
-	}
-}
-
 // Stop turns off a ticker. After Stop, no more ticks will be sent. Stop does
 // not close the channel, to prevent a concurrent goroutine reading from the
 // channel from seeing an erroneous "tick".

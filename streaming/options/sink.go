@@ -106,7 +106,7 @@ func WithSinkNoAck() Sink {
 }
 
 // WithSinkAckGracePeriod sets the grace period for acknowledging events.  The
-// default grace period is 30 seconds.
+// default grace period is 20 seconds.
 func WithSinkAckGracePeriod(d time.Duration) Sink {
 	return func(o *SinkOptions) {
 		o.AckGracePeriod = d
@@ -129,6 +129,6 @@ func defaultSinkOptions() SinkOptions {
 		MaxPolled:      1000,
 		BufferSize:     1000,
 		LastEventID:    "$",
-		AckGracePeriod: 30 * time.Second,
+		AckGracePeriod: 20 * time.Second,
 	}
 }
