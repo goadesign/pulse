@@ -157,7 +157,6 @@ func (s *Stream) Remove(ctx context.Context, ids ...string) error {
 }
 
 // Destroy deletes the entire stream and all its messages.
-// TBD: this should also destroy the sinks
 func (s *Stream) Destroy(ctx context.Context) error {
 	if err := s.rdb.Del(ctx, s.key).Err(); err != nil {
 		err := fmt.Errorf("failed to destroy stream: %w", err)

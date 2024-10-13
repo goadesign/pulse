@@ -41,6 +41,7 @@ type (
 		del          *redis.Script
 		testAndDel   *redis.Script
 		reset        *redis.Script
+		testAndReset *redis.Script
 		rdb          *redis.Client
 		lock         sync.Mutex
 		content      map[string]string
@@ -100,6 +101,23 @@ const luaTestAndSet = `
 const luaReset = `
    redis.call("DEL", KEYS[1])
    redis.call("PUBLISH", KEYS[2], "*=")
+`
+
+// luaTestAndReset is the Lua script used to reset the map if all the given keys
+// have the given values.
+const luaTestAndReset = `
+  local hash = KEYS[1]
+  local n = (#ARGV - 1) / 2
+  
+  for i = 2, n + 1 do
+      if redis.call("HGET", hash, ARGV[i]) ~= ARGV[i + n] then
+          return 0
+      end
+  end
+  
+  redis.call("DEL", hash)
+  redis.call("PUBLISH", KEYS[2], "*=")
+  return 1
 `
 
 // luaIncr is the Lua script used to increment a key and return the new value.
@@ -240,6 +258,7 @@ func Join(ctx context.Context, name string, rdb *redis.Client, opts ...MapOption
 		remove:       redis.NewScript(luaRemove),
 		del:          redis.NewScript(luaDelete),
 		testAndDel:   redis.NewScript(luaTestAndDel),
+		testAndReset: redis.NewScript(luaTestAndReset),
 		reset:        redis.NewScript(luaReset),
 		content:      make(map[string]string),
 	}
@@ -489,6 +508,24 @@ func (sm *Map) Reset(ctx context.Context) error {
 	return err
 }
 
+// TestAndReset tests that the values for the given keys match the test values
+// and clears the map if they do.
+func (sm *Map) TestAndReset(ctx context.Context, keys, tests []string) (bool, error) {
+	args := make([]any, 1+len(keys)+len(tests))
+	args[0] = "*"
+	for i, k := range keys {
+		args[i+1] = k
+	}
+	for i, t := range tests {
+		args[len(keys)+i+1] = t
+	}
+	res, err := sm.runLuaScript(ctx, "testAndReset", sm.testAndReset, args...)
+	if err != nil {
+		return false, err
+	}
+	return res.(int64) == 1, nil
+}
+
 // Close closes the connection to the map, freeing resources. It is safe to
 // call Close multiple times.
 func (sm *Map) Close() {
@@ -509,7 +546,7 @@ func (sm *Map) Close() {
 // init initializes the map.
 func (sm *Map) init(ctx context.Context) error {
 	// Make sure scripts are cached.
-	for _, script := range []string{luaSet, luaDelete, luaTestAndDel, luaReset, luaIncr, luaAppend, luaAppendUnique, luaRemove} {
+	for _, script := range []string{luaSet, luaDelete, luaTestAndDel, luaTestAndReset, luaReset, luaIncr, luaAppend, luaAppendUnique, luaRemove} {
 		if err := sm.rdb.ScriptLoad(ctx, script).Err(); err != nil {
 			return fmt.Errorf("pulse map: %s failed to load Lua scripts %q: %w", sm.Name, script, err)
 		}

@@ -14,9 +14,9 @@ import (
 )
 
 var (
-	testStalePeriod   = 50 * time.Millisecond
-	testBlockDuration = 100 * time.Millisecond
-	testAckDuration   = 100 * time.Millisecond
+	testCheckIdlePeriod = 50 * time.Millisecond
+	testBlockDuration   = 100 * time.Millisecond
+	testAckDuration     = 100 * time.Millisecond
 )
 
 func TestNewSink(t *testing.T) {
@@ -280,8 +280,8 @@ func TestMultipleConsumers(t *testing.T) {
 func TestClaimStaleMessages(t *testing.T) {
 	testName := strings.Replace(t.Name(), "/", "_", -1)
 	var origStalePeriod time.Duration
-	origStalePeriod, checkStalePeriod = checkStalePeriod, testStalePeriod
-	defer func() { checkStalePeriod = origStalePeriod }()
+	origStalePeriod, checkIdlePeriod = checkIdlePeriod, testCheckIdlePeriod
+	defer func() { checkIdlePeriod = origStalePeriod }()
 
 	rdb := ptesting.NewRedisClient(t)
 	defer ptesting.CleanupRedis(t, rdb, false, "")
@@ -330,9 +330,9 @@ func TestClaimStaleMessages(t *testing.T) {
 
 func TestNonAckMessageDeliveredToAnotherConsumer(t *testing.T) {
 	testName := strings.Replace(t.Name(), "/", "_", -1)
-	var origStalePeriod time.Duration
-	origStalePeriod, checkStalePeriod = checkStalePeriod, testStalePeriod
-	defer func() { checkStalePeriod = origStalePeriod }()
+	var origCheckIdlePeriod time.Duration
+	origCheckIdlePeriod, checkIdlePeriod = checkIdlePeriod, testCheckIdlePeriod
+	defer func() { checkIdlePeriod = origCheckIdlePeriod }()
 	rdb := ptesting.NewRedisClient(t)
 	defer ptesting.CleanupRedis(t, rdb, false, "")
 	ctx := ptesting.NewTestContext(t)

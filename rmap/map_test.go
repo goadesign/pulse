@@ -164,6 +164,88 @@ func TestMapLocal(t *testing.T) {
 	cleanup(t, m)
 }
 
+func TestAppendUniqueValues(t *testing.T) {
+	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+	ctx := context.Background()
+	m, err := Join(ctx, "test", rdb)
+	require.NoError(t, err)
+	defer cleanup(t, m)
+
+	const key = "uniqueArray"
+
+	// Test appending to an empty key
+	res, err := m.AppendUniqueValues(ctx, key, "a", "b", "c")
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"a", "b", "c"}, res)
+	assert.Eventually(t, func() bool { return m.Map()[key] == "a,b,c" }, wf, tck)
+
+	// Test appending unique values
+	res, err = m.AppendUniqueValues(ctx, key, "d", "e", "a")
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"a", "b", "c", "d", "e"}, res)
+	assert.Eventually(t, func() bool { return m.Map()[key] == "a,b,c,d,e" }, wf, tck)
+
+	// Test appending only duplicate values
+	res, err = m.AppendUniqueValues(ctx, key, "a", "b", "c")
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"a", "b", "c", "d", "e"}, res)
+	assert.Eventually(t, func() bool { return m.Map()[key] == "a,b,c,d,e" }, wf, tck)
+
+	// Test appending to a non-existent key
+	const newKey = "newUniqueArray"
+	res, err = m.AppendUniqueValues(ctx, newKey, "x", "y", "z")
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"x", "y", "z"}, res)
+	assert.Eventually(t, func() bool { return m.Map()[newKey] == "x,y,z" }, wf, tck)
+
+	// Test error cases
+	res, err = m.AppendUniqueValues(ctx, "", "value")
+	assert.Error(t, err)
+	assert.Nil(t, res)
+
+	res, err = m.AppendUniqueValues(ctx, "invalid=key", "value")
+	assert.Error(t, err)
+	assert.Nil(t, res)
+}
+
+func TestTestAndDelete(t *testing.T) {
+	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+	ctx := context.Background()
+	m, err := Join(ctx, "test", rdb)
+	require.NoError(t, err)
+	defer cleanup(t, m)
+
+	const key, initialVal, newVal = "foo", "bar", "baz"
+
+	// Set initial value
+	old, err := m.Set(ctx, key, initialVal)
+	assert.NoError(t, err)
+	assert.Equal(t, "", old)
+	assert.Eventually(t, func() bool { return m.Map()[key] == initialVal }, wf, tck)
+
+	old, err = m.TestAndDelete(ctx, key, newVal)
+	assert.NoError(t, err)
+	assert.Equal(t, initialVal, old)
+	old, err = m.TestAndDelete(ctx, key, initialVal)
+	assert.NoError(t, err)
+	assert.Equal(t, initialVal, old)
+	assert.Eventually(t, func() bool { _, exists := m.Map()[key]; return !exists }, wf, tck)
+
+	// Test and delete on non-existent key
+	old, err = m.TestAndDelete(ctx, "nonexistent", "anyvalue")
+	assert.NoError(t, err)
+	assert.Equal(t, "", old)
+
+	// Test error cases
+	old, err = m.TestAndDelete(ctx, "", "value")
+	assert.Error(t, err)
+	assert.Equal(t, "", old)
+
+	old, err = m.TestAndDelete(ctx, "invalid=key", "value")
+	assert.Error(t, err)
+	assert.Equal(t, "", old)
+}
+
 func TestTestAndSet(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	ctx := context.Background()
@@ -187,6 +269,62 @@ func TestTestAndSet(t *testing.T) {
 	assert.Equal(t, val, old)
 	time.Sleep(50 * time.Millisecond)
 	assert.Equal(t, val, m.Map()[key])
+}
+
+func TestTestAndReset(t *testing.T) {
+	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+	ctx := context.Background()
+	m, err := Join(ctx, "test", rdb)
+	require.NoError(t, err)
+	defer cleanup(t, m)
+
+	// Set initial values
+	_, err = m.Set(ctx, "key1", "value1")
+	assert.NoError(t, err)
+	_, err = m.Set(ctx, "key2", "value2")
+	assert.NoError(t, err)
+	_, err = m.Set(ctx, "key3", "value3")
+	assert.NoError(t, err)
+
+	assert.Eventually(t, func() bool { return len(m.Map()) == 3 }, wf, tck)
+
+	// Test with correct values (should reset)
+	reset, err := m.TestAndReset(ctx, []string{"key1", "key2", "key3"}, []string{"value1", "value2", "value3"})
+	assert.NoError(t, err)
+	assert.True(t, reset)
+	assert.Eventually(t, func() bool { return len(m.Map()) == 0 }, wf, tck)
+
+	// Set new values
+	_, err = m.Set(ctx, "key1", "newvalue1")
+	assert.NoError(t, err)
+	_, err = m.Set(ctx, "key2", "newvalue2")
+	assert.NoError(t, err)
+
+	assert.Eventually(t, func() bool { return len(m.Map()) == 2 }, wf, tck)
+
+	// Test with incorrect values (should not reset)
+	reset, err = m.TestAndReset(ctx, []string{"key1", "key2"}, []string{"value1", "value2"})
+	assert.NoError(t, err)
+	assert.False(t, reset)
+	assert.Eventually(t, func() bool { return len(m.Map()) == 2 }, wf, tck)
+
+	// Test with partial correct values (should not reset)
+	reset, err = m.TestAndReset(ctx, []string{"key1", "key2"}, []string{"newvalue1", "value2"})
+	assert.NoError(t, err)
+	assert.False(t, reset)
+	assert.Eventually(t, func() bool { return len(m.Map()) == 2 }, wf, tck)
+
+	// Test with non-existent keys (should not reset)
+	reset, err = m.TestAndReset(ctx, []string{"key1", "nonexistent"}, []string{"newvalue1", "anyvalue"})
+	assert.NoError(t, err)
+	assert.False(t, reset)
+	assert.Eventually(t, func() bool { return len(m.Map()) == 2 }, wf, tck)
+
+	// Test with empty keys and values (should reset)
+	reset, err = m.TestAndReset(ctx, []string{}, []string{})
+	assert.NoError(t, err)
+	assert.True(t, reset)
+	assert.Eventually(t, func() bool { return len(m.Map()) == 0 }, wf, tck)
 }
 
 func TestArrays(t *testing.T) {
