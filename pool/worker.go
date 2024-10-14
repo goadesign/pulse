@@ -375,6 +375,9 @@ func (w *Worker) requeueJobs(ctx context.Context) {
 			w.logger.Error(fmt.Errorf("failed to requeue job %q: %w", job.Key, err))
 		}
 		w.Node.pendingJobs[eventID] = nil
+		if _, err := w.jobsMap.RemoveValues(ctx, w.ID, job.Key); err != nil {
+			w.logger.Error(fmt.Errorf("failed to remove requeued job from jobs map: %w", err), "job", job.Key)
+		}
 		w.logger.Info("requeued", "job", job.Key)
 	}
 	w.jobs = nil
