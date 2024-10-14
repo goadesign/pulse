@@ -100,7 +100,7 @@ func newWorker(ctx context.Context, p *Node, h JobHandler) (*Worker, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create jobs stream for worker %q: %w", wid, err)
 	}
-	reader, err := stream.NewReader(ctx, soptions.WithReaderBlockDuration(p.workerTTL), soptions.WithReaderStartAtOldest())
+	reader, err := stream.NewReader(ctx, soptions.WithReaderBlockDuration(p.workerTTL/2), soptions.WithReaderStartAtOldest())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create reader for worker %q: %w", wid, err)
 	}

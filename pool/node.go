@@ -373,14 +373,17 @@ func (node *Node) close(ctx context.Context, requeue bool) error {
 	// Need to stop workers before requeueing jobs to prevent
 	// requeued jobs from being handled by this node.
 	var wg sync.WaitGroup
+	node.logger.Debug("stopping workers", "count", len(node.localWorkers))
 	for _, w := range node.localWorkers {
 		wg.Add(1)
 		go func(w *Worker) {
 			defer wg.Done()
 			w.stopAndWait(ctx)
+			node.logger.Debug("worker stopped", "worker", w.ID)
 		}(w)
 	}
 	wg.Wait()
+	node.logger.Debug("workers stopped")
 
 	if requeue {
 		for _, w := range node.localWorkers {
