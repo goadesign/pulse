@@ -51,7 +51,10 @@ func main() {
 	}
 
 	// Create node for pool "example".
-	node, err := pool.AddNode(ctx, "example", rdb, pool.WithLogger(logger))
+	node, err := pool.AddNode(ctx, "example", rdb,
+		pool.WithJobSinkBlockDuration(100*time.Millisecond), // Shutdown faster
+		pool.WithLogger(logger),
+	)
 	if err != nil {
 		panic(err)
 	}
@@ -62,15 +65,31 @@ func main() {
 		panic(err)
 	}
 
-	// Wait for jobs to complete.
+	// Check if a timeout is set
+	var timeout time.Duration
+	if t := os.Getenv("TIMEOUT"); t != "" {
+		timeout, err = time.ParseDuration(t)
+		if err != nil {
+			panic(err)
+		}
+	} else {
+		timeout = 10 * time.Minute
+	}
+	log.Infof(ctx, "timeout set to %s", timeout)
+
+	// Wait for CTRL-C or timeout.
 	log.Infof(ctx, "Waiting for jobs... CTRL+C to stop.")
-
-	// Close done channel on CTRL-C.
 	sigc := make(chan os.Signal, 1)
+	defer close(sigc)
 	signal.Notify(sigc, os.Interrupt)
-	<-sigc
-	close(sigc)
+	select {
+	case <-sigc:
+		log.Infof(ctx, "interrupted")
+	case <-time.After(timeout):
+		log.Infof(ctx, "timeout")
+	}
 
+	// Shutdown node.
 	if err := node.Shutdown(ctx); err != nil {
 		panic(err)
 	}

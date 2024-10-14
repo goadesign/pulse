@@ -28,7 +28,11 @@ func main() {
 	}
 
 	// Don't forget to destroy the stream when done
-	defer stream.Destroy(ctx)
+	defer func() {
+		if err := stream.Destroy(ctx); err != nil {
+			panic(err)
+		}
+	}()
 
 	// Write 2 events to the stream
 	id1, err := stream.Add(ctx, "event 1", []byte("payload 1"))

@@ -1,7 +1,7 @@
 package pool
 
-import "fmt"
+import "errors"
 
-// errRequeue is the error returned by a worker when starting a job it wants to
-// requeue.
-var errRequeue = fmt.Errorf("requeue")
+// ErrRequeue indicates that a worker failed to process a job's start or stop operation
+// and requests the job to be requeued for another attempt.
+var ErrRequeue = errors.New("requeue")

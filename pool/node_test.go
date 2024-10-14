@@ -156,13 +156,9 @@ func TestTwoNodeJobDispatchAndAck(t *testing.T) {
 		t.Errorf("Unexpected job received by worker1: %+v", job)
 		return nil
 	}
-	originalStartFunc := worker2.handler.(*mockHandler).startFunc
 	worker2.handler.(*mockHandler).startFunc = func(job *Job) error {
-		err := originalStartFunc(job)
-		if err == nil {
-			close(jobDone)
-		}
-		return err
+		close(jobDone)
+		return nil
 	}
 
 	// Test job dispatch and execution

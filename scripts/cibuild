@@ -6,6 +6,7 @@ GIT_ROOT=$(git rev-parse --show-toplevel)
 pushd ${GIT_ROOT}
 
 ./scripts/setup
+./scripts/start-redis
 ./scripts/test
 ./scripts/run-examples
 
