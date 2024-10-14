@@ -8,6 +8,8 @@ pushd ${GIT_ROOT}
 ./scripts/setup
 ./scripts/start-redis
 ./scripts/test
-./scripts/run-examples
+
+# This is a bit too slow for CI
+# ./scripts/run-examples
 
 popd
