@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -18,7 +19,9 @@ func TestWorkerRequeueJobs(t *testing.T) {
 		rdb      = ptesting.NewRedisClient(t)
 		node     = newTestNode(t, ctx, rdb, testName)
 	)
-	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	defer ptesting.CleanupRedis(t, rdb, false, testName)
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
 
 	// Create a worker and dispatch a job
 	worker := newTestWorker(t, ctx, node)
@@ -27,19 +30,24 @@ func TestWorkerRequeueJobs(t *testing.T) {
 	// Wait for the job to start
 	require.Eventually(t, func() bool { return len(worker.Jobs()) == 1 }, max, delay)
 
-	// stop refreshing keep-alive and remove the worker from the node's keep-alive map
-	worker.workerTTL = time.Hour
-	_, err := node.keepAliveMap.Delete(ctx, worker.ID)
-	require.NoError(t, err)
-	require.Eventually(t, func() bool { return len(node.keepAliveMap.Map()) == 0 }, time.Second, delay)
+	// Emulate the worker failing by preventing it from refreshing its keepalive
+	// This means we can't cleanup cleanly, hence "false" in CleanupRedis
+	worker.lock.Lock()
+	worker.stopped = true
+	worker.lock.Unlock()
 
 	// Create a new worker to pick up the requeued job
 	newWorker := newTestWorker(t, ctx, node)
 
+	// Wait at least workerTTL
+	time.Sleep(2 * node.workerTTL)
+
+	// Route an event to trigger worker cleanup
+	assert.NoError(t, node.DispatchJob(ctx, testName+"2", []byte("payload2")))
+
 	// Wait for the job to be requeued and started by the new worker
 	// Increase 'max' to cover the time until requeue happens
-	require.Eventually(t, func() bool { return len(newWorker.Jobs()) == 1 }, time.Second, delay)
-
-	// Clean up
-	assert.NoError(t, node.Shutdown(ctx))
+	require.Eventually(t, func() bool {
+		return len(newWorker.Jobs()) == 2
+	}, time.Second, delay, "job was not requeued")
 }

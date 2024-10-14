@@ -495,7 +495,7 @@ func (s *Sink) deleteStaleConsumers(ctx context.Context) {
 		}
 		if time.Since(time.Unix(0, ts)) > 2*s.ackGracePeriod {
 			staleConsumers = append(staleConsumers, consumer)
-			s.logger.Debug("stale consumer", "consumer", consumer)
+			s.logger.Debug("stale consumer", "consumer", consumer, "since", time.Since(time.Unix(0, ts)), "grace", 2*s.ackGracePeriod)
 		}
 	}
 	for _, stream := range s.streams {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,6 +32,8 @@ type (
 		reader            *streaming.Reader
 		done              chan struct{}
 		workersMap        *rmap.Map
+		jobsMap           *rmap.Map
+		jobPayloadsMap    *rmap.Map
 		keepAliveMap      *rmap.Map
 		shutdownMap       *rmap.Map
 		workerTTL         time.Duration
@@ -110,6 +113,8 @@ func newWorker(ctx context.Context, p *Node, h JobHandler) (*Worker, error) {
 		reader:            reader,
 		done:              make(chan struct{}),
 		workersMap:        p.workerMap,
+		jobsMap:           p.jobsMap,
+		jobPayloadsMap:    p.jobPayloadsMap,
 		keepAliveMap:      p.keepAliveMap,
 		shutdownMap:       p.shutdownMap,
 		workerTTL:         p.workerTTL,
@@ -169,8 +174,8 @@ func (w *Worker) handleEvents(c <-chan *streaming.Event) {
 				err = w.notify(ctx, key, payload)
 			}
 			if err != nil {
-				if errors.Is(err, errRequeue) {
-					w.logger.Info("requeue", ev.EventName, "after", w.pendingJobTTL, "error", err)
+				if errors.Is(err, ErrRequeue) {
+					w.logger.Info("requeue", ev.EventName, "after", w.pendingJobTTL)
 					continue
 				}
 				w.ackPoolEvent(ctx, nodeID, ev.ID, err)
@@ -188,7 +193,6 @@ func (w *Worker) handleEvents(c <-chan *streaming.Event) {
 
 // stop stops the reader, the worker goroutines and removes the worker from the
 // workers and keep-alive maps.
-// TBD: what to do if requeue fails?
 func (w *Worker) stop(ctx context.Context) {
 	w.lock.Lock()
 	defer w.lock.Unlock()
@@ -202,6 +206,17 @@ func (w *Worker) stop(ctx context.Context) {
 	}
 	if _, er := w.keepAliveMap.Delete(ctx, w.ID); er != nil {
 		err = fmt.Errorf("failed to remove worker %q from keep alive map: %w", w.ID, er)
+	}
+	keys, er := w.jobsMap.Delete(ctx, w.ID)
+	if er != nil {
+		err = fmt.Errorf("failed to remove worker %q from jobs map: %w", w.ID, er)
+	}
+	if keys != "" {
+		for _, key := range strings.Split(keys, ",") {
+			if _, er := w.jobPayloadsMap.Delete(ctx, key); er != nil {
+				err = fmt.Errorf("worker stop: failed to remove job payload %q from job payloads map: %w", key, er)
+			}
+		}
 	}
 	w.reader.Close()
 	if er := w.stream.Destroy(ctx); er != nil {
@@ -231,30 +246,49 @@ func (w *Worker) stopAndWait(ctx context.Context) {
 }
 
 // startJob starts a job.
-func (w *Worker) startJob(_ context.Context, job *Job) error {
+func (w *Worker) startJob(ctx context.Context, job *Job) error {
 	w.lock.Lock()
 	defer w.lock.Unlock()
 	if w.stopped {
 		return fmt.Errorf("worker %q stopped", w.ID)
 	}
+	if _, err := w.jobsMap.AppendUniqueValues(ctx, w.ID, job.Key); err != nil {
+		w.logger.Error(fmt.Errorf("failed to add job %q to jobs map: %w, requeueing", job.Key, err))
+		return ErrRequeue
+	}
+	if _, err := w.jobPayloadsMap.Set(ctx, job.Key, string(job.Payload)); err != nil {
+		w.logger.Error(fmt.Errorf("failed to add job payload %q to job payloads map: %w, requeueing", job.Key, err))
+		return ErrRequeue
+	}
 	job.Worker = w
 	if err := w.handler.Start(job); err != nil {
+		if _, err := w.jobsMap.RemoveValues(ctx, w.ID, job.Key); err != nil {
+			w.logger.Error(fmt.Errorf("start failure handling: failed to remove job %q from jobs map: %w", job.Key, err))
+		}
+		if _, err := w.jobPayloadsMap.Delete(ctx, job.Key); err != nil {
+			w.logger.Error(fmt.Errorf("start failure handling: failed to remove job payload %q from job payloads map: %w", job.Key, err))
+		}
 		return err
 	}
 	w.logger.Info("started job", "job", job.Key)
-	job.Worker = w
 	w.jobs[job.Key] = job
 	return nil
 }
 
 // stopJob stops a job.
 // worker.lock must be held when calling this method.
-func (w *Worker) stopJob(_ context.Context, key string) error {
+func (w *Worker) stopJob(ctx context.Context, key string) error {
 	if _, ok := w.jobs[key]; !ok {
 		return fmt.Errorf("job %s not found", key)
 	}
 	if err := w.handler.Stop(key); err != nil {
 		return fmt.Errorf("failed to stop job %q: %w", key, err)
+	}
+	if _, err := w.jobsMap.RemoveValues(ctx, w.ID, key); err != nil {
+		w.logger.Error(fmt.Errorf("stop job: failed to remove job %q from jobs map: %w", key, err))
+	}
+	if _, err := w.jobPayloadsMap.Delete(ctx, key); err != nil {
+		w.logger.Error(fmt.Errorf("stop job: failed to remove job payload %q from job payloads map: %w", key, err))
 	}
 	w.logger.Info("stopped job", "job", key)
 	delete(w.jobs, key)
