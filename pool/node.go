@@ -635,10 +635,25 @@ func (node *Node) rebalanceWorker(ctx context.Context, worker *Worker, activeIDs
 			continue
 		}
 		delete(worker.jobs, job.Key)
-		if _, err := node.poolStream.Add(ctx, evStartJob, marshalJob(job)); err != nil {
-			node.logger.Error(fmt.Errorf("failed to add job %q to stream %q: %w", job.Key, node.poolStream.Name, err))
+		if err := node.requeueJob(ctx, worker.ID, job); err != nil {
+			node.logger.Error(fmt.Errorf("failed to requeue job %q: %w", job.Key, err))
 		}
 	}
+}
+
+// requeueJob requeues the given worker jobs.
+// It is the caller's responsibility to lock the worker.
+func (node *Node) requeueJob(ctx context.Context, workerID string, job *Job) error {
+	eventID, err := node.poolStream.Add(ctx, evStartJob, marshalJob(job))
+	if err != nil {
+		return fmt.Errorf("failed to add job %q to stream %q: %w", job.Key, node.poolStream.Name, err)
+	}
+	node.pendingJobs[eventID] = nil
+	if _, err := node.jobsMap.RemoveValues(ctx, workerID, job.Key); err != nil {
+		return fmt.Errorf("failed to remove job %q from jobs map during rebalance: %w", job.Key, err)
+	}
+	node.logger.Info("requeued job", "key", job.Key, "worker", workerID, "event-id", eventID)
+	return nil
 }
 
 // manageShutdown monitors the pool shutdown map and initiates node shutdown when updated.
@@ -724,7 +739,6 @@ func (node *Node) activeWorkers(ctx context.Context) []string {
 		}
 		node.logger.Info("deleting", "worker", id, "last seen", lastSeen, "TTL", node.workerTTL)
 
-		// requeue the worker's keys first
 		keys, _ := node.jobsMap.GetValues(id)
 		var requeued []string
 		for _, key := range keys {
@@ -739,22 +753,11 @@ func (node *Node) activeWorkers(ctx context.Context) []string {
 				CreatedAt: time.Now(),
 				NodeID:    node.NodeID,
 			}
-			eventID, err := node.poolStream.Add(ctx, evStartJob, marshalJob(job))
-			if err != nil {
+			if err := node.requeueJob(ctx, id, job); err != nil {
 				node.logger.Error(fmt.Errorf("failed to requeue inactive job %q: %w", job.Key, err))
 				continue
 			}
-			node.pendingJobs[eventID] = nil
 			requeued = append(requeued, job.Key)
-			node.logger.Debug("requeued inactive", "job", job.Key, "event-id", eventID)
-		}
-		if _, err := node.jobsMap.RemoveValues(ctx, id, requeued...); err != nil {
-			node.logger.Error(fmt.Errorf("failed to remove requeued job keys for worker %q: %w", id, err))
-		}
-		for _, key := range requeued {
-			if _, err := node.jobPayloadsMap.Delete(ctx, key); err != nil {
-				node.logger.Error(fmt.Errorf("failed to remove requeued job payload for job %q: %w", key, err))
-			}
 		}
 		if len(requeued) != len(keys) {
 			node.logger.Error(fmt.Errorf("failed to requeue all inactive jobs for worker %q: %d/%d, will retry later", id, len(requeued), len(keys)))
