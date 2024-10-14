@@ -182,6 +182,7 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...NodeOp
 		h:                 jumpHash{crc64.New(crc64.MakeTable(crc64.ECMA))},
 		stop:              make(chan struct{}),
 		rdb:               rdb,
+		logger:            logger,
 	}
 
 	nch := nodeReader.Subscribe()
