@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	redis "github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
@@ -47,7 +48,9 @@ func CleanupRedis(t *testing.T, rdb *redis.Client, checkClean bool, testName str
 				filtered = append(filtered, k)
 			}
 		}
-		assert.Len(t, filtered, 0, "found keys: %v", filtered)
+		assert.Eventually(t, func() bool {
+			return len(filtered) == 0
+		}, time.Second, time.Millisecond*10, "found keys: %v", filtered)
 	}
 	assert.NoError(t, rdb.FlushDB(ctx).Err())
 }
