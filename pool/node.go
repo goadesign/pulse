@@ -743,7 +743,7 @@ func (node *Node) activeWorkers(ctx context.Context) []string {
 			}
 			node.pendingJobs[eventID] = nil
 			requeued = append(requeued, job.Key)
-			node.logger.Info("requeued inactive", "job", job.Key, "event-id", eventID)
+			node.logger.Debug("requeued inactive", "job", job.Key, "event-id", eventID)
 		}
 		if _, err := node.jobsMap.RemoveValues(ctx, id, requeued...); err != nil {
 			node.logger.Error(fmt.Errorf("failed to remove requeued job keys for worker %q: %w", id, err))
@@ -757,6 +757,8 @@ func (node *Node) activeWorkers(ctx context.Context) []string {
 			node.logger.Error(fmt.Errorf("failed to requeue all inactive jobs for worker %q: %d/%d, will retry later", id, len(requeued), len(keys)))
 			continue
 		}
+
+		node.logger.Info("requeued worker jobs", "worker", id, "requeued", len(requeued))
 
 		// then delete the worker
 		if err := node.deleteWorker(ctx, id); err != nil {
