@@ -721,13 +721,13 @@ func (node *Node) activeWorkers(ctx context.Context) []string {
 		}
 		node.logger.Info("deleting", "worker", id, "last seen", lastSeen, "TTL", node.workerTTL)
 
-		// requeue the worker's jobs first
-		jobs, _ := node.jobsMap.GetValues(id)
-		var requeued int
-		for _, key := range jobs {
+		// requeue the worker's keys first
+		keys, _ := node.jobsMap.GetValues(id)
+		var requeued []string
+		for _, key := range keys {
 			payload, ok := node.jobPayloadsMap.Get(key)
 			if !ok {
-				node.logger.Error(fmt.Errorf("failed to get requeue inactive job payload for job %q: %w", key, err))
+				node.logger.Error(fmt.Errorf("payload for job %q not found", key))
 				continue
 			}
 			job := &Job{
@@ -742,11 +742,19 @@ func (node *Node) activeWorkers(ctx context.Context) []string {
 				continue
 			}
 			node.pendingJobs[eventID] = nil
+			requeued = append(requeued, job.Key)
 			node.logger.Info("requeued inactive", "job", job.Key, "event-id", eventID)
-			requeued++
 		}
-		if requeued != len(jobs) {
-			node.logger.Error(fmt.Errorf("failed to requeue all inactive jobs for worker %q, will retry later: %d/%d", id, requeued, len(jobs)))
+		if _, err := node.jobsMap.RemoveValues(ctx, id, requeued...); err != nil {
+			node.logger.Error(fmt.Errorf("failed to remove requeued job keys for worker %q: %w", id, err))
+		}
+		for _, key := range requeued {
+			if _, err := node.jobPayloadsMap.Delete(ctx, key); err != nil {
+				node.logger.Error(fmt.Errorf("failed to remove requeued job payload for job %q: %w", key, err))
+			}
+		}
+		if len(requeued) != len(keys) {
+			node.logger.Error(fmt.Errorf("failed to requeue all inactive jobs for worker %q: %d/%d, will retry later", id, len(requeued), len(keys)))
 			continue
 		}
 
