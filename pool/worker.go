@@ -175,7 +175,7 @@ func (w *Worker) handleEvents(c <-chan *streaming.Event) {
 			}
 			if err != nil {
 				if errors.Is(err, ErrRequeue) {
-					w.logger.Info("requeue", ev.EventName, "after", w.pendingJobTTL)
+					w.logger.Info("requeue", "event", ev.EventName, "id", ev.ID, "after", w.pendingJobTTL)
 					continue
 				}
 				w.ackPoolEvent(ctx, nodeID, ev.ID, err)
@@ -183,7 +183,6 @@ func (w *Worker) handleEvents(c <-chan *streaming.Event) {
 				continue
 			}
 			w.ackPoolEvent(ctx, nodeID, ev.ID, nil)
-			w.logger.Info("handled", "event", ev.EventName, "id", ev.ID, "from-node", nodeID)
 		case <-w.done:
 			w.logger.Debug("handleEvents: exiting")
 			return

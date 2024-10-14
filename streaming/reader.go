@@ -207,7 +207,6 @@ func (r *Reader) read() {
 	defer r.cleanup()
 	for {
 		streamsEvents, err := r.xread(ctx)
-		r.logger.Info("read", "events", len(streamsEvents))
 		if r.isClosing() {
 			return
 		}
