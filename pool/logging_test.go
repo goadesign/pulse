@@ -16,7 +16,7 @@ import (
 )
 
 func TestLogging(t *testing.T) {
-	var buf bytes.Buffer
+	var buf ptesting.Buffer
 	ctx := log.Context(context.Background(), log.WithOutput(&buf), log.WithFormat(testFormat))
 	log.FlushAndDisableBuffering(ctx)
 	logger := pulse.ClueLogger(ctx)
