@@ -60,7 +60,7 @@ func NewStream(name string, rdb *redis.Client, opts ...options.Stream) (*Stream,
 		Name:       name,
 		MaxLen:     o.MaxLen,
 		logger:     logger,
-		rootLogger: logger,
+		rootLogger: o.Logger,
 		key:        streamKeyPrefix + name,
 		rdb:        rdb,
 	}

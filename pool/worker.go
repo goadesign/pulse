@@ -86,40 +86,40 @@ type (
 )
 
 // newWorker creates a new worker.
-func newWorker(ctx context.Context, p *Node, h JobHandler) (*Worker, error) {
+func newWorker(ctx context.Context, node *Node, h JobHandler) (*Worker, error) {
 	wid := ulid.Make().String()
 	createdAt := time.Now()
-	if _, err := p.workerMap.SetAndWait(ctx, wid, strconv.FormatInt(createdAt.UnixNano(), 10)); err != nil {
-		return nil, fmt.Errorf("failed to add worker %q to pool %q: %w", wid, p.Name, err)
+	if _, err := node.workerMap.SetAndWait(ctx, wid, strconv.FormatInt(createdAt.UnixNano(), 10)); err != nil {
+		return nil, fmt.Errorf("failed to add worker %q to pool %q: %w", wid, node.Name, err)
 	}
 	now := strconv.FormatInt(time.Now().UnixNano(), 10)
-	if _, err := p.keepAliveMap.SetAndWait(ctx, wid, now); err != nil {
+	if _, err := node.keepAliveMap.SetAndWait(ctx, wid, now); err != nil {
 		return nil, fmt.Errorf("failed to update worker keep-alive: %w", err)
 	}
-	stream, err := streaming.NewStream(workerStreamName(wid), p.rdb, soptions.WithStreamLogger(p.logger))
+	stream, err := streaming.NewStream(workerStreamName(wid), node.rdb, soptions.WithStreamLogger(node.logger))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create jobs stream for worker %q: %w", wid, err)
 	}
-	reader, err := stream.NewReader(ctx, soptions.WithReaderBlockDuration(p.workerTTL/2), soptions.WithReaderStartAtOldest())
+	reader, err := stream.NewReader(ctx, soptions.WithReaderBlockDuration(node.workerTTL/2), soptions.WithReaderStartAtOldest())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create reader for worker %q: %w", wid, err)
 	}
 	w := &Worker{
 		ID:                wid,
-		Node:              p,
+		Node:              node,
 		handler:           h,
 		CreatedAt:         time.Now(),
 		stream:            stream,
 		reader:            reader,
 		done:              make(chan struct{}),
-		workersMap:        p.workerMap,
-		jobsMap:           p.jobsMap,
-		jobPayloadsMap:    p.jobPayloadsMap,
-		keepAliveMap:      p.keepAliveMap,
-		shutdownMap:       p.shutdownMap,
-		workerTTL:         p.workerTTL,
-		workerShutdownTTL: p.workerShutdownTTL,
-		logger:            p.logger.WithPrefix("worker", wid),
+		workersMap:        node.workerMap,
+		jobsMap:           node.jobsMap,
+		jobPayloadsMap:    node.jobPayloadsMap,
+		keepAliveMap:      node.keepAliveMap,
+		shutdownMap:       node.shutdownMap,
+		workerTTL:         node.workerTTL,
+		workerShutdownTTL: node.workerShutdownTTL,
+		logger:            node.logger.WithPrefix("worker", wid),
 		jobs:              make(map[string]*Job),
 		nodeStreams:       make(map[string]*streaming.Stream),
 	}
