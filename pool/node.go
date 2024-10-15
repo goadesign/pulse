@@ -93,8 +93,11 @@ const (
 func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...NodeOption) (*Node, error) {
 	o := parseOptions(opts...)
 	logger := o.logger
+	nodeID := ulid.Make().String()
 	if logger == nil {
 		logger = pulse.NoopLogger()
+	} else {
+		logger = logger.WithPrefix("pool", name, "node", nodeID)
 	}
 	wsm, err := rmap.Join(ctx, shutdownMapName(name), rdb, rmap.WithLogger(logger))
 	if err != nil {
@@ -109,7 +112,6 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...NodeOp
 	if err != nil {
 		return nil, fmt.Errorf("failed to create pool job stream %q: %w", poolStreamName(name), err)
 	}
-	nodeID := ulid.Make().String()
 	var (
 		wm         *rmap.Map
 		jm         *rmap.Map
@@ -177,10 +179,10 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...NodeOp
 		workerTTL:         o.workerTTL,
 		workerShutdownTTL: o.workerShutdownTTL,
 		pendingJobTTL:     o.pendingJobTTL,
-		logger:            logger.WithPrefix("pool", name, "node", nodeID),
 		h:                 jumpHash{crc64.New(crc64.MakeTable(crc64.ECMA))},
 		stop:              make(chan struct{}),
 		rdb:               rdb,
+		logger:            logger,
 	}
 
 	nch := nodeReader.Subscribe()
