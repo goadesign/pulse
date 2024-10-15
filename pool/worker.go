@@ -124,6 +124,10 @@ func newWorker(ctx context.Context, p *Node, h JobHandler) (*Worker, error) {
 		nodeStreams:       make(map[string]*streaming.Stream),
 	}
 
+	w.logger.Info("created",
+		"worker_ttl", w.workerTTL,
+		"worker_shutdown_ttl", w.workerShutdownTTL)
+
 	w.wg.Add(2)
 	go w.handleEvents(reader.Subscribe())
 	go w.keepAlive()

@@ -99,6 +99,14 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...NodeOp
 	} else {
 		logger = logger.WithPrefix("pool", name, "node", nodeID)
 	}
+	logger.Info("options",
+		"client_only", o.clientOnly,
+		"max_queued_jobs", o.maxQueuedJobs,
+		"worker_ttl", o.workerTTL,
+		"worker_shutdown_ttl", o.workerShutdownTTL,
+		"pending_job_ttl", o.pendingJobTTL,
+		"job_sink_block_duration", o.jobSinkBlockDuration,
+		"ack_grace_period", o.ackGracePeriod)
 	wsm, err := rmap.Join(ctx, shutdownMapName(name), rdb, rmap.WithLogger(logger))
 	if err != nil {
 		return nil, fmt.Errorf("failed to join shutdown replicated map %q: %w", shutdownMapName(name), err)
@@ -127,6 +135,8 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...NodeOp
 		if err != nil {
 			return nil, fmt.Errorf("failed to join pool workers replicated map %q: %w", workerMapName(name), err)
 		}
+		workerIDs := wm.Keys()
+		logger.Info("joined", "workers", workerIDs)
 		jm, err = rmap.Join(ctx, jobsMapName(name), rdb, rmap.WithLogger(logger))
 		if err != nil {
 			return nil, fmt.Errorf("failed to join pool jobs replicated map %q: %w", jobsMapName(name), err)
@@ -221,7 +231,6 @@ func (node *Node) AddWorker(ctx context.Context, handler JobHandler) (*Worker, e
 	}
 	node.localWorkers = append(node.localWorkers, w)
 	node.workerStreams[w.ID] = w.stream
-	node.logger.Info("added worker", "worker", w.ID)
 	return w, nil
 }
 
@@ -497,12 +506,7 @@ func (node *Node) handleNodeEvents(c <-chan *streaming.Event) {
 				node.returnDispatchStatus(ctx, ev)
 			}
 		case <-node.stop:
-			node.logger.Debug("handleNodeEvents: received stop signal, exiting")
-			node.nodeReader.Close()
-			if err := node.nodeStream.Destroy(ctx); err != nil {
-				node.logger.Error(fmt.Errorf("failed to destroy node event stream: %w", err))
-			}
-			return
+			go node.nodeReader.Close() // Close nodeReader in a separate goroutine to avoid blocking
 		}
 	}
 }
