@@ -123,11 +123,12 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...options.S
 		return nil, fmt.Errorf("failed to load stale check lease script: %w", err)
 	}
 
-	cm, err := rmap.Join(ctx, consumersMapName(stream), stream.rdb, rmap.WithLogger(stream.logger))
+	logger := stream.rootLogger.WithPrefix("sink", name)
+	cm, err := rmap.Join(ctx, consumersMapName(stream), stream.rdb, rmap.WithLogger(logger))
 	if err != nil {
 		return nil, fmt.Errorf("failed to join replicated map for sink %s: %w", name, err)
 	}
-	km, err := rmap.Join(ctx, sinkKeepAliveMapName(name), stream.rdb, rmap.WithLogger(stream.logger))
+	km, err := rmap.Join(ctx, sinkKeepAliveMapName(name), stream.rdb, rmap.WithLogger(logger))
 	if err != nil {
 		return nil, fmt.Errorf("failed to join replicated map for sink keep-alives %s: %w", name, err)
 	}
@@ -151,8 +152,8 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...options.S
 		consumersMap:          map[string]*rmap.Map{stream.Name: cm},
 		consumersKeepAliveMap: km,
 		ackGracePeriod:        o.AckGracePeriod,
-		logger:                stream.rootLogger.WithPrefix("sink", name),
 		acquireLease:          acquireLeaseScript,
+		logger:                logger,
 		rdb:                   stream.rdb,
 	}
 	consumer, err := sink.newConsumer(ctx, stream)
@@ -166,6 +167,8 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...options.S
 	go sink.read(ctx)
 	go sink.periodicKeepAlive()
 	go sink.periodicIdleMessageCheck()
+
+	sink.logger.Info("created", "start", sink.startID, "stream", stream.Name, "max_polled", sink.maxPolled, "block_duration", sink.blockDuration, "buffer_size", sink.bufferSize, "no_ack", sink.noAck, "ack_grace_period", sink.ackGracePeriod)
 
 	return sink, nil
 }
