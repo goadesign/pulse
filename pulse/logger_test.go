@@ -1,7 +1,6 @@
 package pulse
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"strings"
@@ -10,10 +9,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"goa.design/clue/log"
+
+	ptesting "goa.design/pulse/testing"
 )
 
 func TestWithMultipleDerivedPulseLoggers(t *testing.T) {
-	var buf bytes.Buffer
+	var buf ptesting.Buffer
 	ctx := log.Context(context.Background(), log.WithOutput(&buf), log.WithFormat(log.FormatJSON))
 	log.FlushAndDisableBuffering(ctx)
 	logger := ClueLogger(ctx)
