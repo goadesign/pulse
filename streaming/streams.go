@@ -101,11 +101,9 @@ func (s *Stream) NewReader(ctx context.Context, opts ...options.Reader) (*Reader
 func (s *Stream) NewSink(ctx context.Context, name string, opts ...options.Sink) (*Sink, error) {
 	sink, err := newSink(ctx, name, s, opts...)
 	if err != nil {
-		err := fmt.Errorf("failed to create sink: %w", err)
-		s.logger.Error(err, "sink", name)
+		s.logger.Error(fmt.Errorf("failed to create sink: %w", err), "sink", name)
 		return nil, err
 	}
-	s.logger.Info("create", "sink", name, "start", sink.startID)
 	return sink, nil
 }
 
