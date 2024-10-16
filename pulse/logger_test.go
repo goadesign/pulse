@@ -51,7 +51,7 @@ func TestWithMultipleDerivedPulseLoggers(t *testing.T) {
 		actualJSON, err := json.Marshal(logMap)
 		require.NoError(t, err, "Failed to marshal log entry")
 
-		assert.JSONEq(t, expectedLog, string(actualJSON), "Log entry doesn't match expected value")
+		assert.Equal(t, expectedLog, string(actualJSON), "Log entry doesn't match expected value")
 	}
 
 	checkLog(t, logs[0], `{"level":"info","msg":"root"}`)
