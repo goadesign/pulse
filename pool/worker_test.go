@@ -33,9 +33,7 @@ func TestWorkerRequeueJobs(t *testing.T) {
 
 	// Emulate the worker failing by preventing it from refreshing its keepalive
 	// This means we can't cleanup cleanly, hence "false" in CleanupRedis
-	worker.lock.Lock()
-	worker.stopped = true
-	worker.lock.Unlock()
+	worker.stopAndWait(ctx)
 
 	// Create a new worker to pick up the requeued job
 	newWorker := newTestWorker(t, ctx, node)
@@ -51,6 +49,9 @@ func TestWorkerRequeueJobs(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return len(newWorker.Jobs()) == 2
 	}, time.Second, delay, "job was not requeued")
+
+	// Cleanup
+	assert.NoError(t, node.Shutdown(ctx))
 }
 
 func TestStaleWorkerCleanupInNode(t *testing.T) {
