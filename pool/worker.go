@@ -341,6 +341,48 @@ func (w *Worker) keepAlive(ctx context.Context) {
 	}
 }
 
+// rebalance rebalances the jobs handled by the worker.
+func (w *Worker) rebalance(ctx context.Context, activeWorkers []string) {
+	w.lock.Lock()
+	defer w.lock.Unlock()
+
+	if len(w.jobs) == 0 {
+		return
+	}
+	w.logger.Debug("rebalance", "jobs", len(w.jobs))
+	rebalanced := make(map[string]*Job)
+	for _, job := range w.jobs {
+		wid := activeWorkers[w.Node.h.Hash(job.Key, int64(len(activeWorkers)))]
+		if wid != w.ID {
+			rebalanced[job.Key] = job
+		}
+	}
+	total := len(rebalanced)
+	if total == 0 {
+		w.logger.Debug("rebalance: no jobs to rebalance")
+		return
+	}
+	cherrs := make(map[string]chan error, total)
+	for key, job := range rebalanced {
+		if err := w.handler.Stop(key); err != nil {
+			w.logger.Error(fmt.Errorf("rebalance: failed to stop job: %w", err), "job", key)
+			continue
+		}
+		delete(w.jobs, key)
+		cherr, err := w.Node.requeueJob(ctx, w.ID, job)
+		if err != nil {
+			w.logger.Error(fmt.Errorf("rebalance: failed to requeue job: %w", err), "job", key)
+			if err := w.handler.Start(job); err != nil {
+				w.logger.Error(fmt.Errorf("rebalance: failed to restart job: %w", err), "job", key)
+			}
+			continue
+		}
+		delete(rebalanced, key)
+		cherrs[key] = cherr
+	}
+	go w.Node.processRequeuedJobs(ctx, w.ID, cherrs)
+}
+
 // requeueJobs requeues the jobs handled by the worker.
 // This should be done after the worker is stopped.
 func (w *Worker) requeueJobs(ctx context.Context) error {
@@ -471,7 +513,7 @@ func (w *Worker) cleanup(ctx context.Context) {
 	}
 }
 
-// workerEventsStreamName returns the name of the stream used to communicate with the
+// workerStreamName returns the name of the stream used to communicate with the
 // worker with the given ID.
 func workerStreamName(id string) string {
 	return "worker:" + id
