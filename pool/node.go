@@ -771,19 +771,9 @@ func (node *Node) processInactiveWorkers(ctx context.Context) {
 			}
 			continue
 		}
-		mustRequeue := len(keys)
 		requeued := make(map[string]chan error)
 		for _, key := range keys {
-			payload, ok := node.jobPayloadsMap.Get(key)
-			if !ok {
-				node.logger.Error(fmt.Errorf("processInactiveWorkers: payload for job not found"), "job", key, "worker", id)
-				// No need to keep the job around if the payload is not found.
-				if _, _, err := node.jobsMap.RemoveValues(ctx, id, key); err != nil {
-					node.logger.Error(fmt.Errorf("processInactiveWorkers: failed to remove job %q from jobs map: %w", key, err), "job", key, "worker", id)
-				}
-				mustRequeue--
-				continue
-			}
+			payload, _ := node.jobPayloadsMap.Get(key) // Some jobs have no payload
 			job := &Job{
 				Key:       key,
 				Payload:   []byte(payload),
@@ -798,10 +788,11 @@ func (node *Node) processInactiveWorkers(ctx context.Context) {
 			requeued[job.Key] = cherr
 		}
 
-		if len(requeued) != mustRequeue {
-			node.logger.Error(fmt.Errorf("processInactiveWorkers: failed to requeue all inactive jobs: %d/%d, will retry later", len(requeued), mustRequeue), "worker", id)
+		allRequeued := len(requeued) == len(keys)
+		if !allRequeued {
+			node.logger.Error(fmt.Errorf("processInactiveWorkers: failed to requeue all inactive jobs: %d/%d, will retry later", len(requeued), len(keys)), "worker", id)
 		}
-		go node.processRequeuedJobs(ctx, id, requeued, len(requeued) == mustRequeue)
+		go node.processRequeuedJobs(ctx, id, requeued, allRequeued)
 	}
 }
 
