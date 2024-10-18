@@ -31,7 +31,9 @@ func TestNewTicker(t *testing.T) {
 	assert.WithinDuration(t, startTime.Add(tickDuration), firstTick, time.Second, "First tick should occur after approximately one tick duration")
 
 	// Verify next tick time and duration
+	ticker.lock.Lock()
 	nextTickTime, tickerDuration := deserialize(ticker.next)
+	ticker.lock.Unlock()
 	assert.WithinDuration(t, startTime.Add(tickDuration), nextTickTime, time.Second, "Next tick time should be approximately one tick duration from start")
 	assert.Equal(t, tickDuration, tickerDuration, "Ticker duration should match the specified duration")
 

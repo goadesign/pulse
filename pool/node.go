@@ -620,6 +620,23 @@ func (node *Node) handleWorkerMapUpdate(ctx context.Context) {
 	if node.closing {
 		return
 	}
+	// First cleanup the local workers that are no longer active.
+	for _, worker := range node.localWorkers {
+		if _, ok := node.workerMap.Get(worker.ID); !ok {
+			// If it's not in the worker map, then it's not active and its jobs
+			// have already been requeued.
+			node.logger.Info("handleWorkerMapUpdate: removing inactive local worker", "worker", worker.ID)
+			worker.stopAndWait(ctx)
+			for i, w := range node.localWorkers {
+				if worker.ID == w.ID {
+					node.localWorkers = append(node.localWorkers[:i], node.localWorkers[i+1:]...)
+					break
+				}
+			}
+		}
+	}
+
+	// Then rebalance the jobs across the remaining active workers.
 	activeWorkers := node.activeWorkers()
 	if len(activeWorkers) == 0 {
 		return
@@ -727,10 +744,11 @@ func (node *Node) processInactiveWorkers(ctx context.Context) {
 			continue
 		}
 		lastSeen := time.Unix(0, lsi)
-		if time.Since(lastSeen) <= node.workerTTL {
+		lsd := time.Since(lastSeen)
+		if lsd <= node.workerTTL {
 			continue
 		}
-		node.logger.Debug("processInactiveWorkers: removing worker", "worker", id)
+		node.logger.Debug("processInactiveWorkers: removing worker", "worker", id, "last-seen", lsd, "ttl", node.workerTTL)
 
 		// Use optimistic locking to set the keep-alive timestamp to a value
 		// in the future so that another node does not also requeue the jobs.
@@ -747,21 +765,15 @@ func (node *Node) processInactiveWorkers(ctx context.Context) {
 
 		keys, ok := node.jobsMap.GetValues(id)
 		if !ok {
-			continue // worker is already being deleted
+			// Worker has no jobs, so delete it right away.
+			if err := node.deleteWorker(ctx, id); err != nil {
+				node.logger.Error(fmt.Errorf("processInactiveWorkers: failed to delete worker %q: %w", id, err), "worker", id)
+			}
+			continue
 		}
-		mustRequeue := len(keys)
 		requeued := make(map[string]chan error)
 		for _, key := range keys {
-			payload, ok := node.jobPayloadsMap.Get(key)
-			if !ok {
-				node.logger.Error(fmt.Errorf("processInactiveWorkers: payload for job not found"), "job", key, "worker", id)
-				// No need to keep the job around if the payload is not found.
-				if _, _, err := node.jobsMap.RemoveValues(ctx, id, key); err != nil {
-					node.logger.Error(fmt.Errorf("processInactiveWorkers: failed to remove job %q from jobs map: %w", key, err), "job", key, "worker", id)
-				}
-				mustRequeue--
-				continue
-			}
+			payload, _ := node.jobPayloadsMap.Get(key) // Some jobs have no payload
 			job := &Job{
 				Key:       key,
 				Payload:   []byte(payload),
@@ -776,10 +788,11 @@ func (node *Node) processInactiveWorkers(ctx context.Context) {
 			requeued[job.Key] = cherr
 		}
 
-		if len(requeued) != mustRequeue {
-			node.logger.Error(fmt.Errorf("processInactiveWorkers: failed to requeue all inactive jobs: %d/%d, will retry later", len(requeued), mustRequeue), "worker", id)
+		allRequeued := len(requeued) == len(keys)
+		if !allRequeued {
+			node.logger.Error(fmt.Errorf("processInactiveWorkers: failed to requeue all inactive jobs: %d/%d, will retry later", len(requeued), len(keys)), "worker", id)
 		}
-		go node.processRequeuedJobs(ctx, id, requeued, len(requeued) == mustRequeue)
+		go node.processRequeuedJobs(ctx, id, requeued, allRequeued)
 	}
 }
 
@@ -866,6 +879,7 @@ func (node *Node) activeWorkers() []string {
 
 // deleteWorker removes a worker from the pool deleting the worker stream.
 func (node *Node) deleteWorker(ctx context.Context, id string) error {
+	node.logger.Debug("deleteWorker: deleting worker", "worker", id)
 	if _, err := node.keepAliveMap.Delete(ctx, id); err != nil {
 		node.logger.Error(fmt.Errorf("deleteWorker: failed to delete worker %q from keep-alive map: %w", id, err))
 	}

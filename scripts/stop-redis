@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -e
+
+# Get the root directory of the git repository
+GIT_ROOT=$(git rev-parse --show-toplevel)
+
+# Change to the git root directory
+pushd "${GIT_ROOT}"
+
+# Source common utilities and environment variables
+# shellcheck source=utils/common.sh
+source ./scripts/utils/common.sh
+source .env
+
+# Stop the Redis Docker container
+docker compose -p redis -f docker-compose/docker-compose-redis.yaml down
+
+# Return to the original directory
+popd

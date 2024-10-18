@@ -334,7 +334,6 @@ func (s *Sink) newConsumer(ctx context.Context, stream *Stream) (string, error) 
 		}
 		return "", fmt.Errorf("failed to set sink keep-alive for new consumer %s: %w", consumer, err)
 	}
-	s.logger.Debug("created new consumer", "consumer", consumer)
 	return consumer, nil
 }
 
