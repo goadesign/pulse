@@ -53,7 +53,7 @@ func TestWorkerRequeueJobs(t *testing.T) {
 	}, time.Second, delay, "job was not requeued")
 }
 
-func TestStaleWorkerCleanup(t *testing.T) {
+func TestStaleWorkerCleanupInNode(t *testing.T) {
 	var (
 		ctx      = ptesting.NewTestContext(t)
 		testName = strings.Replace(t.Name(), "/", "_", -1)
@@ -64,6 +64,7 @@ func TestStaleWorkerCleanup(t *testing.T) {
 
 	// Create one active worker
 	activeWorker := newTestWorker(t, ctx, node)
+	t.Log("active worker", activeWorker.ID)
 
 	// Create five stale workers
 	staleWorkers := make([]*Worker, 5)

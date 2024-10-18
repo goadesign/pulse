@@ -626,9 +626,9 @@ func (node *Node) handleWorkerMapUpdate(ctx context.Context) {
 			// If it's not in the worker map, then it's not active and its jobs
 			// have already been requeued.
 			node.logger.Info("handleWorkerMapUpdate: removing inactive local worker", "worker", worker.ID)
+			worker.stopAndWait(ctx)
 			for i, w := range node.localWorkers {
-				w.stopAndWait(ctx)
-				if w.ID == worker.ID {
+				if worker.ID == w.ID {
 					node.localWorkers = append(node.localWorkers[:i], node.localWorkers[i+1:]...)
 					break
 				}
