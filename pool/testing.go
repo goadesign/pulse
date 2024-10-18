@@ -19,9 +19,9 @@ type mockHandler struct {
 
 const (
 	testWorkerShutdownTTL    = 100 * time.Millisecond
-	testJobSinkBlockDuration = 50 * time.Millisecond
-	testWorkerTTL            = 50 * time.Millisecond
-	testAckGracePeriod       = 20 * time.Millisecond
+	testJobSinkBlockDuration = 100 * time.Millisecond
+	testWorkerTTL            = 100 * time.Millisecond
+	testAckGracePeriod       = 50 * time.Millisecond
 )
 
 // newTestNode creates a new Node instance for testing purposes.

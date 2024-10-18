@@ -31,7 +31,6 @@ type (
 		stream            *streaming.Stream
 		reader            *streaming.Reader
 		done              chan struct{}
-		workersMap        *rmap.Map
 		jobsMap           *rmap.Map
 		jobPayloadsMap    *rmap.Map
 		keepAliveMap      *rmap.Map
@@ -112,7 +111,6 @@ func newWorker(ctx context.Context, node *Node, h JobHandler) (*Worker, error) {
 		stream:            stream,
 		reader:            reader,
 		done:              make(chan struct{}),
-		workersMap:        node.workerMap,
 		jobsMap:           node.jobsMap,
 		jobPayloadsMap:    node.jobPayloadsMap,
 		keepAliveMap:      node.keepAliveMap,
@@ -130,7 +128,7 @@ func newWorker(ctx context.Context, node *Node, h JobHandler) (*Worker, error) {
 
 	w.wg.Add(2)
 	go w.handleEvents(reader.Subscribe())
-	go w.keepAlive()
+	go w.keepAlive(ctx)
 
 	return w, nil
 }
@@ -203,32 +201,11 @@ func (w *Worker) stop(ctx context.Context) {
 		return
 	}
 	w.stopped = true
-	var err error
-	if _, er := w.workersMap.Delete(ctx, w.ID); er != nil {
-		err = fmt.Errorf("failed to remove worker %q from pool %q: %w", w.ID, w.Node.Name, er)
-	}
-	if _, er := w.keepAliveMap.Delete(ctx, w.ID); er != nil {
-		err = fmt.Errorf("failed to remove worker %q from keep alive map: %w", w.ID, er)
-	}
-	keys, er := w.jobsMap.Delete(ctx, w.ID)
-	if er != nil {
-		err = fmt.Errorf("failed to remove worker %q from jobs map: %w", w.ID, er)
-	}
-	if keys != "" {
-		for _, key := range strings.Split(keys, ",") {
-			if _, er := w.jobPayloadsMap.Delete(ctx, key); er != nil {
-				err = fmt.Errorf("worker stop: failed to remove job payload %q from job payloads map: %w", key, er)
-			}
-		}
-	}
 	w.reader.Close()
-	if er := w.stream.Destroy(ctx); er != nil {
-		err = fmt.Errorf("failed to destroy stream for worker %q: %w", w.ID, er)
+	if err := w.stream.Destroy(ctx); err != nil {
+		w.logger.Error(fmt.Errorf("failed to destroy stream for worker: %w", err))
 	}
 	close(w.done)
-	if err != nil {
-		w.logger.Error(err)
-	}
 }
 
 // stopAndWait stops the worker and waits for its goroutines to exit up to
@@ -265,7 +242,7 @@ func (w *Worker) startJob(ctx context.Context, job *Job) error {
 	}
 	job.Worker = w
 	if err := w.handler.Start(job); err != nil {
-		if _, err := w.jobsMap.RemoveValues(ctx, w.ID, job.Key); err != nil {
+		if _, _, err := w.jobsMap.RemoveValues(ctx, w.ID, job.Key); err != nil {
 			w.logger.Error(fmt.Errorf("start failure handling: failed to remove job %q from jobs map: %w", job.Key, err))
 		}
 		if _, err := w.jobPayloadsMap.Delete(ctx, job.Key); err != nil {
@@ -287,7 +264,7 @@ func (w *Worker) stopJob(ctx context.Context, key string) error {
 	if err := w.handler.Stop(key); err != nil {
 		return fmt.Errorf("failed to stop job %q: %w", key, err)
 	}
-	if _, err := w.jobsMap.RemoveValues(ctx, w.ID, key); err != nil {
+	if _, _, err := w.jobsMap.RemoveValues(ctx, w.ID, key); err != nil {
 		w.logger.Error(fmt.Errorf("stop job: failed to remove job %q from jobs map: %w", key, err))
 	}
 	if _, err := w.jobPayloadsMap.Delete(ctx, key); err != nil {
@@ -339,9 +316,8 @@ func (w *Worker) ackPoolEvent(ctx context.Context, nodeID, eventID string, acker
 }
 
 // keepAlive keeps the worker registration up-to-date until ctx is cancelled.
-func (w *Worker) keepAlive() {
+func (w *Worker) keepAlive(ctx context.Context) {
 	defer w.wg.Done()
-	ctx := context.Background()
 	ticker := time.NewTicker(w.workerTTL / 2)
 	defer ticker.Stop()
 	for {
@@ -367,24 +343,132 @@ func (w *Worker) keepAlive() {
 
 // requeueJobs requeues the jobs handled by the worker.
 // This should be done after the worker is stopped.
-func (w *Worker) requeueJobs(ctx context.Context) {
+func (w *Worker) requeueJobs(ctx context.Context) error {
+	w.lock.Lock()
+	jobCount := len(w.jobs)
+	if jobCount == 0 {
+		w.lock.Unlock()
+		return nil
+	}
+	w.logger.Debug("requeueJobs: requeuing", "jobs", jobCount)
+	jobsToRequeue := make(map[string]*Job, jobCount)
+	for k, v := range w.jobs {
+		jobsToRequeue[k] = v
+	}
+	createdAt := strconv.FormatInt(w.CreatedAt.UnixNano(), 10)
+	w.lock.Unlock()
+
+	// First mark the worker as inactive so that requeued jobs are not assigned to this worker
+	// Use optimistic locking to avoid race conditions.
+	prev, err := w.Node.workerMap.TestAndSet(ctx, w.ID, createdAt, "-")
+	if err != nil {
+		return fmt.Errorf("requeueJobs: failed to mark worker as inactive: %w", err)
+	}
+	if prev == "-" || prev == "" {
+		w.logger.Debug("requeueJobs: worker already marked as inactive, skipping requeue")
+		return nil
+	}
+
+	retryUntil := time.Now().Add(w.workerTTL)
+	for retryUntil.After(time.Now()) {
+		remainingJobs := w.attemptRequeue(ctx, jobsToRequeue)
+		jobsToRequeue = remainingJobs
+		if len(remainingJobs) == 0 {
+			break
+		}
+	}
+
+	failedCount := len(jobsToRequeue)
+	w.logger.Info("requeued", "jobs", jobCount, "failed", failedCount)
+	if failedCount > 0 {
+		return fmt.Errorf("requeueJobs: failed to requeue %d/%d jobs after retrying for %v", failedCount, jobCount, w.workerTTL)
+	}
+
+	return nil
+}
+
+// attemptRequeue attempts to requeue the jobs in the given map.
+// It returns any job that failed to be requeued.
+func (w *Worker) attemptRequeue(ctx context.Context, jobsToRequeue map[string]*Job) map[string]*Job {
+	var wg sync.WaitGroup
+	type result struct {
+		key string
+		err error
+	}
+	resultChan := make(chan result, len(jobsToRequeue))
+
+	for key, job := range jobsToRequeue {
+		wg.Add(1)
+		go func(k string, j *Job) {
+			defer wg.Done()
+			err := w.requeueJob(ctx, j)
+			resultChan <- result{key: k, err: err}
+		}(key, job)
+	}
+
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	remainingJobs := make(map[string]*Job)
+	for {
+		select {
+		case res, ok := <-resultChan:
+			if !ok {
+				return remainingJobs
+			}
+			if res.err != nil {
+				w.logger.Error(fmt.Errorf("requeueJobs: failed to requeue job %q: %w", res.key, res.err))
+				remainingJobs[res.key] = jobsToRequeue[res.key]
+				continue
+			}
+			delete(remainingJobs, res.key)
+			w.logger.Info("requeued", "job", res.key)
+		case <-time.After(w.workerTTL):
+			w.logger.Error(fmt.Errorf("requeueJobs: timeout reached, some jobs may not have been processed"))
+			return remainingJobs
+		}
+	}
+}
+
+// requeueJob requeues a job.
+func (w *Worker) requeueJob(ctx context.Context, job *Job) error {
 	w.lock.Lock()
 	defer w.lock.Unlock()
-	for _, job := range w.jobs {
-		if err := w.stopJob(ctx, job.Key); err != nil {
-			w.logger.Error(fmt.Errorf("failed to stop job %q: %w", job.Key, err))
-		}
-		eventID, err := w.Node.poolStream.Add(ctx, evStartJob, marshalJob(job))
-		if err != nil {
-			w.logger.Error(fmt.Errorf("failed to requeue job %q: %w", job.Key, err))
-		}
-		w.Node.pendingJobs[eventID] = nil
-		if _, err := w.jobsMap.RemoveValues(ctx, w.ID, job.Key); err != nil {
-			w.logger.Error(fmt.Errorf("failed to remove requeued job from jobs map: %w", err), "job", job.Key)
-		}
-		w.logger.Info("requeued", "job", job.Key)
+
+	err := w.stopJob(ctx, job.Key)
+	if err != nil {
+		return fmt.Errorf("failed to stop job: %w", err)
 	}
-	w.jobs = nil
+
+	eventID, err := w.Node.poolStream.Add(ctx, evStartJob, marshalJob(job))
+	if err != nil {
+		return fmt.Errorf("requeueJob: failed to add job to pool stream: %w", err)
+	}
+	w.Node.pendingJobs[eventID] = nil
+	return nil
+}
+
+// cleanup removes the worker from the workers, keep-alive and jobs maps.
+func (w *Worker) cleanup(ctx context.Context) {
+	if _, err := w.Node.workerMap.Delete(ctx, w.ID); err != nil {
+		w.logger.Error(fmt.Errorf("failed to remove worker from worker map: %w", err))
+	}
+	if _, err := w.keepAliveMap.Delete(ctx, w.ID); err != nil {
+		w.logger.Error(fmt.Errorf("failed to remove worker from keep alive map: %w", err))
+	}
+	keys, err := w.jobsMap.Delete(ctx, w.ID)
+	if err != nil {
+		w.logger.Error(fmt.Errorf("failed to remove worker from jobs map: %w", err))
+	}
+	if keys != "" {
+		for _, key := range strings.Split(keys, ",") {
+			if _, err := w.jobPayloadsMap.Delete(ctx, key); err != nil {
+				w.logger.Error(fmt.Errorf("worker stop: failed to remove job payload %q from job payloads map: %w", key, err))
+			}
+		}
+	}
 }
 
 // workerEventsStreamName returns the name of the stream used to communicate with the

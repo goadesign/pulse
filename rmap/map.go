@@ -132,10 +132,11 @@ var (
 	   return v
 	`)
 
-	// luaRemove is the Lua script used to remove an item from an array value and
-	// return the result.
+	// luaRemove is the Lua script used to remove items from an array value and
+	// return the result along with a flag indicating if any value was removed.
 	luaRemove = redis.NewScript(`
 	   local v = redis.call("HGET", KEYS[1], ARGV[1])
+	   local removed = false
 
 	   if v then
 	      -- Create a set of current values
@@ -146,7 +147,10 @@ var (
 
 	      -- Remove specified values
 	      for s in string.gmatch(ARGV[2], "[^,]+") do
-	         curr[s] = nil
+	         if curr[s] then
+	            curr[s] = nil
+	            removed = true
+	         end
 	      end
 
 	      -- Collect the remaining values
@@ -168,7 +172,7 @@ var (
 	      redis.call("PUBLISH", KEYS[2], ARGV[1] .. "=" .. v)
 	   end
 
-	   return v
+	   return {v, removed}
 	`)
 
 	// luaReset is the Lua script used to reset the map.
@@ -360,8 +364,15 @@ func (sm *Map) GetValues(key string) ([]string, bool) {
 	return strings.Split(val, ","), true
 }
 
-// Set sets the value for the given key and returns the previous value. An error
-// is returned if the key is empty or contains an equal sign.
+// Set sets the value for the given key and returns the previous value.
+// An error is returned if:
+// - The key is empty
+// - The key contains an equal sign
+// - There's an issue with the Redis operation
+//
+// Example:
+// Set(ctx, "color", "blue") would set the "color" key to "blue"
+// and return the previous value, if any.
 func (sm *Map) Set(ctx context.Context, key, value string) (string, error) {
 	prev, err := sm.runLuaScript(ctx, "set", sm.setScript, key, value)
 	if err != nil {
@@ -400,8 +411,15 @@ func (sm *Map) SetAndWait(ctx context.Context, key, value string) (string, error
 }
 
 // TestAndSet sets the value for the given key if the current value matches the
-// given test value. The previous value is returned. An error is returned if the
-// key is empty or contains an equal sign.
+// given test value. The previous value is returned.
+// An error is returned if:
+// - The key is empty
+// - The key contains an equal sign
+// - There's an issue with the Redis operation
+//
+// Example:
+// TestAndSet(ctx, "color", "red", "blue") would set "color" to "blue"
+// only if its current value is "red", and return the previous value.
 func (sm *Map) TestAndSet(ctx context.Context, key, test, value string) (string, error) {
 	prev, err := sm.runLuaScript(ctx, "testAndSet", sm.testAndSetScript, key, test, value)
 	if err != nil {
@@ -413,9 +431,17 @@ func (sm *Map) TestAndSet(ctx context.Context, key, test, value string) (string,
 	return prev.(string), nil
 }
 
-// Inc increments the value for the given key and returns the result, the value
-// must represent an integer. An error is returned if the key is empty, contains
-// an equal sign or if the value does not represent an integer.
+// Inc increments the value for the given key and returns the result.
+// The value must represent an integer.
+// An error is returned if:
+// - The key is empty
+// - The key contains an equal sign
+// - The value does not represent an integer
+// - There's an issue with the Redis operation
+//
+// Example:
+// Inc(ctx, "counter", 1) would increment the "counter" by 1
+// and return the new value.
 func (sm *Map) Inc(ctx context.Context, key string, delta int) (int, error) {
 	res, err := sm.runLuaScript(ctx, "incr", sm.incrScript, key, delta)
 	if err != nil {
@@ -429,9 +455,15 @@ func (sm *Map) Inc(ctx context.Context, key string, delta int) (int, error) {
 }
 
 // AppendValues appends the given items to the value for the given key and
-// returns the result. The array of items is stored as a comma-separated list
-// (so items should not have commas in them). An error is returned if the key is
-// empty or contains an equal sign.
+// returns the result. The array of items is stored as a comma-separated list.
+// An error is returned if:
+// - The key is empty
+// - The key contains an equal sign
+// - There's an issue with the Redis operation
+//
+// Example:
+// AppendValues(ctx, "fruits", "apple", "banana") would append "apple" and "banana"
+// to the existing list of fruits and return the updated list.
 func (sm *Map) AppendValues(ctx context.Context, key string, items ...string) ([]string, error) {
 	sitems := strings.Join(items, ",")
 	res, err := sm.runLuaScript(ctx, "append", sm.appendScript, key, sitems)
@@ -446,8 +478,15 @@ func (sm *Map) AppendValues(ctx context.Context, key string, items ...string) ([
 
 // AppendUniqueValues appends the given items to the value for the given key if
 // they are not already present and returns the result. The array of items is
-// stored as a comma-separated list (so items should not have commas in them).
-// An error is returned if the key is empty or contains an equal sign.
+// stored as a comma-separated list.
+// An error is returned if:
+// - The key is empty
+// - The key contains an equal sign
+// - There's an issue with the Redis operation
+//
+// Example:
+// AppendUniqueValues(ctx, "fruits", "apple", "banana") would append only unique values
+// to the existing list of fruits and return the updated list.
 func (sm *Map) AppendUniqueValues(ctx context.Context, key string, items ...string) ([]string, error) {
 	sitems := strings.Join(items, ",")
 	res, err := sm.runLuaScript(ctx, "appendUnique", sm.appendUniqueScript, key, sitems)
@@ -461,25 +500,50 @@ func (sm *Map) AppendUniqueValues(ctx context.Context, key string, items ...stri
 }
 
 // RemoveValues removes the given items from the value for the given key and
-// returns the result. The array of items is stored as a comma-separated list.
-// If the removal results in an empty slice then the key is automatically
-// deleted. An error is returned if key is empty or contains an equal sign.
-func (sm *Map) RemoveValues(ctx context.Context, key string, items ...string) ([]string, error) {
+// returns the remaining values after removal. The function behaves as follows:
+//
+//  1. The value for the key is expected to be a comma-separated list of items.
+//  2. It removes all occurrences of the specified items from this list.
+//  3. If the removal results in an empty list, the key is automatically deleted.
+//  4. Returns the remaining items as a slice of strings, a boolean indicating
+//     whether any value was removed, and an error (if any).
+//  5. If the key doesn't exist, it returns nil, false, nil.
+//
+// An error is returned if:
+// - The key is empty
+// - The key contains an equal sign
+// - There's an issue with the Redis operation
+//
+// Example:
+// Given a key "fruits" with value "apple,banana,cherry,apple"
+// RemoveValues(ctx, "fruits", "apple", "cherry") would return (["banana"], true, nil)
+// and update the value in Redis to "banana"
+func (sm *Map) RemoveValues(ctx context.Context, key string, items ...string) ([]string, bool, error) {
 	sitems := strings.Join(items, ",")
 	res, err := sm.runLuaScript(ctx, "remove", sm.removeScript, key, sitems)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	if res == nil {
-		return nil, nil
+	result := res.([]any)
+	if result[0] == nil {
+		return nil, false, nil // Key didn't exist
 	}
-	if res.(string) == "" {
-		return nil, nil
+	remaining := result[0].(string)
+	if remaining == "" {
+		return nil, true, nil // All items were removed, key was deleted
 	}
-	return strings.Split(res.(string), ","), nil
+	removed := result[1].(int64) == 1
+	return strings.Split(remaining, ","), removed, nil
 }
 
 // Delete deletes the value for the given key and returns the previous value.
+// An error is returned if:
+// - The key is empty
+// - The key contains an equal sign
+// - There's an issue with the Redis operation
+//
+// Example:
+// Delete(ctx, "color") would delete the "color" key and return its previous value, if any.
 func (sm *Map) Delete(ctx context.Context, key string) (string, error) {
 	prev, err := sm.runLuaScript(ctx, "delete", sm.delScript, key)
 	if err != nil {
@@ -492,7 +556,15 @@ func (sm *Map) Delete(ctx context.Context, key string) (string, error) {
 }
 
 // TestAndDelete tests that the value for the given key matches the test value
-// and deletes the key if it does.
+// and deletes the key if it does. It returns the previous value.
+// An error is returned if:
+// - The key is empty
+// - The key contains an equal sign
+// - There's an issue with the Redis operation
+//
+// Example:
+// TestAndDelete(ctx, "color", "blue") would delete the "color" key only if
+// its current value is "blue", and return the previous value.
 func (sm *Map) TestAndDelete(ctx context.Context, key, test string) (string, error) {
 	prev, err := sm.runLuaScript(ctx, "testAndDelete", sm.testAndDelScript, key, test)
 	if err != nil {
@@ -511,7 +583,16 @@ func (sm *Map) Reset(ctx context.Context) error {
 }
 
 // TestAndReset tests that the values for the given keys match the test values
-// and clears the map if they do.
+// and clears the map if they do. It returns true if the map was cleared, false otherwise.
+// An error is returned if:
+// - Any key is empty
+// - Any key contains an equal sign
+// - There's an issue with the Redis operation
+//
+// Example:
+// TestAndReset(ctx, []string{"color", "size"}, []string{"blue", "large"}) would clear the map
+// only if the "color" key has value "blue" and the "size" key has value "large",
+// and return true if the map was cleared.
 func (sm *Map) TestAndReset(ctx context.Context, keys, tests []string) (bool, error) {
 	args := make([]any, 1+len(keys)+len(tests))
 	args[0] = "*"

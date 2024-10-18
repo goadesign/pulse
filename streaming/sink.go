@@ -267,7 +267,7 @@ func (s *Sink) RemoveStream(ctx context.Context, stream *Stream) error {
 		s.streamCursors[i] = stream.key
 		s.streamCursors[len(s.streams)+i] = ">"
 	}
-	remains, err := s.consumersMap[stream.Name].RemoveValues(ctx, s.Name, s.consumer)
+	remains, _, err := s.consumersMap[stream.Name].RemoveValues(ctx, s.Name, s.consumer)
 	if err != nil {
 		return fmt.Errorf("failed to remove consumer %s from replicated map for stream %s: %w", s.consumer, stream.Name, err)
 	}
@@ -340,6 +340,7 @@ func (s *Sink) newConsumer(ctx context.Context, stream *Stream) (string, error) 
 
 // read reads events from the streams and sends them to the sink channel.
 func (s *Sink) read(ctx context.Context) {
+	defer s.logger.Debug("read: exiting")
 	defer s.wait.Done()
 	for {
 		if err := s.ensureConsumer(ctx); err != nil {
@@ -351,6 +352,7 @@ func (s *Sink) read(ctx context.Context) {
 		copy(readStreams, s.streamCursors)
 		s.lock.Unlock()
 
+		s.logger.Debug("reading", "streams", readStreams, "max", s.maxPolled, "block", s.blockDuration)
 		streams, err := s.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
 			Group:    s.Name,
 			Consumer: s.consumer,
@@ -401,6 +403,7 @@ func (s *Sink) ensureConsumer(ctx context.Context) error {
 // periodicKeepAlive updates this consumer keep-alive every half ack grace period.
 func (s *Sink) periodicKeepAlive() {
 	defer s.wait.Done()
+	defer s.logger.Debug("periodicKeepAlive: exiting")
 	ticker := time.NewTicker(s.ackGracePeriod)
 	defer ticker.Stop()
 
@@ -428,6 +431,7 @@ func (s *Sink) periodicKeepAlive() {
 // Once all idle messages are claimed, any stale consumer is deleted.
 func (s *Sink) periodicIdleMessageCheck() {
 	defer s.wait.Done()
+	defer s.logger.Debug("periodicIdleMessageCheck: exiting")
 	ticker := time.NewTicker(checkIdlePeriod)
 	defer ticker.Stop()
 
@@ -516,7 +520,7 @@ func (s *Sink) deleteStaleConsumers(ctx context.Context) {
 				if _, err := s.consumersKeepAliveMap.Delete(ctx, consumer); err != nil {
 					s.logger.Error(fmt.Errorf("failed to delete sink keep-alive for stale consumer %s: %w", consumer, err))
 				}
-				if _, err := sinks.RemoveValues(ctx, s.Name, consumer); err != nil {
+				if _, _, err := sinks.RemoveValues(ctx, s.Name, consumer); err != nil {
 					s.logger.Error(fmt.Errorf("failed to remove consumer from map: %w", err), "stream", stream.Name, "consumer", consumer)
 				}
 				s.logger.Debug("deleted stale consumer", "consumer", consumer)

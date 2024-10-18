@@ -345,18 +345,21 @@ func TestArrays(t *testing.T) {
 	assert.Equal(t, []string{"bar", "baz"}, res)
 	assert.Eventually(t, func() bool { return len(strings.Split(m.Map()[key], ",")) == 2 }, wf, tck)
 	assert.Equal(t, val1+","+val2, m.Map()[key])
-	res, err = m.RemoveValues(ctx, key, val1)
+	res, removed, err := m.RemoveValues(ctx, key, val1)
 	assert.NoError(t, err)
 	assert.Equal(t, []string{"baz"}, res)
+	assert.True(t, removed)
 	assert.Eventually(t, func() bool { return len(strings.Split(m.Map()[key], ",")) == 1 }, wf, tck)
 	assert.Equal(t, val2, m.Map()[key])
-	res, err = m.RemoveValues(ctx, key, val2)
+	res, removed, err = m.RemoveValues(ctx, key, val2)
 	assert.NoError(t, err)
 	assert.Nil(t, res)
+	assert.True(t, removed)
 	assert.Eventually(t, func() bool { return len(m.Map()) == 0 }, wf, tck)
-	res, err = m.RemoveValues(ctx, nonkey, val1)
+	res, removed, err = m.RemoveValues(ctx, nonkey, val1)
 	assert.NoError(t, err)
 	assert.Nil(t, res)
+	assert.False(t, removed)
 	assert.Equal(t, m.rdb.Exists(ctx, key).Val(), int64(0))
 }
 
@@ -476,12 +479,14 @@ func TestRemoveValuesErrors(t *testing.T) {
 	require.NoError(t, err)
 	defer cleanup(t, m)
 
-	res, err := m.RemoveValues(ctx, "", "foo")
+	res, removed, err := m.RemoveValues(ctx, "", "foo")
 	assert.Error(t, err)
 	assert.Equal(t, []string(nil), res)
-	res, err = m.RemoveValues(ctx, "foo=2", "bar")
+	assert.False(t, removed)
+	res, removed, err = m.RemoveValues(ctx, "foo=2", "bar")
 	assert.Error(t, err)
 	assert.Equal(t, []string(nil), res)
+	assert.False(t, removed)
 }
 
 func TestReconnect(t *testing.T) {
