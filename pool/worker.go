@@ -380,7 +380,7 @@ func (w *Worker) rebalance(ctx context.Context, activeWorkers []string) {
 		delete(rebalanced, key)
 		cherrs[key] = cherr
 	}
-	go w.Node.processRequeuedJobs(ctx, w.ID, cherrs)
+	go w.Node.processRequeuedJobs(ctx, w.ID, cherrs, false)
 }
 
 // requeueJobs requeues the jobs handled by the worker.
