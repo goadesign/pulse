@@ -65,11 +65,11 @@ func main() {
 	fmt.Printf("%q: new values for listval: %v\n", m.Name, vals)
 
 	// Remove elements from a list and return the new content
-	vals, err = m.RemoveValues(ctx, "listval", "first")
+	vals, removed, err := m.RemoveValues(ctx, "listval", "first")
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("%q: new values for listval: %v\n", m.Name, vals)
+	fmt.Printf("%q: new values for listval: %v, removed: %v\n", m.Name, vals, removed)
 
 	// Increment an integer, starts at 0
 	if _, err := m.Inc(ctx, "intval", 1); err != nil {
