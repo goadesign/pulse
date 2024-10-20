@@ -338,7 +338,7 @@ func (node *Node) Shutdown(ctx context.Context) error {
 	}
 	if node.clientOnly {
 		node.lock.Unlock()
-		return fmt.Errorf("Shutdown: pool %q is client-only", node.Name)
+		return fmt.Errorf("Shutdown: client-only node cannot shutdown worker pool")
 	}
 	node.lock.Unlock()
 	node.logger.Info("shutting down")
@@ -401,31 +401,32 @@ func (node *Node) close(ctx context.Context, requeue bool) error {
 	node.logger.Info("closing")
 	node.closing = true
 
-	// Need to stop workers before requeueing jobs to prevent
-	// requeued jobs from being handled by this node.
-	var wg sync.WaitGroup
-	node.logger.Debug("stopping workers", "count", len(node.localWorkers))
-	for _, w := range node.localWorkers {
-		wg.Add(1)
-		go func(w *Worker) {
-			defer wg.Done()
-			w.stopAndWait(ctx)
-		}(w)
-	}
-	wg.Wait()
-	node.logger.Debug("workers stopped")
-
-	for _, w := range node.localWorkers {
-		if requeue {
-			if err := w.requeueJobs(ctx); err != nil {
-				node.logger.Error(fmt.Errorf("Close: failed to requeue jobs for worker %q: %w", w.ID, err))
-				continue
-			}
+	if len(node.localWorkers) > 0 {
+		// Need to stop workers before requeueing jobs to prevent
+		// requeued jobs from being handled by this node.
+		var wg sync.WaitGroup
+		node.logger.Debug("stopping workers", "count", len(node.localWorkers))
+		for _, w := range node.localWorkers {
+			wg.Add(1)
+			go func(w *Worker) {
+				defer wg.Done()
+				w.stopAndWait(ctx)
+			}(w)
 		}
-		w.cleanup(ctx)
+		wg.Wait()
+		node.logger.Debug("workers stopped")
+		for _, w := range node.localWorkers {
+			if requeue {
+				if err := w.requeueJobs(ctx); err != nil {
+					node.logger.Error(fmt.Errorf("Close: failed to requeue jobs for worker %q: %w", w.ID, err))
+					continue
+				}
+			}
+			w.cleanup(ctx)
+		}
+		node.localWorkers = nil
 	}
 
-	node.localWorkers = nil
 	if !node.clientOnly {
 		node.poolSink.Close()
 		node.tickerMap.Close()
@@ -532,7 +533,10 @@ func (node *Node) ackWorkerEvent(ctx context.Context, ev *streaming.Event) {
 	key := workerID + ":" + ack.EventID
 	pending, ok := node.pendingEvents[key]
 	if !ok {
-		node.logger.Error(fmt.Errorf("ackWorkerEvent: received event %s from worker %s that was not dispatched", ack.EventID, workerID))
+		node.logger.Error(fmt.Errorf("ackWorkerEvent: received unknown event %s from worker %s", ack.EventID, workerID))
+		if err := node.poolSink.Ack(ctx, pending); err != nil {
+			node.logger.Error(fmt.Errorf("ackWorkerEvent: failed to ack unknown event: %w", err), "event", pending.EventName, "id", pending.ID)
+		}
 		return
 	}
 

@@ -285,7 +285,7 @@ func (w *Worker) notify(_ context.Context, key string, payload []byte) error {
 	}
 	nh, ok := w.handler.(NotificationHandler)
 	if !ok {
-		w.logger.Debug("worker does not implement NotificationHandler, ignoring notification")
+		w.logger.Error(fmt.Errorf("worker does not implement NotificationHandler, ignoring notification"), "worker", w.ID)
 		return nil
 	}
 	w.logger.Debug("handled notification", "payload", string(payload))

@@ -59,6 +59,11 @@ type (
 		rdb *redis.Client
 	}
 
+	// Acker is the interface used by events to acknowledge themselves.
+	Acker interface {
+		XAck(ctx context.Context, streamKey, sinkName string, ids ...string) *redis.IntCmd
+	}
+
 	// Event is a stream event.
 	Event struct {
 		// ID is the unique event ID.
@@ -73,10 +78,10 @@ type (
 		Topic string
 		// Payload is the event payload.
 		Payload []byte
+		// Acker is the redis client used to acknowledge events.
+		Acker Acker
 		// streamKey is the Redis key of the stream.
 		streamKey string
-		// rdb is the redis client.
-		rdb *redis.Client
 	}
 )
 
@@ -314,7 +319,7 @@ func streamEvents(
 			Topic:      topic,
 			Payload:    []byte(event.Values[payloadKey].(string)),
 			streamKey:  streamKey,
-			rdb:        rdb,
+			Acker:      rdb,
 		}
 		if eventFilter != nil && !eventFilter(ev) {
 			logger.Debug("event filtered", "event", ev.EventName, "id", ev.ID, "stream", streamName)

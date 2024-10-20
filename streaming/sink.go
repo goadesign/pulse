@@ -197,7 +197,7 @@ func (s *Sink) Unsubscribe(c <-chan *Event) {
 
 // Ack acknowledges the event.
 func (s *Sink) Ack(ctx context.Context, e *Event) error {
-	err := e.rdb.XAck(ctx, e.streamKey, e.SinkName, e.ID).Err()
+	err := e.Acker.XAck(ctx, e.streamKey, e.SinkName, e.ID).Err()
 	if err != nil {
 		s.logger.Error(err, "ack", e.ID, "stream", e.StreamName)
 		return err
