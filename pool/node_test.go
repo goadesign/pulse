@@ -1,13 +1,17 @@
 package pool
 
 import (
+	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"goa.design/pulse/streaming"
 	ptesting "goa.design/pulse/testing"
 )
 
@@ -87,6 +91,82 @@ func TestDispatchJobTwoWorkers(t *testing.T) {
 	assert.Contains(t, [][]byte{job1.payload, job2.payload}, worker2.Jobs()[0].Payload, "Worker2 received unexpected payload")
 
 	// Shutdown
+	assert.NoError(t, node.Shutdown(ctx), "Failed to shutdown node")
+}
+
+func TestNotifyWorker(t *testing.T) {
+	testName := strings.Replace(t.Name(), "/", "_", -1)
+	ctx := ptesting.NewTestContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	node := newTestNode(t, ctx, rdb, testName)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+
+	// Create a worker
+	worker := newTestWorker(t, ctx, node)
+
+	// Set up notification handling
+	jobKey := "test-job"
+	jobPayload := []byte("job payload")
+	notificationPayload := []byte("test notification")
+	ch := make(chan []byte, 1)
+	worker.handler.(*mockHandler).notifyFunc = func(key string, payload []byte) error {
+		assert.Equal(t, jobKey, key, "Received notification for the wrong key")
+		assert.Equal(t, notificationPayload, payload, "Received notification for the wrong payload")
+		close(ch)
+		return nil
+	}
+
+	// Dispatch a job to ensure the worker is assigned
+	require.NoError(t, node.DispatchJob(ctx, jobKey, jobPayload))
+
+	// Send a notification
+	err := node.NotifyWorker(ctx, jobKey, notificationPayload)
+	require.NoError(t, err, "Failed to send notification")
+
+	// Wait for the notification to be received
+	select {
+	case <-ch:
+	case <-time.After(max):
+		t.Fatal("Timeout waiting for notification to be received")
+	}
+
+	// Shutdown node
+	assert.NoError(t, node.Shutdown(ctx), "Failed to shutdown node")
+}
+
+func TestNotifyWorkerNoHandler(t *testing.T) {
+	testName := strings.Replace(t.Name(), "/", "_", -1)
+	ctx, buf := ptesting.NewBufferedLogContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	node := newTestNode(t, ctx, rdb, testName)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+
+	// Create a worker without NotificationHandler implementation
+	worker := newTestWorkerWithoutNotify(t, ctx, node)
+
+	// Dispatch a job to ensure the worker is assigned
+	jobKey := "test-job"
+	jobPayload := []byte("job payload")
+	require.NoError(t, node.DispatchJob(ctx, jobKey, jobPayload))
+
+	// Wait for the job to be received by the worker
+	require.Eventually(t, func() bool {
+		return len(worker.Jobs()) == 1
+	}, max, delay, "Job was not received by the worker")
+
+	// Send a notification
+	notificationPayload := []byte("test notification")
+	assert.NoError(t, node.NotifyWorker(ctx, jobKey, notificationPayload), "Failed to send notification")
+
+	// Check that an error was logged
+	assert.Eventually(t, func() bool {
+		return strings.Contains(buf.String(), "worker does not implement NotificationHandler, ignoring notification")
+	}, max, delay, "Expected error message was not logged within the timeout period")
+
+	// Ensure the worker is still functioning
+	assert.Len(t, worker.Jobs(), 1, "Worker should still have the job")
+
+	// Shutdown node
 	assert.NoError(t, node.Shutdown(ctx), "Failed to shutdown node")
 }
 
@@ -224,4 +304,80 @@ func TestNodeCloseAndRequeue(t *testing.T) {
 
 	// Clean up
 	require.NoError(t, node2.Shutdown(ctx), "Failed to shutdown node2")
+}
+
+func TestStaleEventsAreRemoved(t *testing.T) {
+	// Setup
+	ctx := ptesting.NewTestContext(t)
+	testName := strings.Replace(t.Name(), "/", "_", -1)
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	node := newTestNode(t, ctx, rdb, testName)
+	defer func() { assert.NoError(t, node.Shutdown(ctx)) }()
+
+	// Add a stale event manually
+	staleEventID := fmt.Sprintf("%d-0", time.Now().Add(-2*node.pendingJobTTL).UnixNano()/int64(time.Millisecond))
+	staleEvent := &streaming.Event{
+		ID:        staleEventID,
+		EventName: "test-event",
+		Payload:   []byte("test-payload"),
+		Acker: &mockAcker{
+			XAckFunc: func(ctx context.Context, streamKey, sinkName string, ids ...string) *redis.IntCmd {
+				return redis.NewIntCmd(ctx, 0)
+			},
+		},
+	}
+	node.pendingEvents["worker:stale-event-id"] = staleEvent
+
+	// Add a fresh event
+	freshEventID := fmt.Sprintf("%d-0", time.Now().Add(-time.Second).UnixNano()/int64(time.Millisecond))
+	freshEvent := &streaming.Event{
+		ID:        freshEventID,
+		EventName: "test-event",
+		Payload:   []byte("test-payload"),
+		Acker: &mockAcker{
+			XAckFunc: func(ctx context.Context, streamKey, sinkName string, ids ...string) *redis.IntCmd {
+				return redis.NewIntCmd(ctx, 0)
+			},
+		},
+	}
+	node.pendingEvents["worker:fresh-event-id"] = freshEvent
+
+	// Create a mock event to trigger the ackWorkerEvent function
+	mockEvent := &streaming.Event{
+		ID:        "mock-event-id",
+		EventName: evAck,
+		Payload:   marshalEnvelope("worker", marshalAck(&ack{EventID: "mock-event-id"})),
+		Acker: &mockAcker{
+			XAckFunc: func(ctx context.Context, streamKey, sinkName string, ids ...string) *redis.IntCmd {
+				return redis.NewIntCmd(ctx, 0)
+			},
+		},
+	}
+	node.pendingEvents["worker:mock-event-id"] = mockEvent
+
+	// Call ackWorkerEvent to trigger the stale event cleanup
+	node.ackWorkerEvent(ctx, mockEvent)
+
+	assert.Eventually(t, func() bool {
+		node.lock.Lock()
+		defer node.lock.Unlock()
+		_, exists := node.pendingEvents["worker:stale-event-id"]
+		return !exists
+	}, max, delay, "Stale event should have been removed")
+
+	assert.Eventually(t, func() bool {
+		node.lock.Lock()
+		defer node.lock.Unlock()
+		_, exists := node.pendingEvents["worker:fresh-event-id"]
+		return exists
+	}, max, delay, "Fresh event should still be present")
+}
+
+type mockAcker struct {
+	XAckFunc func(ctx context.Context, streamKey, sinkName string, ids ...string) *redis.IntCmd
+}
+
+func (m *mockAcker) XAck(ctx context.Context, streamKey, sinkName string, ids ...string) *redis.IntCmd {
+	return m.XAckFunc(ctx, streamKey, sinkName, ids...)
 }

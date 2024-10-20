@@ -14,7 +14,13 @@ import (
 type mockHandler struct {
 	startFunc  func(job *Job) error
 	stopFunc   func(key string) error
-	notifyFunc func(payload []byte) error
+	notifyFunc func(key string, payload []byte) error
+}
+
+// mockHandlerWithoutNotify is a mock handler that doesn't implement NotificationHandler
+type mockHandlerWithoutNotify struct {
+	startFunc func(job *Job) error
+	stopFunc  func(key string) error
 }
 
 const (
@@ -47,7 +53,20 @@ func newTestWorker(t *testing.T, ctx context.Context, node *Node) *Worker {
 	handler := &mockHandler{
 		startFunc:  func(job *Job) error { return nil },
 		stopFunc:   func(key string) error { return nil },
-		notifyFunc: func(payload []byte) error { return nil },
+		notifyFunc: func(key string, payload []byte) error { return nil },
+	}
+	worker, err := node.AddWorker(ctx, handler)
+	require.NoError(t, err)
+	return worker
+}
+
+// newTestWorkerWithoutNotify creates a new Worker instance for testing purposes.
+// It sets up a mock handler without NotificationHandler for testing.
+func newTestWorkerWithoutNotify(t *testing.T, ctx context.Context, node *Node) *Worker {
+	t.Helper()
+	handler := &mockHandlerWithoutNotify{
+		startFunc: func(job *Job) error { return nil },
+		stopFunc:  func(key string) error { return nil },
 	}
 	worker, err := node.AddWorker(ctx, handler)
 	require.NoError(t, err)
@@ -56,4 +75,9 @@ func newTestWorker(t *testing.T, ctx context.Context, node *Node) *Worker {
 
 func (w *mockHandler) Start(job *Job) error  { return w.startFunc(job) }
 func (w *mockHandler) Stop(key string) error { return w.stopFunc(key) }
-func (w *mockHandler) Notify(p []byte) error { return w.notifyFunc(p) }
+func (w *mockHandler) HandleNotification(key string, payload []byte) error {
+	return w.notifyFunc(key, payload)
+}
+
+func (h *mockHandlerWithoutNotify) Start(job *Job) error  { return h.startFunc(job) }
+func (h *mockHandlerWithoutNotify) Stop(key string) error { return h.stopFunc(key) }
