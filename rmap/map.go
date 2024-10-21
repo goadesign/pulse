@@ -532,7 +532,7 @@ func (sm *Map) RemoveValues(ctx context.Context, key string, items ...string) ([
 	if remaining == "" {
 		return nil, true, nil // All items were removed, key was deleted
 	}
-	removed := result[1].(int64) == 1
+	removed := result[1] != nil && result[1].(int64) == 1
 	return strings.Split(remaining, ","), removed, nil
 }
 

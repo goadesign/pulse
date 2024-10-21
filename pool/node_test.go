@@ -22,6 +22,170 @@ const (
 	max = time.Second
 )
 
+func TestWorkers(t *testing.T) {
+	testName := strings.Replace(t.Name(), "/", "_", -1)
+	ctx := ptesting.NewTestContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	node := newTestNode(t, ctx, rdb, testName)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+
+	// Create a few workers
+	worker1 := newTestWorker(t, ctx, node)
+	worker2 := newTestWorker(t, ctx, node)
+	worker3 := newTestWorker(t, ctx, node)
+
+	// Get the list of workers
+	workers := node.Workers()
+
+	// Check if the number of workers is correct
+	assert.Equal(t, 3, len(workers), "Expected 3 workers")
+
+	// Check if all created workers are in the list
+	expectedWorkers := []string{worker1.ID, worker2.ID, worker3.ID}
+	actualWorkers := make([]string, len(workers))
+	for i, w := range workers {
+		actualWorkers[i] = w.ID
+	}
+	assert.ElementsMatch(t, expectedWorkers, actualWorkers, "The list of workers should contain all created workers")
+
+	// Shutdown node
+	assert.NoError(t, node.Shutdown(ctx), "Failed to shutdown node")
+}
+
+func TestPoolWorkers(t *testing.T) {
+	testName := strings.Replace(t.Name(), "/", "_", -1)
+	ctx := ptesting.NewTestContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	node := newTestNode(t, ctx, rdb, testName)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+
+	// Create workers on the current node
+	worker1 := newTestWorker(t, ctx, node)
+	worker2 := newTestWorker(t, ctx, node)
+
+	// Create a worker on a different node
+	otherNode := newTestNode(t, ctx, rdb, testName)
+	worker3 := newTestWorker(t, ctx, otherNode)
+	defer func() { assert.NoError(t, otherNode.Shutdown(ctx)) }()
+
+	// Check if the number of workers is correct (should include workers from all nodes)
+	assert.Eventually(t, func() bool {
+		return len(node.PoolWorkers()) == 3
+	}, max, delay, "Expected 3 workers in the pool")
+
+	// Check if all created workers are in the list
+	poolWorkers := node.PoolWorkers()
+	workerIDs := make([]string, len(poolWorkers))
+	for i, w := range poolWorkers {
+		workerIDs[i] = w.ID
+	}
+
+	expectedWorkerIDs := []string{worker1.ID, worker2.ID, worker3.ID}
+	assert.ElementsMatch(t, expectedWorkerIDs, workerIDs, "Not all expected workers were found in the pool")
+
+	// Shutdown nodes
+	assert.NoError(t, node.Shutdown(ctx), "Failed to shutdown node")
+}
+
+func TestJobKeys(t *testing.T) {
+	testName := strings.Replace(t.Name(), "/", "_", -1)
+	ctx := ptesting.NewTestContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+
+	node1 := newTestNode(t, ctx, rdb, testName)
+	node2 := newTestNode(t, ctx, rdb, testName)
+	newTestWorker(t, ctx, node1)
+	newTestWorker(t, ctx, node2)
+	defer func() {
+		assert.NoError(t, node1.Shutdown(ctx))
+		assert.NoError(t, node2.Shutdown(ctx))
+	}()
+
+	// Configure nodes to send jobs to specific workers
+	node1.h, node2.h = &ptesting.Hasher{Index: 0}, &ptesting.Hasher{Index: 1}
+
+	jobs := []struct {
+		key     string
+		payload []byte
+	}{
+		{key: "job1", payload: []byte("payload1")},
+		{key: "job2", payload: []byte("payload2")},
+		{key: "job3", payload: []byte("payload3")},
+		{key: "job4", payload: []byte("payload4")},
+	}
+
+	for _, job := range jobs {
+		assert.NoError(t, node1.DispatchJob(ctx, job.key, job.payload), fmt.Sprintf("Failed to dispatch job: %s", job.key))
+	}
+
+	// Get job keys from the pool and check if all dispatched job keys are present
+	var allJobKeys []string
+	assert.Eventually(t, func() bool {
+		allJobKeys = node1.JobKeys()
+		return len(jobs) == len(allJobKeys)
+	}, max, delay, fmt.Sprintf("Number of job keys doesn't match the number of dispatched jobs: %d != %d", len(jobs), len(allJobKeys)))
+	for _, job := range jobs {
+		assert.Contains(t, allJobKeys, job.key, fmt.Sprintf("Job key %s not found in JobKeys", job.key))
+	}
+
+	// Dispatch a job with an existing key to node1
+	assert.NoError(t, node1.DispatchJob(ctx, "job1", []byte("updated payload")), "Failed to dispatch job with existing key")
+
+	// Check that the number of job keys hasn't changed
+	updatedAllJobKeys := node1.JobKeys()
+	assert.Equal(t, len(allJobKeys), len(updatedAllJobKeys), "Number of job keys shouldn't change when updating an existing job")
+}
+
+func TestJobPayload(t *testing.T) {
+	testName := strings.Replace(t.Name(), "/", "_", -1)
+	ctx := ptesting.NewTestContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+
+	node := newTestNode(t, ctx, rdb, testName)
+	newTestWorker(t, ctx, node)
+	defer func() { assert.NoError(t, node.Shutdown(ctx)) }()
+
+	tests := []struct {
+		name    string
+		key     string
+		payload []byte
+	}{
+		{"job with payload", "job1", []byte("payload1")},
+		{"job without payload", "job2", nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.NoError(t, node.DispatchJob(ctx, tt.key, tt.payload), "Failed to dispatch job")
+
+			// Check if job payload is correct
+			assert.Eventually(t, func() bool {
+				payload, ok := node.JobPayload(tt.key)
+				fmt.Println(payload, ok)
+				fmt.Println(tt.payload)
+				return ok && assert.Equal(t, tt.payload, payload)
+			}, max, delay, fmt.Sprintf("Failed to get correct payload for job %s", tt.key))
+		})
+	}
+
+	// Test non-existent job
+	payload, ok := node.JobPayload("non-existent-job")
+	assert.False(t, ok, "Expected false for non-existent job")
+	assert.Nil(t, payload, "Expected nil payload for non-existent job")
+
+	// Update existing job
+	updatedPayload := []byte("updated payload")
+	assert.NoError(t, node.DispatchJob(ctx, "job1", updatedPayload), "Failed to update existing job")
+
+	// Check if the payload was updated
+	assert.Eventually(t, func() bool {
+		payload, ok := node.JobPayload("job1")
+		return ok && assert.Equal(t, updatedPayload, payload, "Payload was not updated correctly")
+	}, max, delay, "Failed to get updated payload for job")
+}
+
 func TestDispatchJobOneWorker(t *testing.T) {
 	testName := strings.Replace(t.Name(), "/", "_", -1)
 	ctx := ptesting.NewTestContext(t)
@@ -304,6 +468,34 @@ func TestNodeCloseAndRequeue(t *testing.T) {
 
 	// Clean up
 	require.NoError(t, node2.Shutdown(ctx), "Failed to shutdown node2")
+}
+
+func TestAckWorkerEventWithMissingPendingEvent(t *testing.T) {
+	// Setup
+	ctx := ptesting.NewTestContext(t)
+	testName := strings.Replace(t.Name(), "/", "_", -1)
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	node := newTestNode(t, ctx, rdb, testName)
+	defer func() { assert.NoError(t, node.Shutdown(ctx)) }()
+
+	// Create a mock event with a non-existent pending event ID
+	mockEvent := &streaming.Event{
+		ID:        "non-existent-event-id",
+		EventName: evAck,
+		Payload:   marshalEnvelope("worker", marshalAck(&ack{EventID: "non-existent-event-id"})),
+		Acker: &mockAcker{
+			XAckFunc: func(ctx context.Context, streamKey, sinkName string, ids ...string) *redis.IntCmd {
+				return redis.NewIntCmd(ctx, 0)
+			},
+		},
+	}
+
+	// Call ackWorkerEvent with the mock event
+	node.ackWorkerEvent(ctx, mockEvent)
+
+	// Verify that no panic occurred and the function completed successfully
+	assert.True(t, true, "ackWorkerEvent should complete without panic")
 }
 
 func TestStaleEventsAreRemoved(t *testing.T) {

@@ -144,7 +144,14 @@ func (w *Worker) Jobs() []*Job {
 	sort.Strings(keys)
 	jobs := make([]*Job, 0, len(w.jobs))
 	for _, key := range keys {
-		jobs = append(jobs, w.jobs[key])
+		job := w.jobs[key]
+		jobs = append(jobs, &Job{
+			Key:       key,
+			Payload:   job.Payload,
+			CreatedAt: job.CreatedAt,
+			Worker:    &Worker{ID: w.ID, Node: w.Node, CreatedAt: w.CreatedAt},
+			NodeID:    job.NodeID,
+		})
 	}
 	return jobs
 }
