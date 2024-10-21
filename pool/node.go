@@ -541,7 +541,7 @@ func (node *Node) routeWorkerEvent(ctx context.Context, ev *streaming.Event) err
 	node.logger.Debug("routed", "event", ev.EventName, "id", ev.ID, "worker", wid, "worker-event-id", eventID)
 
 	// Record the event in the pending events map for future ack.
-	node.pendingEvents[wid+":"+eventID] = ev
+	node.pendingEvents[pendingEventKey(wid, eventID)] = ev
 
 	return nil
 }
@@ -583,7 +583,7 @@ func (node *Node) ackWorkerEvent(ctx context.Context, ev *streaming.Event) {
 
 	workerID, payload := unmarshalEnvelope(ev.Payload)
 	ack := unmarshalAck(payload)
-	key := workerID + ":" + ack.EventID
+	key := pendingEventKey(workerID, ack.EventID)
 	pending, ok := node.pendingEvents[key]
 	if !ok {
 		node.logger.Error(fmt.Errorf("ackWorkerEvent: received unknown event %s from worker %s", ack.EventID, workerID))
@@ -619,7 +619,7 @@ func (node *Node) ackWorkerEvent(ctx context.Context, ev *streaming.Event) {
 		}
 	}
 	for _, key := range staleKeys {
-		node.logger.Error(fmt.Errorf("ackWorkerEvent: stale event, removing from pending events"), "event", node.pendingEvents[key].EventName, "id", key)
+		node.logger.Error(fmt.Errorf("ackWorkerEvent: stale event, removing from pending events"), "event", node.pendingEvents[key].EventName, "id", node.pendingEvents[key].ID, "since", time.Since(node.pendingEvents[key].CreatedAt()), "TTL", 2*node.pendingJobTTL)
 		delete(node.pendingEvents, key)
 	}
 }
@@ -1027,4 +1027,10 @@ func poolStreamName(pool string) string {
 // nodeStreamName returns the name of the stream used by node events.
 func nodeStreamName(pool, nodeID string) string {
 	return fmt.Sprintf("%s:node:%s", pool, nodeID)
+}
+
+// pendingEventKey computes the key of a pending event from a worker ID and a
+// stream event ID.
+func pendingEventKey(workerID, eventID string) string {
+	return fmt.Sprintf("%s:%s", workerID, eventID)
 }

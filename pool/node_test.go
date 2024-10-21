@@ -519,7 +519,7 @@ func TestStaleEventsAreRemoved(t *testing.T) {
 			},
 		},
 	}
-	node.pendingEvents["worker:stale-event-id"] = staleEvent
+	node.pendingEvents[pendingEventKey("worker", staleEventID)] = staleEvent
 
 	// Add a fresh event
 	freshEventID := fmt.Sprintf("%d-0", time.Now().Add(-time.Second).UnixNano()/int64(time.Millisecond))
@@ -533,20 +533,21 @@ func TestStaleEventsAreRemoved(t *testing.T) {
 			},
 		},
 	}
-	node.pendingEvents["worker:fresh-event-id"] = freshEvent
+	node.pendingEvents[pendingEventKey("worker", freshEventID)] = freshEvent
 
 	// Create a mock event to trigger the ackWorkerEvent function
+	mockEventID := "mock-event-id"
 	mockEvent := &streaming.Event{
-		ID:        "mock-event-id",
+		ID:        mockEventID,
 		EventName: evAck,
-		Payload:   marshalEnvelope("worker", marshalAck(&ack{EventID: "mock-event-id"})),
+		Payload:   marshalEnvelope("worker", marshalAck(&ack{EventID: mockEventID})),
 		Acker: &mockAcker{
 			XAckFunc: func(ctx context.Context, streamKey, sinkName string, ids ...string) *redis.IntCmd {
 				return redis.NewIntCmd(ctx, 0)
 			},
 		},
 	}
-	node.pendingEvents["worker:mock-event-id"] = mockEvent
+	node.pendingEvents[pendingEventKey("worker", mockEventID)] = mockEvent
 
 	// Call ackWorkerEvent to trigger the stale event cleanup
 	node.ackWorkerEvent(ctx, mockEvent)
@@ -554,14 +555,14 @@ func TestStaleEventsAreRemoved(t *testing.T) {
 	assert.Eventually(t, func() bool {
 		node.lock.Lock()
 		defer node.lock.Unlock()
-		_, exists := node.pendingEvents["worker:stale-event-id"]
+		_, exists := node.pendingEvents[pendingEventKey("worker", staleEventID)]
 		return !exists
 	}, max, delay, "Stale event should have been removed")
 
 	assert.Eventually(t, func() bool {
 		node.lock.Lock()
 		defer node.lock.Unlock()
-		_, exists := node.pendingEvents["worker:fresh-event-id"]
+		_, exists := node.pendingEvents[pendingEventKey("worker", freshEventID)]
 		return exists
 	}, max, delay, "Fresh event should still be present")
 }

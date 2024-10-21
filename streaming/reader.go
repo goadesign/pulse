@@ -288,7 +288,7 @@ func (e *Event) CreatedAt() time.Time {
 	ts, _ := strconv.ParseInt(tss, 10, 64)
 	seconds := ts / 1000
 	nanos := (ts % 1000) * 1_000_000
-	return time.Unix(seconds, nanos)
+	return time.Unix(seconds, nanos).UTC()
 }
 
 // streamEvents filters and streams the Redis messages as events to c.
