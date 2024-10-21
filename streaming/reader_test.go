@@ -1,12 +1,15 @@
 package streaming
 
 import (
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/redis/go-redis/v9"
 	"goa.design/pulse/pulse"
 	"goa.design/pulse/streaming/options"
 	ptesting "goa.design/pulse/testing"
@@ -184,4 +187,34 @@ func TestRemoveReaderStream(t *testing.T) {
 	read = readOneReaderEvent(t, c)
 	assert.Equal(t, "event3", read.EventName)
 	assert.Equal(t, []byte("payload3"), read.Payload)
+}
+
+func TestEventCreatedAt(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx := ptesting.NewTestContext(t)
+
+	// Use Redis to create a new event ID
+	eventID, err := rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: "test-stream",
+		Values: map[string]interface{}{"key": "value"},
+	}).Result()
+	require.NoError(t, err)
+
+	event := &Event{ID: eventID}
+
+	// Call CreatedAt() method
+	createdAt := event.CreatedAt()
+
+	// Parse the timestamp from the event ID
+	parts := strings.Split(eventID, "-")
+	ts, err := strconv.ParseInt(parts[0], 10, 64)
+	require.NoError(t, err)
+	expectedTime := time.UnixMilli(ts).UTC()
+
+	// Assert that the returned time is exactly the expected time
+	assert.Equal(t, expectedTime, createdAt)
+
+	// Assert that the returned time is in UTC
+	assert.Equal(t, time.UTC, createdAt.Location())
 }
