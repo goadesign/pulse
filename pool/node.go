@@ -7,8 +7,10 @@ import (
 	"hash"
 	"hash/crc64"
 	"io"
+	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -261,13 +263,39 @@ func (node *Node) Workers() []*Worker {
 	node.lock.Lock()
 	defer node.lock.Unlock()
 	workers := make([]*Worker, len(node.localWorkers))
-	copy(workers, node.localWorkers)
+	for i, w := range node.localWorkers {
+		workers[i] = &Worker{
+			ID:        w.ID,
+			CreatedAt: w.CreatedAt,
+			Node:      node,
+		}
+	}
 	return workers
 }
 
+// PoolWorkers returns the list of workers running in the pool.
+func (node *Node) PoolWorkers() []*Worker {
+	workers := node.workerMap.Map()
+	poolWorkers := make([]*Worker, 0, len(workers))
+	for id, createdAt := range workers {
+		cat, err := strconv.ParseInt(createdAt, 10, 64)
+		if err != nil {
+			node.logger.Error(fmt.Errorf("PoolWorkers: failed to parse createdAt %q for worker %q: %w", createdAt, id, err))
+			continue
+		}
+		poolWorkers = append(poolWorkers, &Worker{ID: id, CreatedAt: time.Unix(0, cat), Node: node})
+	}
+	return poolWorkers
+}
+
 // DispatchJob dispatches a job to the proper worker in the pool.
-// It returns the error returned by the worker's start handler if any.
-// If the context is done before the job is dispatched, the context error is returned.
+// It returns:
+// - nil if the job is successfully dispatched and started by a worker
+// - an error returned by the worker's start handler if the job fails to start
+// - the context error if the context is canceled before the job is started
+// - an error if the pool is closed or if there's a failure in adding the job
+//
+// The method blocks until one of the above conditions is met.
 func (node *Node) DispatchJob(ctx context.Context, key string, payload []byte) error {
 	// Send job to pool stream.
 	node.lock.Lock()
@@ -311,6 +339,31 @@ func (node *Node) StopJob(ctx context.Context, key string) error {
 	}
 	node.logger.Info("stop requested", "key", key)
 	return nil
+}
+
+// JobKeys returns the list of keys of the jobs running in the pool.
+func (node *Node) JobKeys() []string {
+	var jobKeys []string
+	jobByNodes := node.jobsMap.Map()
+	for _, jobs := range jobByNodes {
+		jobKeys = append(jobKeys, strings.Split(jobs, ",")...)
+	}
+	return jobKeys
+}
+
+// JobPayload returns the payload of the job with the given key.
+// It returns:
+// - (payload, true) if the job exists and has a payload
+// - (nil, true) if the job exists but has no payload (empty payload)
+// - (nil, false) if the job does not exist
+func (node *Node) JobPayload(key string) ([]byte, bool) {
+	payload, ok := node.jobPayloadsMap.Get(key)
+	if ok {
+		return []byte(payload), true
+	}
+	keys := node.JobKeys()
+	return nil, slices.Contains(keys, key)
+
 }
 
 // NotifyWorker notifies the worker that handles the job with the given key.
@@ -534,9 +587,6 @@ func (node *Node) ackWorkerEvent(ctx context.Context, ev *streaming.Event) {
 	pending, ok := node.pendingEvents[key]
 	if !ok {
 		node.logger.Error(fmt.Errorf("ackWorkerEvent: received unknown event %s from worker %s", ack.EventID, workerID))
-		if err := node.poolSink.Ack(ctx, pending); err != nil {
-			node.logger.Error(fmt.Errorf("ackWorkerEvent: failed to ack unknown event: %w", err), "event", pending.EventName, "id", pending.ID)
-		}
 		return
 	}
 
