@@ -86,7 +86,7 @@ type (
 )
 
 // newReader creates a new reader.
-func newReader(stream *Stream, opts ...options.Reader) (*Reader, error) {
+func newReader(ctx context.Context, stream *Stream, opts ...options.Reader) (*Reader, error) {
 	o := options.ParseReaderOptions(opts...)
 	var eventFilter eventFilterFunc
 	if o.Topic != "" {
@@ -112,7 +112,7 @@ func newReader(stream *Stream, opts ...options.Reader) (*Reader, error) {
 	}
 
 	reader.wait.Add(1)
-	go reader.read()
+	pulse.Go(ctx, reader.read)
 
 	return reader, nil
 }

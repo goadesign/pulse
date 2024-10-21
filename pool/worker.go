@@ -127,8 +127,8 @@ func newWorker(ctx context.Context, node *Node, h JobHandler) (*Worker, error) {
 		"worker_shutdown_ttl", w.workerShutdownTTL)
 
 	w.wg.Add(2)
-	go w.handleEvents(reader.Subscribe())
-	go w.keepAlive(ctx)
+	pulse.Go(ctx, func() { w.handleEvents(reader.Subscribe()) })
+	pulse.Go(ctx, func() { w.keepAlive(ctx) })
 
 	return w, nil
 }

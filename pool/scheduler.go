@@ -99,8 +99,8 @@ func (node *Node) Schedule(ctx context.Context, producer JobProducer, interval t
 	if err := sched.stopJobs(ctx, plan); err != nil {
 		return fmt.Errorf("failed to stop jobs: %w", err)
 	}
-	go sched.scheduleJobs(ctx, ticker, producer)
-	go sched.handleStop(ctx)
+	pulse.Go(ctx, func() { sched.scheduleJobs(ctx, ticker, producer) })
+	pulse.Go(ctx, func() { sched.handleStop(ctx) })
 	return nil
 }
 

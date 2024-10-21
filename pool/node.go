@@ -208,11 +208,11 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...NodeOp
 
 	p.wg.Add(5)
 	pch := poolSink.Subscribe()
-	go p.handlePoolEvents(pch) // handleXXX handles streaming events
-	go p.handleNodeEvents(nch)
-	go p.manageWorkers(ctx) // manageXXX handles map updates
-	go p.manageShutdown(ctx)
-	go p.manageInactiveWorkers(ctx)
+	pulse.Go(ctx, func() { p.handlePoolEvents(pch) }) // handleXXX handles streaming events
+	pulse.Go(ctx, func() { p.handleNodeEvents(nch) })
+	pulse.Go(ctx, func() { p.manageWorkers(ctx) }) // manageXXX handles map updates
+	pulse.Go(ctx, func() { p.manageShutdown(ctx) })
+	pulse.Go(ctx, func() { p.manageInactiveWorkers(ctx) })
 	return p, nil
 }
 

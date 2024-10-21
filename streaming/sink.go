@@ -164,9 +164,9 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...options.S
 	sink.logger = sink.logger.WithPrefix("consumer", consumer)
 
 	sink.wait.Add(3)
-	go sink.read(ctx)
-	go sink.periodicKeepAlive()
-	go sink.periodicIdleMessageCheck()
+	pulse.Go(ctx, func() { sink.read(ctx) })
+	pulse.Go(ctx, sink.periodicKeepAlive)
+	pulse.Go(ctx, sink.periodicIdleMessageCheck)
 
 	sink.logger.Info("created", "start", sink.startID, "stream", stream.Name, "max_polled", sink.maxPolled, "block_duration", sink.blockDuration, "buffer_size", sink.bufferSize, "no_ack", sink.noAck, "ack_grace_period", sink.ackGracePeriod)
 
