@@ -21,8 +21,6 @@ type (
 	// update it.
 	Map struct {
 		Name               string
-		closing            bool                  // true if Close was called
-		closed             bool                  // stopped is true once Close finishes.
 		chankey            string                // Redis pubsub channel name
 		hashkey            string                // Redis hash key
 		msgch              <-chan *redis.Message // channel to receive map updates
@@ -33,8 +31,6 @@ type (
 		logger             pulse.Logger          // logger
 		sub                *redis.PubSub         // subscription to map updates
 		rdb                *redis.Client
-		lock               sync.Mutex
-		content            map[string]string
 		setScript          *redis.Script
 		testAndSetScript   *redis.Script
 		appendScript       *redis.Script
@@ -45,6 +41,11 @@ type (
 		testAndDelScript   *redis.Script
 		testAndResetScript *redis.Script
 		resetScript        *redis.Script
+
+		lock    sync.RWMutex
+		content map[string]string
+		closing bool // true if Close was called
+		closed  bool // true if Close returned
 	}
 
 	// EventKind is the type of map event.
@@ -111,8 +112,8 @@ func Join(ctx context.Context, name string, rdb *redis.Client, opts ...MapOption
 
 // Map returns a copy of the replicated map content.
 func (sm *Map) Map() map[string]string {
-	sm.lock.Lock()
-	defer sm.lock.Unlock()
+	sm.lock.RLock()
+	defer sm.lock.RUnlock()
 
 	hash := make(map[string]string, len(sm.content))
 	for k, v := range sm.content {
@@ -123,8 +124,8 @@ func (sm *Map) Map() map[string]string {
 
 // Keys returns a copy of the replicated map keys.
 func (sm *Map) Keys() []string {
-	sm.lock.Lock()
-	defer sm.lock.Unlock()
+	sm.lock.RLock()
+	defer sm.lock.RUnlock()
 
 	keys := make([]string, 0, len(sm.content))
 	for k := range sm.content {
@@ -169,15 +170,15 @@ func (sm *Map) Unsubscribe(c <-chan EventKind) {
 
 // Len returns the number of items in the replicated map.
 func (sm *Map) Len() int {
-	sm.lock.Lock()
-	defer sm.lock.Unlock()
+	sm.lock.RLock()
+	defer sm.lock.RUnlock()
 	return len(sm.content)
 }
 
 // Get returns the value for the given key.
 func (sm *Map) Get(key string) (string, bool) {
-	sm.lock.Lock()
-	defer sm.lock.Unlock()
+	sm.lock.RLock()
+	defer sm.lock.RUnlock()
 	res, ok := sm.content[key]
 	return res, ok
 }
@@ -229,9 +230,9 @@ func (sm *Map) SetAndWait(ctx context.Context, key, value string) (string, error
 			if !ok {
 				return "", fmt.Errorf("pulse map: %s is stopped", sm.Name)
 			}
-			sm.lock.Lock()
+			sm.lock.RLock()
 			v, ok := sm.content[key]
-			sm.lock.Unlock()
+			sm.lock.RUnlock()
 			if ok && v == value {
 				return prev, nil
 			}
@@ -443,16 +444,17 @@ func (sm *Map) TestAndReset(ctx context.Context, keys, tests []string) (bool, er
 func (sm *Map) Close() {
 	sm.lock.Lock()
 	if sm.closing {
+		sm.lock.Unlock()
 		return
 	}
 	sm.closing = true
-	close(sm.done)
 	sm.lock.Unlock()
+	close(sm.done)
 	sm.wait.Wait()
-	sm.lock.Lock()
-	defer sm.lock.Unlock()
 	close(sm.ichan)
+	sm.lock.Lock()
 	sm.closed = true
+	sm.lock.Unlock()
 }
 
 // init initializes the map.
@@ -562,11 +564,12 @@ func (sm *Map) run() {
 // runLuaScript runs the given Lua script, the first argument must be the key.
 // It is the caller's responsibility to make sure the map is locked.
 func (sm *Map) runLuaScript(ctx context.Context, name string, script *redis.Script, args ...any) (any, error) {
-	sm.lock.Lock()
-	defer sm.lock.Unlock()
+	sm.lock.RLock()
 	if sm.closing {
+		sm.lock.RUnlock()
 		return "", fmt.Errorf("pulse map: %s is stopped", sm.Name)
 	}
+	sm.lock.RUnlock()
 	key := args[0].(string)
 	if len(key) == 0 {
 		return nil, fmt.Errorf("pulse map: %s key cannot be empty in %q", sm.Name, name)
