@@ -185,7 +185,7 @@ func (w *Worker) handleEvents(c <-chan *streaming.Event) {
 				err = w.startJob(ctx, unmarshalJob(payload))
 			case evStopJob:
 				w.logger.Debug("handleEvents: received stop job", "event", ev.EventName, "id", ev.ID)
-				err = w.stopJob(ctx, unmarshalJobKey(payload))
+				err = w.stopJob(ctx, unmarshalJobKey(payload), false)
 			case evNotify:
 				w.logger.Debug("handleEvents: received notify", "event", ev.EventName, "id", ev.ID)
 				key, payload := unmarshalNotification(payload)
@@ -271,21 +271,23 @@ func (w *Worker) startJob(ctx context.Context, job *Job) error {
 }
 
 // stopJob stops a job.
-func (w *Worker) stopJob(ctx context.Context, key string) error {
+func (w *Worker) stopJob(ctx context.Context, key string, forRequeue bool) error {
 	if _, ok := w.jobs.Load(key); !ok {
-		return fmt.Errorf("job %s not found", key)
+		return fmt.Errorf("job %s not found in local worker", key)
 	}
 	if err := w.handler.Stop(key); err != nil {
 		return fmt.Errorf("failed to stop job %q: %w", key, err)
 	}
-	if _, _, err := w.jobsMap.RemoveValues(ctx, w.ID, key); err != nil {
-		w.logger.Error(fmt.Errorf("stop job: failed to remove job %q from jobs map: %w", key, err))
-	}
-	if _, err := w.jobPayloadsMap.Delete(ctx, key); err != nil {
-		w.logger.Error(fmt.Errorf("stop job: failed to remove job payload %q from job payloads map: %w", key, err))
-	}
-	w.logger.Info("stopped job", "job", key)
 	w.jobs.Delete(key)
+	if !forRequeue {
+		if _, _, err := w.jobsMap.RemoveValues(ctx, w.ID, key); err != nil {
+			w.logger.Error(fmt.Errorf("stop job: failed to remove job %q from jobs map: %w", key, err))
+		}
+		if _, err := w.jobPayloadsMap.Delete(ctx, key); err != nil {
+			w.logger.Error(fmt.Errorf("stop job: failed to remove job payload %q from job payloads map: %w", key, err))
+		}
+	}
+	w.logger.Info("stopped job", "job", key, "for_requeue", forRequeue)
 	return nil
 }
 
@@ -482,7 +484,7 @@ func (w *Worker) attemptRequeue(ctx context.Context, jobsToRequeue map[string]*J
 
 // requeueJob requeues a job.
 func (w *Worker) requeueJob(ctx context.Context, job *Job) error {
-	err := w.stopJob(ctx, job.Key)
+	err := w.stopJob(ctx, job.Key, true)
 	if err != nil {
 		return fmt.Errorf("failed to stop job: %w", err)
 	}
