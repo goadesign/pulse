@@ -89,7 +89,7 @@ func newWorker(ctx context.Context, node *Node, h JobHandler) (*Worker, error) {
 	wid := ulid.Make().String()
 	createdAt := time.Now()
 	if _, err := node.workerMap.SetAndWait(ctx, wid, strconv.FormatInt(createdAt.UnixNano(), 10)); err != nil {
-		return nil, fmt.Errorf("failed to add worker %q to pool %q: %w", wid, node.Name, err)
+		return nil, fmt.Errorf("failed to add worker %q to pool %q: %w", wid, node.PoolName, err)
 	}
 	now := strconv.FormatInt(time.Now().UnixNano(), 10)
 	if _, err := node.keepAliveMap.SetAndWait(ctx, wid, now); err != nil {
@@ -305,7 +305,7 @@ func (w *Worker) ackPoolEvent(ctx context.Context, nodeID, eventID string, acker
 	stream, ok := w.nodeStreams[nodeID]
 	if !ok {
 		var err error
-		stream, err = streaming.NewStream(nodeStreamName(w.Node.Name, nodeID), w.Node.rdb, soptions.WithStreamLogger(w.logger))
+		stream, err = streaming.NewStream(nodeStreamName(w.Node.PoolName, nodeID), w.Node.rdb, soptions.WithStreamLogger(w.logger))
 		if err != nil {
 			w.logger.Error(fmt.Errorf("failed to create stream for node %q: %w", nodeID, err))
 			return
