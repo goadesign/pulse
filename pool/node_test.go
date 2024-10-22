@@ -416,7 +416,9 @@ func TestTwoNodeJobDispatchAndAck(t *testing.T) {
 
 	// Verify pending events are cleared on node1
 	require.Eventually(t, func() bool {
-		return len(node1.pendingEvents) == 0
+		var count int
+		node1.pendingEvents.Range(func(_, _ any) bool { count++; return true })
+		return count == 0
 	}, max, delay, "Pending events were not cleared on node1 within expected time")
 
 	// Clean up
@@ -519,7 +521,7 @@ func TestStaleEventsAreRemoved(t *testing.T) {
 			},
 		},
 	}
-	node.pendingEvents[pendingEventKey("worker", staleEventID)] = staleEvent
+	node.pendingEvents.Store(pendingEventKey("worker", staleEventID), staleEvent)
 
 	// Add a fresh event
 	freshEventID := fmt.Sprintf("%d-0", time.Now().Add(-time.Second).UnixNano()/int64(time.Millisecond))
@@ -533,7 +535,7 @@ func TestStaleEventsAreRemoved(t *testing.T) {
 			},
 		},
 	}
-	node.pendingEvents[pendingEventKey("worker", freshEventID)] = freshEvent
+	node.pendingEvents.Store(pendingEventKey("worker", freshEventID), freshEvent)
 
 	// Create a mock event to trigger the ackWorkerEvent function
 	mockEventID := "mock-event-id"
@@ -547,23 +549,19 @@ func TestStaleEventsAreRemoved(t *testing.T) {
 			},
 		},
 	}
-	node.pendingEvents[pendingEventKey("worker", mockEventID)] = mockEvent
+	node.pendingEvents.Store(pendingEventKey("worker", mockEventID), mockEvent)
 
 	// Call ackWorkerEvent to trigger the stale event cleanup
 	node.ackWorkerEvent(ctx, mockEvent)
 
 	assert.Eventually(t, func() bool {
-		node.lock.Lock()
-		defer node.lock.Unlock()
-		_, exists := node.pendingEvents[pendingEventKey("worker", staleEventID)]
-		return !exists
+		_, ok := node.pendingEvents.Load(pendingEventKey("worker", staleEventID))
+		return !ok
 	}, max, delay, "Stale event should have been removed")
 
 	assert.Eventually(t, func() bool {
-		node.lock.Lock()
-		defer node.lock.Unlock()
-		_, exists := node.pendingEvents[pendingEventKey("worker", freshEventID)]
-		return exists
+		_, ok := node.pendingEvents.Load(pendingEventKey("worker", freshEventID))
+		return ok
 	}, max, delay, "Fresh event should still be present")
 }
 

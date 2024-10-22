@@ -138,7 +138,11 @@ func TestMapLocal(t *testing.T) {
 	assert.Equal(t, "", old)
 	assert.Eventually(t, func() bool { return len(m.Map()) == 1 }, wf, tck)
 	m.Close()
-	assert.Eventually(t, func() bool { return m.closed }, wf, tck)
+	assert.Eventually(t, func() bool {
+		m.lock.RLock()
+		defer m.lock.RUnlock()
+		return m.closed
+	}, wf, tck)
 
 	// Check that we can still read the map after it has been closed.
 	assert.Equal(t, m.Len(), 1)
@@ -393,7 +397,7 @@ func TestLogs(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
 	var buf Buffer
 	ctx := context.Background()
-	ctx = log.Context(ctx, log.WithOutput(&buf), log.WithDebug())
+	ctx = log.Context(ctx, log.WithOutput(&buf), log.WithDebug(), log.WithFormat(log.FormatText))
 
 	m, err := Join(ctx, "test", rdb, WithLogger(pulse.ClueLogger(ctx)))
 	require.NoError(t, err)
@@ -415,7 +419,11 @@ func TestLogs(t *testing.T) {
 	assert.NoError(t, m.Reset(ctx))
 	assert.Eventually(t, func() bool { return len(m.Map()) == 0 }, wf, tck)
 	m.Close()
-	assert.Eventually(t, func() bool { return m.closed }, wf, tck)
+	assert.Eventually(t, func() bool {
+		m.lock.RLock()
+		defer m.lock.RUnlock()
+		return m.closed
+	}, wf, tck)
 
 	// Check that the logs contain the expected messages
 	assert.Contains(t, buf.String(), `joined`)
@@ -529,7 +537,11 @@ func cleanup(t *testing.T, m *Map) {
 	t.Helper()
 	assert.NoError(t, m.Reset(context.Background()))
 	m.Close()
-	assert.Eventually(t, func() bool { return m.closed }, wf, tck)
+	assert.Eventually(t, func() bool {
+		m.lock.RLock()
+		defer m.lock.RUnlock()
+		return m.closed
+	}, wf, tck)
 }
 
 // Buffer is a goroutine safe bytes.Buffer
