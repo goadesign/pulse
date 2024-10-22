@@ -42,6 +42,7 @@ type (
 		workerTTL         time.Duration     // Worker considered dead if keep-alive not updated after this duration
 		workerShutdownTTL time.Duration     // Worker considered dead if not shutdown after this duration
 		pendingJobTTL     time.Duration     // Job lease expires if not acked after this duration
+		ackGracePeriod    time.Duration     // Wait for return status up to this duration
 		logger            pulse.Logger
 		h                 hasher
 		stop              chan struct{}  // closed when node is stopped
@@ -191,6 +192,7 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...NodeOp
 		workerTTL:         o.workerTTL,
 		workerShutdownTTL: o.workerShutdownTTL,
 		pendingJobTTL:     o.pendingJobTTL,
+		ackGracePeriod:    o.ackGracePeriod,
 		h:                 jumpHash{crc64.New(crc64.MakeTable(crc64.ECMA))},
 		stop:              make(chan struct{}),
 		rdb:               rdb,
@@ -313,16 +315,26 @@ func (node *Node) DispatchJob(ctx context.Context, key string, payload []byte) e
 	node.pendingJobs[eventID] = cherr
 	node.lock.Unlock()
 
-	// Wait for return status.
+	// Wait for return status up to ack grace period.
+	timer := time.NewTimer(2 * node.ackGracePeriod)
+	defer timer.Stop()
+
 	select {
 	case err = <-cherr:
+	case <-timer.C:
+		err = fmt.Errorf("DispatchJob: job %q timed out, TTL: %v", key, 2*node.ackGracePeriod)
 	case <-ctx.Done():
 		err = ctx.Err()
 	}
 
+	node.lock.Lock()
+	delete(node.pendingJobs, eventID)
 	close(cherr)
+	node.lock.Unlock()
 	if err == nil {
 		node.logger.Info("dispatched", "key", key)
+	} else {
+		node.logger.Error(fmt.Errorf("DispatchJob: failed to dispatch job: %w", err), "key", key)
 	}
 	return err
 }
@@ -636,9 +648,9 @@ func (node *Node) returnDispatchStatus(_ context.Context, ev *streaming.Event) {
 		return
 	}
 	node.logger.Debug("dispatch return", "event", ev.EventName, "id", ev.ID, "ack-id", ack.EventID)
-	delete(node.pendingJobs, ack.EventID)
 	if cherr == nil {
 		// Event was requeued.
+		delete(node.pendingJobs, ack.EventID)
 		return
 	}
 	var err error
