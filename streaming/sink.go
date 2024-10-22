@@ -410,12 +410,13 @@ func (s *Sink) periodicKeepAlive() {
 	for {
 		select {
 		case <-ticker.C:
+			s.lock.Lock()
 			now := time.Now().UnixNano()
 			if _, err := s.consumersKeepAliveMap.Set(ctx, s.consumer, strconv.FormatInt(now, 10)); err != nil {
 				s.logger.Error(fmt.Errorf("failed to update sink keep-alive: %v", err))
+				s.lock.Unlock()
 				continue
 			}
-			s.lock.Lock()
 			s.lastKeepAlive = now
 			s.lock.Unlock()
 
