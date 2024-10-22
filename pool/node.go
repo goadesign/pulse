@@ -27,8 +27,8 @@ import (
 type (
 	// Node is a pool of workers.
 	Node struct {
-		Name              string
 		NodeID            string
+		PoolName          string
 		poolStream        *streaming.Stream // pool event stream for dispatching jobs
 		poolSink          *streaming.Sink   // pool event sink
 		nodeStream        *streaming.Stream // node event stream for receiving worker events
@@ -93,14 +93,14 @@ const (
 // The options WithClientOnly can be used to create a node that can only be used
 // to dispatch jobs. Such a node does not route or process jobs in the
 // background.
-func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...NodeOption) (*Node, error) {
+func AddNode(ctx context.Context, poolName string, rdb *redis.Client, opts ...NodeOption) (*Node, error) {
 	o := parseOptions(opts...)
 	logger := o.logger
 	nodeID := ulid.Make().String()
 	if logger == nil {
 		logger = pulse.NoopLogger()
 	} else {
-		logger = logger.WithPrefix("pool", name, "node", nodeID)
+		logger = logger.WithPrefix("pool", poolName, "node", nodeID)
 	}
 	logger.Info("options",
 		"client_only", o.clientOnly,
@@ -110,18 +110,18 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...NodeOp
 		"pending_job_ttl", o.pendingJobTTL,
 		"job_sink_block_duration", o.jobSinkBlockDuration,
 		"ack_grace_period", o.ackGracePeriod)
-	wsm, err := rmap.Join(ctx, shutdownMapName(name), rdb, rmap.WithLogger(logger))
+	wsm, err := rmap.Join(ctx, shutdownMapName(poolName), rdb, rmap.WithLogger(logger))
 	if err != nil {
-		return nil, fmt.Errorf("AddNode: failed to join shutdown replicated map %q: %w", shutdownMapName(name), err)
+		return nil, fmt.Errorf("AddNode: failed to join shutdown replicated map %q: %w", shutdownMapName(poolName), err)
 	}
 	if wsm.Len() > 0 {
-		return nil, fmt.Errorf("AddNode: pool %q is shutting down", name)
+		return nil, fmt.Errorf("AddNode: pool %q is shutting down", poolName)
 	}
-	poolStream, err := streaming.NewStream(poolStreamName(name), rdb,
+	poolStream, err := streaming.NewStream(poolStreamName(poolName), rdb,
 		soptions.WithStreamMaxLen(o.maxQueuedJobs),
 		soptions.WithStreamLogger(logger))
 	if err != nil {
-		return nil, fmt.Errorf("AddNode: failed to create pool job stream %q: %w", poolStreamName(name), err)
+		return nil, fmt.Errorf("AddNode: failed to create pool job stream %q: %w", poolStreamName(poolName), err)
 	}
 	var (
 		wm         *rmap.Map
@@ -134,47 +134,47 @@ func AddNode(ctx context.Context, name string, rdb *redis.Client, opts ...NodeOp
 		nodeReader *streaming.Reader
 	)
 	if !o.clientOnly {
-		wm, err = rmap.Join(ctx, workerMapName(name), rdb, rmap.WithLogger(logger))
+		wm, err = rmap.Join(ctx, workerMapName(poolName), rdb, rmap.WithLogger(logger))
 		if err != nil {
-			return nil, fmt.Errorf("AddNode: failed to join pool workers replicated map %q: %w", workerMapName(name), err)
+			return nil, fmt.Errorf("AddNode: failed to join pool workers replicated map %q: %w", workerMapName(poolName), err)
 		}
 		workerIDs := wm.Keys()
 		logger.Info("joined", "workers", workerIDs)
-		jm, err = rmap.Join(ctx, jobsMapName(name), rdb, rmap.WithLogger(logger))
+		jm, err = rmap.Join(ctx, jobsMapName(poolName), rdb, rmap.WithLogger(logger))
 		if err != nil {
-			return nil, fmt.Errorf("AddNode: failed to join pool jobs replicated map %q: %w", jobsMapName(name), err)
+			return nil, fmt.Errorf("AddNode: failed to join pool jobs replicated map %q: %w", jobsMapName(poolName), err)
 		}
-		jpm, err = rmap.Join(ctx, jobPayloadsMapName(name), rdb, rmap.WithLogger(logger))
+		jpm, err = rmap.Join(ctx, jobPayloadsMapName(poolName), rdb, rmap.WithLogger(logger))
 		if err != nil {
-			return nil, fmt.Errorf("AddNode: failed to join pool job payloads replicated map %q: %w", jobPayloadsMapName(name), err)
+			return nil, fmt.Errorf("AddNode: failed to join pool job payloads replicated map %q: %w", jobPayloadsMapName(poolName), err)
 		}
-		km, err = rmap.Join(ctx, keepAliveMapName(name), rdb, rmap.WithLogger(logger))
+		km, err = rmap.Join(ctx, keepAliveMapName(poolName), rdb, rmap.WithLogger(logger))
 		if err != nil {
-			return nil, fmt.Errorf("AddNode: failed to join pool keep-alive replicated map %q: %w", keepAliveMapName(name), err)
+			return nil, fmt.Errorf("AddNode: failed to join pool keep-alive replicated map %q: %w", keepAliveMapName(poolName), err)
 		}
-		tm, err = rmap.Join(ctx, tickerMapName(name), rdb, rmap.WithLogger(logger))
+		tm, err = rmap.Join(ctx, tickerMapName(poolName), rdb, rmap.WithLogger(logger))
 		if err != nil {
-			return nil, fmt.Errorf("AddNode: failed to join pool ticker replicated map %q: %w", tickerMapName(name), err)
+			return nil, fmt.Errorf("AddNode: failed to join pool ticker replicated map %q: %w", tickerMapName(poolName), err)
 		}
 		poolSink, err = poolStream.NewSink(ctx, "events",
 			soptions.WithSinkBlockDuration(o.jobSinkBlockDuration),
 			soptions.WithSinkAckGracePeriod(o.ackGracePeriod))
 		if err != nil {
-			return nil, fmt.Errorf("AddNode: failed to create events sink for stream %q: %w", poolStreamName(name), err)
+			return nil, fmt.Errorf("AddNode: failed to create events sink for stream %q: %w", poolStreamName(poolName), err)
 		}
 	}
-	nodeStream, err = streaming.NewStream(nodeStreamName(name, nodeID), rdb, soptions.WithStreamLogger(logger))
+	nodeStream, err = streaming.NewStream(nodeStreamName(poolName, nodeID), rdb, soptions.WithStreamLogger(logger))
 	if err != nil {
-		return nil, fmt.Errorf("AddNode: failed to create node event stream %q: %w", nodeStreamName(name, nodeID), err)
+		return nil, fmt.Errorf("AddNode: failed to create node event stream %q: %w", nodeStreamName(poolName, nodeID), err)
 	}
 	nodeReader, err = nodeStream.NewReader(ctx, soptions.WithReaderBlockDuration(o.jobSinkBlockDuration), soptions.WithReaderStartAtOldest())
 	if err != nil {
-		return nil, fmt.Errorf("AddNode: failed to create node event reader for stream %q: %w", nodeStreamName(name, nodeID), err)
+		return nil, fmt.Errorf("AddNode: failed to create node event reader for stream %q: %w", nodeStreamName(poolName, nodeID), err)
 	}
 
 	p := &Node{
-		Name:              name,
 		NodeID:            nodeID,
+		PoolName:          poolName,
 		keepAliveMap:      km,
 		workerMap:         wm,
 		jobsMap:           jm,
@@ -225,10 +225,10 @@ func (node *Node) AddWorker(ctx context.Context, handler JobHandler) (*Worker, e
 	node.lock.Lock()
 	defer node.lock.Unlock()
 	if node.closing {
-		return nil, fmt.Errorf("AddWorker: pool %q is closed", node.Name)
+		return nil, fmt.Errorf("AddWorker: pool %q is closed", node.PoolName)
 	}
 	if node.clientOnly {
-		return nil, fmt.Errorf("AddWorker: pool %q is client-only", node.Name)
+		return nil, fmt.Errorf("AddWorker: pool %q is client-only", node.PoolName)
 	}
 	w, err := newWorker(ctx, node, handler)
 	if err != nil {
@@ -303,7 +303,7 @@ func (node *Node) DispatchJob(ctx context.Context, key string, payload []byte) e
 	node.lock.Lock()
 	if node.closing {
 		node.lock.Unlock()
-		return fmt.Errorf("DispatchJob: pool %q is closed", node.Name)
+		return fmt.Errorf("DispatchJob: pool %q is closed", node.PoolName)
 	}
 	job := marshalJob(&Job{Key: key, Payload: payload, CreatedAt: time.Now(), NodeID: node.NodeID})
 	eventID, err := node.poolStream.Add(ctx, evStartJob, job)
@@ -344,7 +344,7 @@ func (node *Node) StopJob(ctx context.Context, key string) error {
 	node.lock.Lock()
 	defer node.lock.Unlock()
 	if node.closing {
-		return fmt.Errorf("StopJob: pool %q is closed", node.Name)
+		return fmt.Errorf("StopJob: pool %q is closed", node.PoolName)
 	}
 	if _, err := node.poolStream.Add(ctx, evStopJob, marshalJobKey(key)); err != nil {
 		return fmt.Errorf("StopJob: failed to add stop job to stream %q: %w", node.poolStream.Name, err)
@@ -383,7 +383,7 @@ func (node *Node) NotifyWorker(ctx context.Context, key string, payload []byte) 
 	node.lock.Lock()
 	defer node.lock.Unlock()
 	if node.closing {
-		return fmt.Errorf("NotifyWorker: pool %q is closed", node.Name)
+		return fmt.Errorf("NotifyWorker: pool %q is closed", node.PoolName)
 	}
 	if _, err := node.poolStream.Add(ctx, evNotify, marshalNotification(key, payload)); err != nil {
 		return fmt.Errorf("NotifyWorker: failed to add notification to stream %q: %w", node.poolStream.Name, err)
@@ -421,7 +421,7 @@ func (node *Node) Shutdown(ctx context.Context) error {
 	}
 
 	// Now clean up the shutdown replicated map.
-	wsm, err := rmap.Join(ctx, shutdownMapName(node.Name), node.rdb, rmap.WithLogger(node.logger))
+	wsm, err := rmap.Join(ctx, shutdownMapName(node.PoolName), node.rdb, rmap.WithLogger(node.logger))
 	if err != nil {
 		node.logger.Error(fmt.Errorf("Shutdown: failed to join shutdown map for cleanup: %w", err))
 	}
@@ -535,7 +535,7 @@ func (node *Node) routeWorkerEvent(ctx context.Context, ev *streaming.Event) err
 	key := unmarshalJobKey(ev.Payload)
 	activeWorkers := node.activeWorkers()
 	if len(activeWorkers) == 0 {
-		return fmt.Errorf("routeWorkerEvent: no active worker in pool %q", node.Name)
+		return fmt.Errorf("routeWorkerEvent: no active worker in pool %q", node.PoolName)
 	}
 	wid := activeWorkers[node.h.Hash(key, int64(len(activeWorkers)))]
 
@@ -606,14 +606,14 @@ func (node *Node) ackWorkerEvent(ctx context.Context, ev *streaming.Event) {
 	// dispatched the job.
 	if pending.EventName == evStartJob {
 		_, nodeID := unmarshalJobKeyAndNodeID(pending.Payload)
-		stream, err := streaming.NewStream(nodeStreamName(node.Name, nodeID), node.rdb, soptions.WithStreamLogger(node.logger))
+		stream, err := streaming.NewStream(nodeStreamName(node.PoolName, nodeID), node.rdb, soptions.WithStreamLogger(node.logger))
 		if err != nil {
-			node.logger.Error(fmt.Errorf("ackWorkerEvent: failed to create node event stream %q: %w", nodeStreamName(node.Name, nodeID), err))
+			node.logger.Error(fmt.Errorf("ackWorkerEvent: failed to create node event stream %q: %w", nodeStreamName(node.PoolName, nodeID), err))
 			return
 		}
 		ack.EventID = pending.ID
 		if _, err := stream.Add(ctx, evDispatchReturn, marshalAck(ack), soptions.WithOnlyIfStreamExists()); err != nil {
-			node.logger.Error(fmt.Errorf("ackWorkerEvent: failed to dispatch return to stream %q: %w", nodeStreamName(node.Name, nodeID), err))
+			node.logger.Error(fmt.Errorf("ackWorkerEvent: failed to dispatch return to stream %q: %w", nodeStreamName(node.PoolName, nodeID), err))
 		}
 	}
 

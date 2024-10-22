@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math/rand"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -493,7 +492,7 @@ func (s *Sink) claimIdleMessages(ctx context.Context) {
 // s.lock must be held.
 func (s *Sink) deleteStaleConsumers(ctx context.Context) {
 	keepAlives := s.consumersKeepAliveMap.Map()
-	var staleConsumers []string
+	staleConsumers := make(map[string]struct{})
 	for consumer, timestamp := range keepAlives {
 		ts, err := strconv.ParseInt(timestamp, 10, 64)
 		if err != nil {
@@ -501,21 +500,21 @@ func (s *Sink) deleteStaleConsumers(ctx context.Context) {
 			continue
 		}
 		if time.Since(time.Unix(0, ts)) > 2*s.ackGracePeriod {
-			staleConsumers = append(staleConsumers, consumer)
-			s.logger.Debug("stale consumer", "consumer", consumer, "since", time.Since(time.Unix(0, ts)), "grace", 2*s.ackGracePeriod)
+			staleConsumers[consumer] = struct{}{}
+			s.logger.Debug("stale consumer", "consumer", consumer, "since", time.Since(time.Unix(0, ts)), "ttl", 2*s.ackGracePeriod)
 		}
 	}
+	// Delete any stale consumers from the consumer group.
 	for _, stream := range s.streams {
 		sinks := s.consumersMap[stream.Name]
 		for _, sink := range sinks.Keys() {
 			consumers, _ := sinks.GetValues(sink)
 			for _, consumer := range consumers {
-				if !slices.Contains(staleConsumers, consumer) {
+				if _, ok := staleConsumers[consumer]; !ok {
 					continue
 				}
 				if err := s.rdb.XGroupDelConsumer(ctx, stream.key, s.Name, consumer).Err(); err != nil {
 					s.logger.Error(fmt.Errorf("failed to delete stale consumer %s: %w", consumer, err))
-					continue
 				}
 				if _, err := s.consumersKeepAliveMap.Delete(ctx, consumer); err != nil {
 					s.logger.Error(fmt.Errorf("failed to delete sink keep-alive for stale consumer %s: %w", consumer, err))
@@ -523,9 +522,17 @@ func (s *Sink) deleteStaleConsumers(ctx context.Context) {
 				if _, _, err := sinks.RemoveValues(ctx, s.Name, consumer); err != nil {
 					s.logger.Error(fmt.Errorf("failed to remove consumer from map: %w", err), "stream", stream.Name, "consumer", consumer)
 				}
+				delete(staleConsumers, consumer)
 				s.logger.Debug("deleted stale consumer", "consumer", consumer)
 			}
 		}
+	}
+	// Delete any remaining stale consumers from the keep-alive map.
+	for consumer := range staleConsumers {
+		if _, err := s.consumersKeepAliveMap.Delete(ctx, consumer); err != nil {
+			s.logger.Error(fmt.Errorf("failed to delete sink keep-alive for orphaned consumer %s: %w", consumer, err))
+		}
+		s.logger.Debug("deleted orphaned consumer", "consumer", consumer)
 	}
 }
 
