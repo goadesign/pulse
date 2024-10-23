@@ -77,7 +77,9 @@ func TestReplaceTickerTimer(t *testing.T) {
 	require.NotNil(t, ticker2)
 
 	// Verify second ticker properties
+	ticker2.lock.Lock()
 	nextTick, tickDuration = deserialize(ticker2.next)
+	ticker2.lock.Unlock()
 	assert.WithinDuration(t, now.Add(longDuration), nextTick, time.Second, "Second ticker: invalid next tick time")
 	assert.Equal(t, longDuration, tickDuration, "Second ticker: invalid duration")
 
