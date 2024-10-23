@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -185,7 +184,7 @@ func (w *Worker) handleEvents(c <-chan *streaming.Event) {
 				err = w.startJob(ctx, unmarshalJob(payload))
 			case evStopJob:
 				w.logger.Debug("handleEvents: received stop job", "event", ev.EventName, "id", ev.ID)
-				err = w.stopJob(ctx, unmarshalJobKey(payload))
+				err = w.stopJob(ctx, unmarshalJobKey(payload), false)
 			case evNotify:
 				w.logger.Debug("handleEvents: received notify", "event", ev.EventName, "id", ev.ID)
 				key, payload := unmarshalNotification(payload)
@@ -271,21 +270,23 @@ func (w *Worker) startJob(ctx context.Context, job *Job) error {
 }
 
 // stopJob stops a job.
-func (w *Worker) stopJob(ctx context.Context, key string) error {
+func (w *Worker) stopJob(ctx context.Context, key string, forRequeue bool) error {
 	if _, ok := w.jobs.Load(key); !ok {
-		return fmt.Errorf("job %s not found", key)
+		return fmt.Errorf("job %s not found in local worker", key)
 	}
 	if err := w.handler.Stop(key); err != nil {
 		return fmt.Errorf("failed to stop job %q: %w", key, err)
 	}
+	w.jobs.Delete(key)
 	if _, _, err := w.jobsMap.RemoveValues(ctx, w.ID, key); err != nil {
 		w.logger.Error(fmt.Errorf("stop job: failed to remove job %q from jobs map: %w", key, err))
 	}
-	if _, err := w.jobPayloadsMap.Delete(ctx, key); err != nil {
-		w.logger.Error(fmt.Errorf("stop job: failed to remove job payload %q from job payloads map: %w", key, err))
+	if !forRequeue {
+		if _, err := w.jobPayloadsMap.Delete(ctx, key); err != nil {
+			w.logger.Error(fmt.Errorf("stop job: failed to remove job payload %q from job payloads map: %w", key, err))
+		}
 	}
-	w.logger.Info("stopped job", "job", key)
-	w.jobs.Delete(key)
+	w.logger.Info("stopped job", "job", key, "for_requeue", forRequeue)
 	return nil
 }
 
@@ -482,16 +483,14 @@ func (w *Worker) attemptRequeue(ctx context.Context, jobsToRequeue map[string]*J
 
 // requeueJob requeues a job.
 func (w *Worker) requeueJob(ctx context.Context, job *Job) error {
-	err := w.stopJob(ctx, job.Key)
-	if err != nil {
-		return fmt.Errorf("failed to stop job: %w", err)
-	}
-
 	eventID, err := w.Node.poolStream.Add(ctx, evStartJob, marshalJob(job))
 	if err != nil {
 		return fmt.Errorf("requeueJob: failed to add job to pool stream: %w", err)
 	}
 	w.Node.pendingJobs.Store(eventID, nil)
+	if err := w.stopJob(ctx, job.Key, true); err != nil {
+		return fmt.Errorf("failed to stop job: %w", err)
+	}
 	return nil
 }
 
@@ -503,16 +502,9 @@ func (w *Worker) cleanup(ctx context.Context) {
 	if _, err := w.keepAliveMap.Delete(ctx, w.ID); err != nil {
 		w.logger.Error(fmt.Errorf("failed to remove worker from keep alive map: %w", err))
 	}
-	keys, err := w.jobsMap.Delete(ctx, w.ID)
+	_, err := w.jobsMap.Delete(ctx, w.ID)
 	if err != nil {
 		w.logger.Error(fmt.Errorf("failed to remove worker from jobs map: %w", err))
-	}
-	if keys != "" {
-		for _, key := range strings.Split(keys, ",") {
-			if _, err := w.jobPayloadsMap.Delete(ctx, key); err != nil {
-				w.logger.Error(fmt.Errorf("worker stop: failed to remove job payload %q from job payloads map: %w", key, err))
-			}
-		}
 	}
 }
 

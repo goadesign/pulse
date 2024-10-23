@@ -510,7 +510,7 @@ func TestStaleEventsAreRemoved(t *testing.T) {
 	defer func() { assert.NoError(t, node.Shutdown(ctx)) }()
 
 	// Add a stale event manually
-	staleEventID := fmt.Sprintf("%d-0", time.Now().Add(-2*node.pendingJobTTL).UnixNano()/int64(time.Millisecond))
+	staleEventID := fmt.Sprintf("%d-0", time.Now().Add(-2*pendingEventTTL).UnixNano()/int64(time.Millisecond))
 	staleEvent := &streaming.Event{
 		ID:        staleEventID,
 		EventName: "test-event",

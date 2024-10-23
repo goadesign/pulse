@@ -30,6 +30,10 @@ const (
 	testAckGracePeriod       = 50 * time.Millisecond
 )
 
+func init() {
+	jobSinkBlockDuration = 100 * time.Millisecond
+}
+
 // newTestNode creates a new Node instance for testing purposes.
 // It configures the node with specific TTL and block duration settings
 // suitable for testing, and uses the provided Redis client and name.
@@ -38,7 +42,6 @@ func newTestNode(t *testing.T, ctx context.Context, rdb *redis.Client, name stri
 	node, err := AddNode(ctx, name, rdb,
 		WithLogger(pulse.ClueLogger(ctx)),
 		WithWorkerShutdownTTL(testWorkerShutdownTTL),
-		WithJobSinkBlockDuration(testJobSinkBlockDuration),
 		WithWorkerTTL(testWorkerTTL),
 		WithAckGracePeriod(testAckGracePeriod))
 	require.NoError(t, err)
