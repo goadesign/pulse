@@ -41,7 +41,6 @@ type (
 		tickerMap         *rmap.Map         // ticker next tick time indexed by name
 		workerTTL         time.Duration     // Worker considered dead if keep-alive not updated after this duration
 		workerShutdownTTL time.Duration     // Worker considered dead if not shutdown after this duration
-		pendingJobTTL     time.Duration     // Job lease expires if not acked after this duration
 		ackGracePeriod    time.Duration     // Wait for return status up to this duration
 		clientOnly        bool
 		logger            pulse.Logger
@@ -85,6 +84,12 @@ const (
 	evDispatchReturn string = "d"
 )
 
+// jobSinkBlockDuration is the max duration to block when reading from the job stream.
+var jobSinkBlockDuration = 5 * time.Second
+
+// pendingEventTTL is the TTL for pending events.
+var pendingEventTTL = 2 * time.Minute
+
 // AddNode adds a new node to the pool with the given name and returns it. The
 // node can be used to dispatch jobs and add new workers. A node also routes
 // dispatched jobs to the proper worker and acks the corresponding events once
@@ -107,8 +112,6 @@ func AddNode(ctx context.Context, poolName string, rdb *redis.Client, opts ...No
 		"max_queued_jobs", o.maxQueuedJobs,
 		"worker_ttl", o.workerTTL,
 		"worker_shutdown_ttl", o.workerShutdownTTL,
-		"pending_job_ttl", o.pendingJobTTL,
-		"job_sink_block_duration", o.jobSinkBlockDuration,
 		"ack_grace_period", o.ackGracePeriod)
 	wsm, err := rmap.Join(ctx, shutdownMapName(poolName), rdb, rmap.WithLogger(logger))
 	if err != nil {
@@ -157,7 +160,7 @@ func AddNode(ctx context.Context, poolName string, rdb *redis.Client, opts ...No
 			return nil, fmt.Errorf("AddNode: failed to join pool ticker replicated map %q: %w", tickerMapName(poolName), err)
 		}
 		poolSink, err = poolStream.NewSink(ctx, "events",
-			soptions.WithSinkBlockDuration(o.jobSinkBlockDuration),
+			soptions.WithSinkBlockDuration(jobSinkBlockDuration),
 			soptions.WithSinkAckGracePeriod(o.ackGracePeriod))
 		if err != nil {
 			return nil, fmt.Errorf("AddNode: failed to create events sink for stream %q: %w", poolStreamName(poolName), err)
@@ -167,7 +170,7 @@ func AddNode(ctx context.Context, poolName string, rdb *redis.Client, opts ...No
 	if err != nil {
 		return nil, fmt.Errorf("AddNode: failed to create node event stream %q: %w", nodeStreamName(poolName, nodeID), err)
 	}
-	nodeReader, err = nodeStream.NewReader(ctx, soptions.WithReaderBlockDuration(o.jobSinkBlockDuration), soptions.WithReaderStartAtOldest())
+	nodeReader, err = nodeStream.NewReader(ctx, soptions.WithReaderBlockDuration(jobSinkBlockDuration), soptions.WithReaderStartAtOldest())
 	if err != nil {
 		return nil, fmt.Errorf("AddNode: failed to create node event reader for stream %q: %w", nodeStreamName(poolName, nodeID), err)
 	}
@@ -191,7 +194,6 @@ func AddNode(ctx context.Context, poolName string, rdb *redis.Client, opts ...No
 		clientOnly:        o.clientOnly,
 		workerTTL:         o.workerTTL,
 		workerShutdownTTL: o.workerShutdownTTL,
-		pendingJobTTL:     o.pendingJobTTL,
 		ackGracePeriod:    o.ackGracePeriod,
 		h:                 jumpHash{crc64.New(crc64.MakeTable(crc64.ECMA))},
 		stop:              make(chan struct{}),
@@ -398,6 +400,12 @@ func (node *Node) Shutdown(ctx context.Context) error {
 		node.logger.Error(fmt.Errorf("Shutdown: failed to destroy pool stream: %w", err))
 	}
 
+	// Cleanup the jobs payloads map as ongoing requeues could prevent it
+	// from being cleaned up by the workers.
+	if err := node.jobPayloadsMap.Reset(ctx); err != nil {
+		node.logger.Error(fmt.Errorf("Shutdown: failed to reset job payloads map: %w", err))
+	}
+
 	// Now clean up the shutdown replicated map.
 	wsm, err := rmap.Join(ctx, shutdownMapName(node.PoolName), node.rdb, rmap.WithLogger(node.logger))
 	if err != nil {
@@ -446,38 +454,68 @@ func (node *Node) close(ctx context.Context, requeue bool) error {
 
 	node.logger.Info("closing")
 
+	// If we're not requeuing then stop all the jobs.
+	if !requeue {
+		node.logger.Info("stopping all jobs")
+		var wg sync.WaitGroup
+		var total atomic.Int32
+		node.localWorkers.Range(func(key, value any) bool {
+			wg.Add(1)
+			worker := value.(*Worker)
+			pulse.Go(ctx, func() {
+				defer wg.Done()
+				for _, job := range worker.Jobs() {
+					if err := worker.stopJob(ctx, job.Key, false); err != nil {
+						node.logger.Error(fmt.Errorf("Close: failed to stop job %q for worker %q: %w", job.Key, worker.ID, err))
+					}
+					total.Add(1)
+				}
+			})
+			return true
+		})
+		wg.Wait()
+		node.logger.Info("stopped all jobs", "total", total.Load())
+	}
+
 	// Need to stop workers before requeueing jobs to prevent
 	// requeued jobs from being handled by this node.
 	var wg sync.WaitGroup
 	node.localWorkers.Range(func(key, value any) bool {
 		wg.Add(1)
-		go func(w *Worker) {
+		worker := value.(*Worker)
+		pulse.Go(ctx, func() {
 			defer wg.Done()
-			w.stopAndWait(ctx)
-		}(value.(*Worker))
+			worker.stopAndWait(ctx)
+		})
 		return true
 	})
 	wg.Wait()
 	node.logger.Debug("workers stopped")
 
 	// Requeue jobs.
-	node.localWorkers.Range(func(key, value any) bool {
-		wg.Add(1)
-		go func(w *Worker) {
-			defer wg.Done()
-			if requeue {
-				if err := w.requeueJobs(ctx); err != nil {
-					node.logger.Error(fmt.Errorf("Close: failed to requeue jobs for worker %q: %w", w.ID, err))
+	if requeue {
+		var wg sync.WaitGroup
+		node.localWorkers.Range(func(key, value any) bool {
+			wg.Add(1)
+			worker := value.(*Worker)
+			pulse.Go(ctx, func() {
+				defer wg.Done()
+				if err := worker.requeueJobs(ctx); err != nil {
+					node.logger.Error(fmt.Errorf("Close: failed to requeue jobs for worker %q: %w", worker.ID, err))
 					return
 				}
-			}
-			w.cleanup(ctx)
-		}(value.(*Worker))
-		return true
-	})
-	wg.Wait()
+			})
+			return true
+		})
+		wg.Wait()
+	}
 
 	// Cleanup
+	node.localWorkers.Range(func(key, value any) bool {
+		worker := value.(*Worker)
+		worker.cleanup(ctx)
+		return true
+	})
 	if !node.clientOnly {
 		node.poolSink.Close()
 		node.tickerMap.Close()
@@ -508,7 +546,7 @@ func (node *Node) handlePoolEvents(c <-chan *streaming.Event) {
 		}
 		node.logger.Debug("routing", "event", ev.EventName, "id", ev.ID)
 		if err := node.routeWorkerEvent(ctx, ev); err != nil {
-			node.logger.Error(fmt.Errorf("handlePoolEvents: failed to route event: %w, will retry after %v", err, node.pendingJobTTL), "event", ev.EventName, "id", ev.ID)
+			node.logger.Error(fmt.Errorf("handlePoolEvents: failed to route event: %w, will retry after %v", err, node.ackGracePeriod), "event", ev.EventName, "id", ev.ID)
 		}
 	}
 }
@@ -609,13 +647,13 @@ func (node *Node) ackWorkerEvent(ctx context.Context, ev *streaming.Event) {
 	var staleKeys []string
 	node.pendingEvents.Range(func(key, value any) bool {
 		ev := value.(*streaming.Event)
-		if time.Since(ev.CreatedAt()) > 2*node.pendingJobTTL {
+		if time.Since(ev.CreatedAt()) > pendingEventTTL {
 			staleKeys = append(staleKeys, key.(string))
 		}
 		return true
 	})
 	for _, key := range staleKeys {
-		node.logger.Error(fmt.Errorf("ackWorkerEvent: stale event, removing from pending events"), "event", ev.EventName, "id", ev.ID, "since", time.Since(ev.CreatedAt()), "TTL", 2*node.pendingJobTTL)
+		node.logger.Error(fmt.Errorf("ackWorkerEvent: stale event, removing from pending events"), "event", ev.EventName, "id", ev.ID, "since", time.Since(ev.CreatedAt()), "TTL", pendingEventTTL)
 		node.pendingEvents.Delete(key)
 	}
 }
@@ -673,6 +711,7 @@ func (node *Node) handleWorkerMapUpdate(ctx context.Context) {
 			// If it's not in the worker map, then it's not active and its jobs
 			// have already been requeued.
 			node.logger.Info("handleWorkerMapUpdate: removing inactive local worker", "worker", worker.ID)
+			node.deleteWorker(ctx, worker.ID)
 			worker.stopAndWait(ctx)
 			node.localWorkers.Delete(key)
 			return true
@@ -918,7 +957,7 @@ func (node *Node) activeWorkers() []string {
 	return activeIDs
 }
 
-// deleteWorker removes a worker from the pool deleting the worker stream.
+// deleteWorker removes a remote worker from the pool deleting the worker stream.
 func (node *Node) deleteWorker(ctx context.Context, id string) error {
 	node.logger.Debug("deleteWorker: deleting worker", "worker", id)
 	if _, err := node.keepAliveMap.Delete(ctx, id); err != nil {
@@ -927,9 +966,12 @@ func (node *Node) deleteWorker(ctx context.Context, id string) error {
 	if _, err := node.workerMap.Delete(ctx, id); err != nil {
 		node.logger.Error(fmt.Errorf("deleteWorker: failed to delete worker %q from workers map: %w", id, err))
 	}
+	if _, err := node.jobsMap.Delete(ctx, id); err != nil {
+		node.logger.Error(fmt.Errorf("deleteWorker: failed to delete worker %q from jobs map: %w", id, err))
+	}
 	stream, err := node.workerStream(ctx, id)
 	if err != nil {
-		return err
+		return fmt.Errorf("deleteWorker: failed to retrieve worker stream for %q: %w", id, err)
 	}
 	if err := stream.Destroy(ctx); err != nil {
 		node.logger.Error(fmt.Errorf("deleteWorker: failed to delete worker stream: %w", err))

@@ -51,10 +51,7 @@ func main() {
 	}
 
 	// Create node for pool "example".
-	node, err := pool.AddNode(ctx, "example", rdb,
-		pool.WithJobSinkBlockDuration(100*time.Millisecond), // Shutdown faster
-		pool.WithLogger(logger),
-	)
+	node, err := pool.AddNode(ctx, "example", rdb, pool.WithLogger(logger))
 	if err != nil {
 		panic(err)
 	}

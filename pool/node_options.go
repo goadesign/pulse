@@ -11,14 +11,12 @@ type (
 	NodeOption func(*nodeOptions)
 
 	nodeOptions struct {
-		workerTTL            time.Duration
-		pendingJobTTL        time.Duration
-		workerShutdownTTL    time.Duration
-		maxQueuedJobs        int
-		clientOnly           bool
-		jobSinkBlockDuration time.Duration
-		ackGracePeriod       time.Duration
-		logger               pulse.Logger
+		workerTTL         time.Duration
+		workerShutdownTTL time.Duration
+		maxQueuedJobs     int
+		clientOnly        bool
+		ackGracePeriod    time.Duration
+		logger            pulse.Logger
 	}
 )
 
@@ -28,14 +26,6 @@ type (
 func WithWorkerTTL(ttl time.Duration) NodeOption {
 	return func(o *nodeOptions) {
 		o.workerTTL = ttl
-	}
-}
-
-// WithPendingJobTTL sets the duration after which a job is made available to
-// other workers if it wasn't started. The default is 20s.
-func WithPendingJobTTL(ttl time.Duration) NodeOption {
-	return func(o *nodeOptions) {
-		o.pendingJobTTL = ttl
 	}
 }
 
@@ -61,14 +51,6 @@ func WithMaxQueuedJobs(max int) NodeOption {
 func WithClientOnly() NodeOption {
 	return func(o *nodeOptions) {
 		o.clientOnly = true
-	}
-}
-
-// WithJobSinkBlockDuration sets the duration to block when reading from the
-// job stream. The default is 5s. This option is mostly useful for testing.
-func WithJobSinkBlockDuration(d time.Duration) NodeOption {
-	return func(o *nodeOptions) {
-		o.jobSinkBlockDuration = d
 	}
 }
 
@@ -100,12 +82,10 @@ func parseOptions(opts ...NodeOption) *nodeOptions {
 // defaultPoolOptions returns the default options.
 func defaultPoolOptions() *nodeOptions {
 	return &nodeOptions{
-		workerTTL:            10 * time.Second,
-		pendingJobTTL:        20 * time.Second,
-		workerShutdownTTL:    2 * time.Minute,
-		maxQueuedJobs:        1000,
-		jobSinkBlockDuration: 5 * time.Second,
-		ackGracePeriod:       20 * time.Second,
-		logger:               pulse.NoopLogger(),
+		workerTTL:         30 * time.Second,
+		workerShutdownTTL: 2 * time.Minute,
+		maxQueuedJobs:     1000,
+		ackGracePeriod:    20 * time.Second,
+		logger:            pulse.NoopLogger(),
 	}
 }
