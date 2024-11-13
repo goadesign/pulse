@@ -11,12 +11,13 @@ type (
 	NodeOption func(*nodeOptions)
 
 	nodeOptions struct {
-		workerTTL         time.Duration
-		workerShutdownTTL time.Duration
-		maxQueuedJobs     int
-		clientOnly        bool
-		ackGracePeriod    time.Duration
-		logger            pulse.Logger
+		workerTTL            time.Duration
+		workerShutdownTTL    time.Duration
+		maxQueuedJobs        int
+		clientOnly           bool
+		jobSinkBlockDuration time.Duration
+		ackGracePeriod       time.Duration
+		logger               pulse.Logger
 	}
 )
 
@@ -34,6 +35,14 @@ func WithWorkerTTL(ttl time.Duration) NodeOption {
 func WithWorkerShutdownTTL(ttl time.Duration) NodeOption {
 	return func(o *nodeOptions) {
 		o.workerShutdownTTL = ttl
+	}
+}
+
+// WithJobSinkBlockDuration sets the duration to block when reading from the
+// job stream. The default is 5s. This option is mostly useful for testing.
+func WithJobSinkBlockDuration(d time.Duration) NodeOption {
+	return func(o *nodeOptions) {
+		o.jobSinkBlockDuration = d
 	}
 }
 
@@ -82,10 +91,11 @@ func parseOptions(opts ...NodeOption) *nodeOptions {
 // defaultPoolOptions returns the default options.
 func defaultPoolOptions() *nodeOptions {
 	return &nodeOptions{
-		workerTTL:         30 * time.Second,
-		workerShutdownTTL: 2 * time.Minute,
-		maxQueuedJobs:     1000,
-		ackGracePeriod:    20 * time.Second,
-		logger:            pulse.NoopLogger(),
+		workerTTL:            30 * time.Second,
+		workerShutdownTTL:    2 * time.Minute,
+		jobSinkBlockDuration: 5 * time.Second,
+		maxQueuedJobs:        1000,
+		ackGracePeriod:       20 * time.Second,
+		logger:               pulse.NoopLogger(),
 	}
 }
