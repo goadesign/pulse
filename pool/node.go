@@ -84,9 +84,6 @@ const (
 	evDispatchReturn string = "d"
 )
 
-// jobSinkBlockDuration is the max duration to block when reading from the job stream.
-var jobSinkBlockDuration = 5 * time.Second
-
 // pendingEventTTL is the TTL for pending events.
 var pendingEventTTL = 2 * time.Minute
 
@@ -160,7 +157,7 @@ func AddNode(ctx context.Context, poolName string, rdb *redis.Client, opts ...No
 			return nil, fmt.Errorf("AddNode: failed to join pool ticker replicated map %q: %w", tickerMapName(poolName), err)
 		}
 		poolSink, err = poolStream.NewSink(ctx, "events",
-			soptions.WithSinkBlockDuration(jobSinkBlockDuration),
+			soptions.WithSinkBlockDuration(o.jobSinkBlockDuration),
 			soptions.WithSinkAckGracePeriod(o.ackGracePeriod))
 		if err != nil {
 			return nil, fmt.Errorf("AddNode: failed to create events sink for stream %q: %w", poolStreamName(poolName), err)
@@ -170,7 +167,7 @@ func AddNode(ctx context.Context, poolName string, rdb *redis.Client, opts ...No
 	if err != nil {
 		return nil, fmt.Errorf("AddNode: failed to create node event stream %q: %w", nodeStreamName(poolName, nodeID), err)
 	}
-	nodeReader, err = nodeStream.NewReader(ctx, soptions.WithReaderBlockDuration(jobSinkBlockDuration), soptions.WithReaderStartAtOldest())
+	nodeReader, err = nodeStream.NewReader(ctx, soptions.WithReaderBlockDuration(o.jobSinkBlockDuration), soptions.WithReaderStartAtOldest())
 	if err != nil {
 		return nil, fmt.Errorf("AddNode: failed to create node event reader for stream %q: %w", nodeStreamName(poolName, nodeID), err)
 	}
