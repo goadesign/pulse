@@ -256,6 +256,7 @@ func (w *Worker) startJob(ctx context.Context, job *Job) error {
 	}
 	job.Worker = w
 	if err := w.handler.Start(job); err != nil {
+		w.logger.Debug("handler failed to start job", "job", job.Key, "error", err)
 		if _, _, err := w.jobsMap.RemoveValues(ctx, w.ID, job.Key); err != nil {
 			w.logger.Error(fmt.Errorf("start failure handling: failed to remove job %q from jobs map: %w", job.Key, err))
 		}

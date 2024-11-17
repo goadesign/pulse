@@ -163,8 +163,6 @@ func TestJobPayload(t *testing.T) {
 			// Check if job payload is correct
 			assert.Eventually(t, func() bool {
 				payload, ok := node.JobPayload(tt.key)
-				fmt.Println(payload, ok)
-				fmt.Println(tt.payload)
 				return ok && assert.Equal(t, tt.payload, payload)
 			}, max, delay, fmt.Sprintf("Failed to get correct payload for job %s", tt.key))
 		})
