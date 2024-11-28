@@ -278,6 +278,7 @@ func (w *Worker) stopJob(ctx context.Context, key string, forRequeue bool) error
 	if err := w.handler.Stop(key); err != nil {
 		return fmt.Errorf("failed to stop job %q: %w", key, err)
 	}
+	w.logger.Debug("stopped job", "job", key)
 	w.jobs.Delete(key)
 	if _, _, err := w.jobsMap.RemoveValues(ctx, w.ID, key); err != nil {
 		w.logger.Error(fmt.Errorf("stop job: failed to remove job %q from jobs map: %w", key, err))
@@ -375,6 +376,7 @@ func (w *Worker) rebalance(ctx context.Context, activeWorkers []string) {
 			w.logger.Error(fmt.Errorf("rebalance: failed to stop job: %w", err), "job", key)
 			continue
 		}
+		w.logger.Debug("stopped job", "job", key)
 		w.jobs.Delete(key)
 		cherr, err := w.Node.requeueJob(ctx, w.ID, job)
 		if err != nil {
@@ -414,8 +416,8 @@ func (w *Worker) requeueJobs(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("requeueJobs: failed to mark worker as inactive: %w", err)
 	}
-	if prev == "-" || prev == "" {
-		w.logger.Debug("requeueJobs: worker already marked as inactive, skipping requeue")
+	if prev == "-" {
+		w.logger.Debug("requeueJobs: jobs already requeued, skipping requeue")
 		return nil
 	}
 
@@ -446,28 +448,24 @@ func (w *Worker) attemptRequeue(ctx context.Context, jobsToRequeue map[string]*J
 		err error
 	}
 	resultChan := make(chan result, len(jobsToRequeue))
+	defer close(resultChan)
 
+	wg.Add(len(jobsToRequeue))
 	for key, job := range jobsToRequeue {
-		wg.Add(1)
-		go func(k string, j *Job) {
+		pulse.Go(ctx, func() {
 			defer wg.Done()
-			err := w.requeueJob(ctx, j)
-			resultChan <- result{key: k, err: err}
-		}(key, job)
+			w.logger.Debug("requeueJobs: requeuing", "job", key)
+			err := w.requeueJob(ctx, job)
+			w.logger.Debug("requeueJobs: requeued", "job", key, "error", err)
+			resultChan <- result{key: key, err: err}
+		})
 	}
-
-	go func() {
-		wg.Wait()
-		close(resultChan)
-	}()
+	wg.Wait()
 
 	remainingJobs := make(map[string]*Job)
 	for {
 		select {
-		case res, ok := <-resultChan:
-			if !ok {
-				return remainingJobs
-			}
+		case res := <-resultChan:
 			if res.err != nil {
 				w.logger.Error(fmt.Errorf("requeueJobs: failed to requeue job %q: %w", res.key, res.err))
 				remainingJobs[res.key] = jobsToRequeue[res.key]
@@ -475,6 +473,10 @@ func (w *Worker) attemptRequeue(ctx context.Context, jobsToRequeue map[string]*J
 			}
 			delete(remainingJobs, res.key)
 			w.logger.Info("requeued", "job", res.key)
+			if len(remainingJobs) == 0 {
+				w.logger.Debug("requeueJobs: all jobs requeued")
+				return remainingJobs
+			}
 		case <-time.After(w.workerTTL):
 			w.logger.Error(fmt.Errorf("requeueJobs: timeout reached, some jobs may not have been processed"))
 			return remainingJobs
