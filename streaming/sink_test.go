@@ -86,7 +86,7 @@ func TestReadSinceLastEvent(t *testing.T) {
 		options.WithSinkStartAfter(eventID),
 		options.WithSinkBlockDuration(testBlockDuration))
 	require.NoError(t, err)
-	defer sink2.Close()
+	defer cleanupSink(t, ctx, s, sink2)
 	c2 := sink2.Subscribe()
 	read = readOneEvent(t, ctx, c2, sink2)
 	assert.Equal(t, "event", read.EventName)
@@ -97,7 +97,7 @@ func TestReadSinceLastEvent(t *testing.T) {
 		options.WithSinkStartAfter("0"),
 		options.WithSinkBlockDuration(testBlockDuration))
 	require.NoError(t, err)
-	defer sink3.Close()
+	defer cleanupSink(t, ctx, s, sink3)
 	c3 := sink3.Subscribe()
 	read = readOneEvent(t, ctx, c3, sink3)
 	assert.Equal(t, "event", read.EventName)
@@ -128,7 +128,7 @@ func TestCleanup(t *testing.T) {
 	assert.Equal(t, []byte("payload"), read.Payload)
 
 	// Stop sink, destroy stream and check Redis keys are gone
-	sink.Close()
+	sink.Close(ctx)
 	assert.Eventually(t, func() bool { return sink.IsClosed() }, max, delay)
 	assert.Equal(t, rdb.Exists(ctx, s.key).Val(), int64(1))
 	assert.NoError(t, s.Destroy(ctx))
@@ -245,7 +245,7 @@ func TestMultipleConsumers(t *testing.T) {
 		options.WithSinkAckGracePeriod(testAckDuration))
 	require.NoError(t, err)
 	defer func() {
-		sink2.Close()
+		sink2.Close(ctx)
 		assert.Eventually(t, func() bool { return sink2.IsClosed() }, max, delay)
 	}()
 
@@ -355,7 +355,7 @@ func TestNonAckMessageDeliveredToAnotherConsumer(t *testing.T) {
 		options.WithSinkBlockDuration(testBlockDuration),
 		options.WithSinkAckGracePeriod(testAckDuration))
 	require.NoError(t, err)
-	defer sink2.Close()
+	defer sink2.Close(ctx)
 
 	// Subscribe to both sinks
 	c1 := sink1.Subscribe()
@@ -387,7 +387,7 @@ func TestNonAckMessageDeliveredToAnotherConsumer(t *testing.T) {
 	assert.Equal(t, []byte("test_payload"), read1.Payload)
 
 	// Close the receiver sink
-	receiverSink.Close()
+	receiverSink.Close(ctx)
 	assert.Eventually(t, func() bool { return receiverSink.IsClosed() }, max, delay)
 
 	// The message should now be redelivered to the other sink
@@ -461,7 +461,7 @@ func TestStaleConsumerDeletionAndMessageClaiming(t *testing.T) {
 	}, max, delay, "Expected two consumers")
 
 	// Close the sink to stop keep-alive refresh
-	sink1.Close()
+	sink1.Close(ctx)
 	assert.Eventually(t, func() bool { return sink1.IsClosed() }, max, delay)
 
 	// Verify that the stale consumer is deleted

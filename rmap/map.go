@@ -406,7 +406,8 @@ func (sm *Map) TestAndDelete(ctx context.Context, key, test string) (string, err
 	return prev.(string), nil
 }
 
-// Reset clears the map content.
+// Reset clears the map content. Reset is the only method that can be called
+// after the map is closed.
 func (sm *Map) Reset(ctx context.Context) error {
 	_, err := sm.runLuaScript(ctx, "reset", sm.resetScript, "*")
 	return err
@@ -544,7 +545,7 @@ func (sm *Map) run() {
 			sm.lock.Unlock()
 
 		case <-sm.done:
-			sm.logger.Info("stopped")
+			sm.logger.Info("closed")
 			// no need to lock, stopping is true
 			for _, c := range sm.chans {
 				close(c)
@@ -565,7 +566,7 @@ func (sm *Map) run() {
 // It is the caller's responsibility to make sure the map is locked.
 func (sm *Map) runLuaScript(ctx context.Context, name string, script *redis.Script, args ...any) (any, error) {
 	sm.lock.RLock()
-	if sm.closing {
+	if sm.closing && name != "reset" {
 		sm.lock.RUnlock()
 		return "", fmt.Errorf("pulse map: %s is stopped", sm.Name)
 	}

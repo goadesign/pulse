@@ -160,7 +160,9 @@ func TestMapLocal(t *testing.T) {
 	old, err = m.Delete(ctx, key)
 	assert.Error(t, err)
 	assert.Equal(t, "", old)
-	assert.Error(t, m.Reset(ctx))
+
+	// Reset should work after the map is closed
+	assert.NoError(t, m.Reset(ctx))
 
 	// Cleanup
 	m, err = Join(ctx, "test", rdb)
@@ -430,7 +432,7 @@ func TestLogs(t *testing.T) {
 	assert.Contains(t, buf.String(), `key=foo val=bar`)
 	assert.Contains(t, buf.String(), `msg=deleted key=foo`)
 	assert.Contains(t, buf.String(), `reset`)
-	assert.Contains(t, buf.String(), `stopped`)
+	assert.Contains(t, buf.String(), `closed`)
 }
 
 func TestJoinErrors(t *testing.T) {

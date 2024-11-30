@@ -3,7 +3,9 @@ package pool
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -561,6 +563,146 @@ func TestStaleEventsAreRemoved(t *testing.T) {
 		_, ok := node.pendingEvents.Load(pendingEventKey("worker", freshEventID))
 		return ok
 	}, max, delay, "Fresh event should still be present")
+}
+
+func TestStaleNodeStreamCleanup(t *testing.T) {
+	var (
+		ctx      = ptesting.NewTestContext(t)
+		testName = strings.Replace(t.Name(), "/", "_", -1)
+		rdb      = ptesting.NewRedisClient(t)
+		node1    = newTestNode(t, ctx, rdb, testName)
+		node2    = newTestNode(t, ctx, rdb, testName)
+		numJobs  = 0
+	)
+	defer ptesting.CleanupRedis(t, rdb, false, testName)
+
+	// Configure nodes to send jobs to specific workers
+	node1.h = &ptesting.Hasher{IndexFunc: func(key string, numBuckets int64) int64 {
+		numJobs++
+		if numJobs > 2 {
+			return 0 // to avoid panics on cleanup where jobs get requeued
+		}
+		if key == "job1" {
+			return 0 // job1 goes to worker1
+		}
+		return 1 // job2 goes to worker2
+	}}
+	node2.h = node1.h
+
+	// Create workers and dispatch jobs to both nodes to ensure streams exist
+	newTestWorker(t, ctx, node1)
+	newTestWorker(t, ctx, node2)
+
+	// Make sure workers are registered with both nodes
+	require.Eventually(t, func() bool {
+		return len(node1.PoolWorkers()) == 2 && len(node2.PoolWorkers()) == 2
+	}, max, delay, "Workers were not registered with both nodes")
+
+	// Dispatch jobs to both nodes
+	assert.NoError(t, node1.DispatchJob(ctx, "job1", []byte("payload1")))
+	assert.NoError(t, node2.DispatchJob(ctx, "job2", []byte("payload2")))
+
+	// Verify both streams exist initially
+	name1 := "pulse:stream:" + nodeStreamName(node1.PoolName, node1.ID)
+	name2 := "pulse:stream:" + nodeStreamName(node2.PoolName, node2.ID)
+	assert.Eventually(t, func() bool {
+		exists1, err1 := rdb.Exists(ctx, name1).Result()
+		exists2, err2 := rdb.Exists(ctx, name2).Result()
+		return err1 == nil && err2 == nil && exists1 == 1 && exists2 == 1
+	}, max, delay, "Node streams should exist initially")
+
+	// Set node2's last seen time to a stale value
+	close(node2.stop)
+	_, err := node2.nodeKeepAliveMap.Set(ctx, node2.ID,
+		strconv.FormatInt(time.Now().Add(-3*node2.workerTTL).UnixNano(), 10))
+	assert.NoError(t, err)
+	node2.wg.Wait()
+	node2.stop = make(chan struct{}) // so we can close
+
+	// Verify node2's stream gets cleaned up
+	assert.Eventually(t, func() bool {
+		exists, err := rdb.Exists(ctx, name2).Result()
+		return err == nil && exists == 0
+	}, max, delay, "Stale node stream should have been cleaned up")
+
+	// Verify node1's stream still exists
+	assert.Eventually(t, func() bool {
+		exists, err := rdb.Exists(ctx, name1).Result()
+		return err == nil && exists == 1
+	}, max, delay, "Active node stream should still exist")
+
+	// Verify node2 was removed from keep-alive map
+	assert.Eventually(t, func() bool {
+		_, exists := node1.nodeKeepAliveMap.Get(node2.ID)
+		return !exists
+	}, max, delay, "Stale node should have been removed from keep-alive map")
+
+	// Clean up
+	assert.NoError(t, node2.Close(ctx))
+	assert.NoError(t, node1.Shutdown(ctx))
+}
+
+func TestShutdownStopsAllJobs(t *testing.T) {
+	testName := strings.Replace(t.Name(), "/", "_", -1)
+	ctx := ptesting.NewTestContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+
+	// Create node and workers
+	node := newTestNode(t, ctx, rdb, testName)
+	worker1 := newTestWorker(t, ctx, node)
+	worker2 := newTestWorker(t, ctx, node)
+
+	// Track stopped jobs
+	var stoppedJobs sync.Map
+	stopHandler := func(key string) error {
+		stoppedJobs.Store(key, true)
+		return nil
+	}
+	worker1.handler.(*mockHandler).stopFunc = stopHandler
+	worker2.handler.(*mockHandler).stopFunc = stopHandler
+
+	// Dispatch multiple jobs
+	jobs := []struct {
+		key     string
+		payload []byte
+	}{
+		{key: "job1", payload: []byte("payload1")},
+		{key: "job2", payload: []byte("payload2")},
+		{key: "job3", payload: []byte("payload3")},
+		{key: "job4", payload: []byte("payload4")},
+	}
+
+	// Configure node to distribute jobs between workers
+	node.h = &ptesting.Hasher{IndexFunc: func(key string, numBuckets int64) int64 {
+		if strings.HasSuffix(key, "1") || strings.HasSuffix(key, "2") {
+			return 0 // jobs 1 and 2 go to worker1
+		}
+		return 1 // jobs 3 and 4 go to worker2
+	}}
+
+	// Dispatch all jobs
+	for _, job := range jobs {
+		require.NoError(t, node.DispatchJob(ctx, job.key, job.payload))
+	}
+
+	// Wait for jobs to be distributed
+	require.Eventually(t, func() bool {
+		return len(worker1.Jobs()) == 2 && len(worker2.Jobs()) == 2
+	}, max, delay, "Jobs were not distributed correctly")
+
+	// Shutdown the node
+	assert.NoError(t, node.Shutdown(ctx))
+
+	// Verify all jobs were stopped
+	for _, job := range jobs {
+		_, ok := stoppedJobs.Load(job.key)
+		assert.True(t, ok, "Job %s was not stopped during shutdown", job.key)
+	}
+
+	// Verify workers have no remaining jobs
+	assert.Empty(t, worker1.Jobs(), "Worker1 should have no remaining jobs")
+	assert.Empty(t, worker2.Jobs(), "Worker2 should have no remaining jobs")
 }
 
 type mockAcker struct {

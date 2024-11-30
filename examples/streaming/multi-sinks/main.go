@@ -54,7 +54,7 @@ func main() {
 	}
 
 	// Don't forget to close the sink when done
-	defer sink1.Close()
+	defer sink1.Close(ctx)
 
 	// Read and acknowlege event
 	ev := <-sink1.Subscribe()
@@ -70,7 +70,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	defer sink2.Close()
+	defer sink2.Close(ctx)
 
 	// Read second event
 	ev = <-sink2.Subscribe()

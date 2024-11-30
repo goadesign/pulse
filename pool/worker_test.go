@@ -33,7 +33,7 @@ func TestWorkerRequeueJobs(t *testing.T) {
 
 	// Emulate the worker failing by preventing it from refreshing its keepalive
 	// This means we can't cleanup cleanly, hence "false" in CleanupRedis
-	worker.stopAndWait(ctx)
+	worker.stop(ctx)
 
 	// Create a new worker to pick up the requeued job
 	newWorker := newTestWorker(t, ctx, node)
@@ -73,7 +73,7 @@ func TestStaleWorkerCleanupInNode(t *testing.T) {
 		staleWorkers[i] = newTestWorker(t, ctx, node)
 		staleWorkers[i].stop(ctx)
 		// Set the last seen time to a past time
-		_, err := node.keepAliveMap.Set(ctx, staleWorkers[i].ID, strconv.FormatInt(time.Now().Add(-2*node.workerTTL).UnixNano(), 10))
+		_, err := node.workerKeepAliveMap.Set(ctx, staleWorkers[i].ID, strconv.FormatInt(time.Now().Add(-2*node.workerTTL).UnixNano(), 10))
 		assert.NoError(t, err)
 	}
 
@@ -108,7 +108,7 @@ func TestStaleWorkerCleanupAcrossNodes(t *testing.T) {
 		staleWorkers[i] = newTestWorker(t, ctx, node2)
 		staleWorkers[i].stop(ctx)
 		// Set the last seen time to a past time
-		_, err := node2.keepAliveMap.Set(ctx, staleWorkers[i].ID, strconv.FormatInt(time.Now().Add(-2*node2.workerTTL).UnixNano(), 10))
+		_, err := node2.workerKeepAliveMap.Set(ctx, staleWorkers[i].ID, strconv.FormatInt(time.Now().Add(-2*node2.workerTTL).UnixNano(), 10))
 		assert.NoError(t, err)
 	}
 
