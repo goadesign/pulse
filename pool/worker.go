@@ -21,11 +21,10 @@ type (
 	Worker struct {
 		// Unique worker ID
 		ID string
-		// Worker pool node where worker is running.
-		Node *Node
 		// Time worker was created.
 		CreatedAt time.Time
 
+		node              *Node
 		handler           JobHandler
 		stream            *streaming.Stream
 		reader            *streaming.Reader
@@ -92,7 +91,7 @@ func newWorker(ctx context.Context, node *Node, h JobHandler) (*Worker, error) {
 		return nil, fmt.Errorf("failed to add worker %q to pool %q: %w", wid, node.PoolName, err)
 	}
 	now := strconv.FormatInt(time.Now().UnixNano(), 10)
-	if _, err := node.keepAliveMap.SetAndWait(ctx, wid, now); err != nil {
+	if _, err := node.workerKeepAliveMap.SetAndWait(ctx, wid, now); err != nil {
 		return nil, fmt.Errorf("failed to update worker keep-alive: %w", err)
 	}
 	stream, err := streaming.NewStream(workerStreamName(wid), node.rdb, soptions.WithStreamLogger(node.logger))
@@ -105,7 +104,7 @@ func newWorker(ctx context.Context, node *Node, h JobHandler) (*Worker, error) {
 	}
 	w := &Worker{
 		ID:                wid,
-		Node:              node,
+		node:              node,
 		handler:           h,
 		CreatedAt:         time.Now(),
 		stream:            stream,
@@ -113,7 +112,7 @@ func newWorker(ctx context.Context, node *Node, h JobHandler) (*Worker, error) {
 		done:              make(chan struct{}),
 		jobsMap:           node.jobsMap,
 		jobPayloadsMap:    node.jobPayloadsMap,
-		keepAliveMap:      node.keepAliveMap,
+		keepAliveMap:      node.workerKeepAliveMap,
 		shutdownMap:       node.shutdownMap,
 		workerTTL:         node.workerTTL,
 		workerShutdownTTL: node.workerShutdownTTL,
@@ -127,7 +126,7 @@ func newWorker(ctx context.Context, node *Node, h JobHandler) (*Worker, error) {
 		"worker_shutdown_ttl", w.workerShutdownTTL)
 
 	w.wg.Add(2)
-	pulse.Go(ctx, func() { w.handleEvents(reader.Subscribe()) })
+	pulse.Go(ctx, func() { w.handleEvents(ctx, reader.Subscribe()) })
 	pulse.Go(ctx, func() { w.keepAlive(ctx) })
 
 	return w, nil
@@ -152,7 +151,7 @@ func (w *Worker) Jobs() []*Job {
 			Key:       key,
 			Payload:   job.Payload,
 			CreatedAt: job.CreatedAt,
-			Worker:    &Worker{ID: w.ID, Node: w.Node, CreatedAt: w.CreatedAt},
+			Worker:    &Worker{ID: w.ID, node: w.node, CreatedAt: w.CreatedAt},
 			NodeID:    job.NodeID,
 		})
 	}
@@ -167,9 +166,9 @@ func (w *Worker) IsStopped() bool {
 }
 
 // handleEvents is the worker loop.
-func (w *Worker) handleEvents(c <-chan *streaming.Event) {
+func (w *Worker) handleEvents(ctx context.Context, c <-chan *streaming.Event) {
 	defer w.wg.Done()
-	ctx := context.Background()
+
 	for {
 		select {
 		case ev, ok := <-c:
@@ -201,14 +200,12 @@ func (w *Worker) handleEvents(c <-chan *streaming.Event) {
 			}
 			w.ackPoolEvent(ctx, nodeID, ev.ID, nil)
 		case <-w.done:
-			w.logger.Debug("handleEvents: exiting")
 			return
 		}
 	}
 }
 
-// stop stops the reader, the worker goroutines and removes the worker from the
-// workers and keep-alive maps.
+// stop stops the reader, destroys the stream and closes the worker.
 func (w *Worker) stop(ctx context.Context) {
 	w.lock.Lock()
 	if w.stopped {
@@ -222,23 +219,7 @@ func (w *Worker) stop(ctx context.Context) {
 		w.logger.Error(fmt.Errorf("failed to destroy stream for worker: %w", err))
 	}
 	close(w.done)
-}
-
-// stopAndWait stops the worker and waits for its goroutines to exit up to
-// w.workerShutdownTTL time.
-func (w *Worker) stopAndWait(ctx context.Context) {
-	w.stop(ctx)
-	c := make(chan struct{})
-	go func() {
-		w.wg.Wait()
-		close(c)
-	}()
-	select {
-	case <-c:
-		w.logger.Debug("stopAndWait: worker stopped")
-	case <-time.After(w.workerShutdownTTL):
-		w.logger.Error(fmt.Errorf("stop timeout"), "after", w.workerShutdownTTL)
-	}
+	w.wg.Wait()
 }
 
 // startJob starts a job.
@@ -278,6 +259,7 @@ func (w *Worker) stopJob(ctx context.Context, key string, forRequeue bool) error
 	if err := w.handler.Stop(key); err != nil {
 		return fmt.Errorf("failed to stop job %q: %w", key, err)
 	}
+	w.logger.Debug("stopped job", "job", key)
 	w.jobs.Delete(key)
 	if _, _, err := w.jobsMap.RemoveValues(ctx, w.ID, key); err != nil {
 		w.logger.Error(fmt.Errorf("stop job: failed to remove job %q from jobs map: %w", key, err))
@@ -312,7 +294,7 @@ func (w *Worker) ackPoolEvent(ctx context.Context, nodeID, eventID string, acker
 	stream, ok := w.nodeStreams.Load(nodeID)
 	if !ok {
 		var err error
-		stream, err = streaming.NewStream(nodeStreamName(w.Node.PoolName, nodeID), w.Node.rdb, soptions.WithStreamLogger(w.logger))
+		stream, err = streaming.NewStream(nodeStreamName(w.node.PoolName, nodeID), w.node.rdb, soptions.WithStreamLogger(w.logger))
 		if err != nil {
 			w.logger.Error(fmt.Errorf("failed to create stream for node %q: %w", nodeID, err))
 			return
@@ -332,21 +314,20 @@ func (w *Worker) ackPoolEvent(ctx context.Context, nodeID, eventID string, acker
 // keepAlive keeps the worker registration up-to-date until ctx is cancelled.
 func (w *Worker) keepAlive(ctx context.Context) {
 	defer w.wg.Done()
+
 	ticker := time.NewTicker(w.workerTTL / 2)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
 			if w.IsStopped() {
-				// Let's not recreate the map if we just deleted it
-				return
+				return // Let's not recreate the map if we just deleted it
 			}
 			now := strconv.FormatInt(time.Now().UnixNano(), 10)
 			if _, err := w.keepAliveMap.Set(ctx, w.ID, now); err != nil {
 				w.logger.Error(fmt.Errorf("failed to update worker keep-alive: %w", err))
 			}
 		case <-w.done:
-			w.logger.Debug("keepAlive: exiting")
 			return
 		}
 	}
@@ -358,7 +339,7 @@ func (w *Worker) rebalance(ctx context.Context, activeWorkers []string) {
 	rebalanced := make(map[string]*Job)
 	w.jobs.Range(func(key, value any) bool {
 		job := value.(*Job)
-		wid := activeWorkers[w.Node.h.Hash(job.Key, int64(len(activeWorkers)))]
+		wid := activeWorkers[w.node.h.Hash(job.Key, int64(len(activeWorkers)))]
 		if wid != w.ID {
 			rebalanced[job.Key] = job
 		}
@@ -375,8 +356,9 @@ func (w *Worker) rebalance(ctx context.Context, activeWorkers []string) {
 			w.logger.Error(fmt.Errorf("rebalance: failed to stop job: %w", err), "job", key)
 			continue
 		}
+		w.logger.Debug("stopped job", "job", key)
 		w.jobs.Delete(key)
-		cherr, err := w.Node.requeueJob(ctx, w.ID, job)
+		cherr, err := w.node.requeueJob(ctx, w.ID, job)
 		if err != nil {
 			w.logger.Error(fmt.Errorf("rebalance: failed to requeue job: %w", err), "job", key)
 			if err := w.handler.Start(job); err != nil {
@@ -387,7 +369,7 @@ func (w *Worker) rebalance(ctx context.Context, activeWorkers []string) {
 		delete(rebalanced, key)
 		cherrs[key] = cherr
 	}
-	go w.Node.processRequeuedJobs(ctx, w.ID, cherrs, false)
+	pulse.Go(ctx, func() { w.node.processRequeuedJobs(ctx, w.ID, cherrs, false) })
 }
 
 // requeueJobs requeues the jobs handled by the worker.
@@ -410,12 +392,12 @@ func (w *Worker) requeueJobs(ctx context.Context) error {
 
 	// First mark the worker as inactive so that requeued jobs are not assigned to this worker
 	// Use optimistic locking to avoid race conditions.
-	prev, err := w.Node.workerMap.TestAndSet(ctx, w.ID, createdAt, "-")
+	prev, err := w.node.workerMap.TestAndSet(ctx, w.ID, createdAt, "-")
 	if err != nil {
 		return fmt.Errorf("requeueJobs: failed to mark worker as inactive: %w", err)
 	}
-	if prev == "-" || prev == "" {
-		w.logger.Debug("requeueJobs: worker already marked as inactive, skipping requeue")
+	if prev == "-" {
+		w.logger.Debug("requeueJobs: jobs already requeued, skipping requeue")
 		return nil
 	}
 
@@ -446,28 +428,27 @@ func (w *Worker) attemptRequeue(ctx context.Context, jobsToRequeue map[string]*J
 		err error
 	}
 	resultChan := make(chan result, len(jobsToRequeue))
+	defer close(resultChan)
 
+	wg.Add(len(jobsToRequeue))
 	for key, job := range jobsToRequeue {
-		wg.Add(1)
-		go func(k string, j *Job) {
+		pulse.Go(ctx, func() {
 			defer wg.Done()
-			err := w.requeueJob(ctx, j)
-			resultChan <- result{key: k, err: err}
-		}(key, job)
+			err := w.requeueJob(ctx, job)
+			if err != nil {
+				w.logger.Error(fmt.Errorf("failed to requeue job: %w", err), "job", key)
+			} else {
+				w.logger.Debug("requeueJobs: requeued", "job", key)
+			}
+			resultChan <- result{key: key, err: err}
+		})
 	}
-
-	go func() {
-		wg.Wait()
-		close(resultChan)
-	}()
+	wg.Wait()
 
 	remainingJobs := make(map[string]*Job)
 	for {
 		select {
-		case res, ok := <-resultChan:
-			if !ok {
-				return remainingJobs
-			}
+		case res := <-resultChan:
 			if res.err != nil {
 				w.logger.Error(fmt.Errorf("requeueJobs: failed to requeue job %q: %w", res.key, res.err))
 				remainingJobs[res.key] = jobsToRequeue[res.key]
@@ -475,7 +456,11 @@ func (w *Worker) attemptRequeue(ctx context.Context, jobsToRequeue map[string]*J
 			}
 			delete(remainingJobs, res.key)
 			w.logger.Info("requeued", "job", res.key)
-		case <-time.After(w.workerTTL):
+			if len(remainingJobs) == 0 {
+				w.logger.Debug("requeueJobs: all jobs requeued")
+				return remainingJobs
+			}
+		case <-time.After(w.workerShutdownTTL):
 			w.logger.Error(fmt.Errorf("requeueJobs: timeout reached, some jobs may not have been processed"))
 			return remainingJobs
 		}
@@ -484,29 +469,15 @@ func (w *Worker) attemptRequeue(ctx context.Context, jobsToRequeue map[string]*J
 
 // requeueJob requeues a job.
 func (w *Worker) requeueJob(ctx context.Context, job *Job) error {
-	eventID, err := w.Node.poolStream.Add(ctx, evStartJob, marshalJob(job))
+	eventID, err := w.node.poolStream.Add(ctx, evStartJob, marshalJob(job))
 	if err != nil {
 		return fmt.Errorf("requeueJob: failed to add job to pool stream: %w", err)
 	}
-	w.Node.pendingJobs.Store(eventID, nil)
+	w.node.pendingJobs.Store(eventID, nil)
 	if err := w.stopJob(ctx, job.Key, true); err != nil {
 		return fmt.Errorf("failed to stop job: %w", err)
 	}
 	return nil
-}
-
-// cleanup removes the worker from the workers, keep-alive and jobs maps.
-func (w *Worker) cleanup(ctx context.Context) {
-	if _, err := w.Node.workerMap.Delete(ctx, w.ID); err != nil {
-		w.logger.Error(fmt.Errorf("failed to remove worker from worker map: %w", err))
-	}
-	if _, err := w.keepAliveMap.Delete(ctx, w.ID); err != nil {
-		w.logger.Error(fmt.Errorf("failed to remove worker from keep alive map: %w", err))
-	}
-	_, err := w.jobsMap.Delete(ctx, w.ID)
-	if err != nil {
-		w.logger.Error(fmt.Errorf("failed to remove worker from jobs map: %w", err))
-	}
 }
 
 // workerStreamName returns the name of the stream used to communicate with the

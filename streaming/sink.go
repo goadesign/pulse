@@ -266,6 +266,15 @@ func (s *Sink) RemoveStream(ctx context.Context, stream *Stream) error {
 		s.streamCursors[i] = stream.key
 		s.streamCursors[len(s.streams)+i] = ">"
 	}
+	if err := s.removeStreamConsumer(ctx, stream); err != nil {
+		return err
+	}
+	s.logger.Info("removed", "stream", stream.Name)
+	return nil
+}
+
+// removeStreamConsumer removes the stream consumer from the sink.
+func (s *Sink) removeStreamConsumer(ctx context.Context, stream *Stream) error {
 	remains, _, err := s.consumersMap[stream.Name].RemoveValues(ctx, s.Name, s.consumer)
 	if err != nil {
 		return fmt.Errorf("failed to remove consumer %s from replicated map for stream %s: %w", s.consumer, stream.Name, err)
@@ -275,13 +284,12 @@ func (s *Sink) RemoveStream(ctx context.Context, stream *Stream) error {
 			return err
 		}
 	}
-	s.logger.Info("removed", "stream", stream.Name)
 	return nil
 }
 
 // Close stops event polling, waits for all events to be processed, and closes the sink channel.
 // It is safe to call Close multiple times.
-func (s *Sink) Close() {
+func (s *Sink) Close(ctx context.Context) {
 	s.lock.Lock()
 	if s.closing {
 		s.lock.Unlock()

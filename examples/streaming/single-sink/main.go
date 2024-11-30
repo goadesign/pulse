@@ -45,7 +45,7 @@ func main() {
 	}
 
 	// Don't forget to close the sink when done
-	defer sink.Close()
+	defer sink.Close(ctx)
 
 	// Consume event
 	ev := <-sink.Subscribe()

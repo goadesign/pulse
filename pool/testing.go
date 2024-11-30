@@ -26,7 +26,7 @@ type mockHandlerWithoutNotify struct {
 const (
 	testWorkerShutdownTTL    = 100 * time.Millisecond
 	testJobSinkBlockDuration = 100 * time.Millisecond
-	testWorkerTTL            = 100 * time.Millisecond
+	testWorkerTTL            = 150 * time.Millisecond
 	testAckGracePeriod       = 50 * time.Millisecond
 )
 

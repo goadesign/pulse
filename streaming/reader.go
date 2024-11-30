@@ -272,6 +272,7 @@ func (r *Reader) cleanup() {
 	for _, c := range r.chans {
 		close(c)
 	}
+	r.chans = nil
 	r.wait.Done()
 }
 

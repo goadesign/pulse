@@ -3,6 +3,7 @@ package testing
 import (
 	"context"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -40,8 +41,12 @@ func CleanupRedis(t *testing.T, rdb *redis.Client, checkClean bool, testName str
 		require.NoError(t, err)
 		var filtered []string
 		for _, k := range keys {
-			// Sinks content gets reused, so ignore it
 			if strings.HasSuffix(k, ":sinks:content") {
+				// Sinks content is cleaned up asynchronously, so ignore it
+				continue
+			}
+			if regexp.MustCompile(`^pulse:stream:[^:]+:node:.*`).MatchString(k) {
+				// Node streams are cleaned up asynchronously, so ignore them
 				continue
 			}
 			if strings.Contains(k, testName) {

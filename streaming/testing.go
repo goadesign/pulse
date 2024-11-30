@@ -64,7 +64,7 @@ func readOneReaderEvent(t *testing.T, c <-chan *Event) *Event {
 func cleanupSink(t *testing.T, ctx context.Context, s *Stream, sink *Sink) {
 	t.Helper()
 	if sink != nil {
-		sink.Close()
+		sink.Close(ctx)
 		assert.Eventually(t, func() bool { return sink.IsClosed() }, max, delay)
 	}
 	if s != nil {
