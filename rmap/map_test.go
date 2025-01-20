@@ -132,8 +132,40 @@ func TestMapLocal(t *testing.T) {
 		assert.Empty(t, v)
 	}
 
+	// Cleanup
+	cleanup(t, m)
+}
+
+func TestReadAfterClose(t *testing.T) {
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: redisPwd,
+	})
+	var buf Buffer
+	ctx := context.Background()
+	ctx = log.Context(ctx, log.WithOutput(&buf))
+	log.FlushAndDisableBuffering(ctx)
+
+	// Join or create a replicated map
+	m, err := Join(ctx, "test", rdb)
+	if err != nil {
+		if strings.Contains(err.Error(), "WRONGPASS") {
+			t.Fatal("Unexpected Redis password error (did you set REDIS_PASSWORD?)")
+		} else if strings.Contains(err.Error(), "connection refused") {
+			t.Fatal("Unexpected Redis connection error (is Redis running?)")
+		}
+	}
+	assert.NoError(t, err)
+	assert.NotNil(t, m)
+	assert.NoError(t, m.Reset(ctx))
+
+	// Validate initial state
+	assert.Eventually(t, func() bool { return len(m.Map()) == 0 }, wf, tck)
+	assert.Empty(t, m.Keys())
+
 	// Write a value and close the map
-	old, err = m.Set(ctx, key, val)
+	const key, val = "foo", "bar"
+	old, err := m.Set(ctx, key, val)
 	assert.NoError(t, err)
 	assert.Equal(t, "", old)
 	assert.Eventually(t, func() bool { return len(m.Map()) == 1 }, wf, tck)
@@ -149,7 +181,7 @@ func TestMapLocal(t *testing.T) {
 	assert.Equal(t, val, m.Map()[key])
 	require.Len(t, m.Keys(), 1)
 	assert.Equal(t, key, m.Keys()[0])
-	v, ok = m.Get(key)
+	v, ok := m.Get(key)
 	assert.True(t, ok)
 	assert.Equal(t, val, v)
 
@@ -167,6 +199,26 @@ func TestMapLocal(t *testing.T) {
 	// Cleanup
 	m, err = Join(ctx, "test", rdb)
 	require.NoError(t, err)
+	cleanup(t, m)
+}
+
+func TestWriteEmptyString(t *testing.T) {
+	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+	ctx := context.Background()
+	m, err := Join(ctx, "test", rdb)
+	require.NoError(t, err)
+	defer cleanup(t, m)
+
+	const key = "foo"
+	old, err := m.Set(ctx, key, "")
+	assert.NoError(t, err)
+	assert.Equal(t, "", old)
+
+	var read string
+	var ok bool
+	assert.Eventually(t, func() bool { read, ok = m.Get(key); return ok }, wf, tck)
+	assert.Equal(t, "", read)
+
 	cleanup(t, m)
 }
 

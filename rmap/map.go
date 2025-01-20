@@ -53,8 +53,10 @@ type (
 )
 
 const (
-	// EventChange is the event emitted when a key is added, changed or deleted.
+	// EventChange is the event emitted when a key is added or changed.
 	EventChange EventKind = iota + 1
+	// EventDelete is the event emitted when a key is deleted.
+	EventDelete
 	// EventReset is the event emitted when the map is reset.
 	EventReset
 )
@@ -512,25 +514,35 @@ func (sm *Map) run() {
 				sm.reconnect()
 				continue
 			}
-			parts := strings.SplitN(msg.Payload, "=", 2)
-			if len(parts) != 2 {
+			parts := strings.SplitN(msg.Payload, ":", 3)
+			if len(parts) < 2 {
 				sm.logger.Error(fmt.Errorf("invalid payload"), "payload", msg.Payload)
 				continue
 			}
-			key, val := parts[0], parts[1]
+			op, key := parts[0], parts[1]
 			sm.lock.Lock()
 			kind := EventChange
-			switch {
-			case key == "*":
+			switch op {
+			case "reset":
 				sm.content = make(map[string]string)
 				sm.logger.Debug("reset")
 				kind = EventReset
-			case val == "":
+			case "del":
 				delete(sm.content, key)
 				sm.logger.Debug("deleted", "key", key)
+				kind = EventDelete
+			case "set":
+				if len(parts) != 3 {
+					sm.logger.Error(fmt.Errorf("invalid set payload"), "payload", msg.Payload)
+					sm.lock.Unlock()
+					continue
+				}
+				sm.content[key] = parts[2]
+				sm.logger.Debug("set", "key", key, "val", parts[2])
 			default:
-				sm.content[key] = val
-				sm.logger.Debug("set", "key", key, "val", val)
+				sm.logger.Error(fmt.Errorf("unknown operation"), "op", op)
+				sm.lock.Unlock()
+				continue
 			}
 			select {
 			case sm.ichan <- struct{}{}:

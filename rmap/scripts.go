@@ -13,7 +13,7 @@ var (
 
 	   -- Set the updated value in the hash and publish the change
 	   redis.call("HSET", KEYS[1], ARGV[1], v)
-	   redis.call("PUBLISH", KEYS[2], ARGV[1] .. "=" .. v)
+	   redis.call("PUBLISH", KEYS[2], "set:" .. ARGV[1] .. ":" .. v)
 
 	   return v
 	`)
@@ -53,7 +53,7 @@ var (
 	  -- If changes were made, update the hash and publish the event
 	  if changed then
 	    redis.call("HSET", KEYS[1], ARGV[1], v)
-	    redis.call("PUBLISH", KEYS[2], ARGV[1] .. "=" .. v)
+	    redis.call("PUBLISH", KEYS[2], "set:" .. ARGV[1] .. ":" .. v)
 	  end
 
 	  return v
@@ -64,7 +64,7 @@ var (
 	luaDelete = redis.NewScript(`
 	   local v = redis.call("HGET", KEYS[1], ARGV[1])
 	   redis.call("HDEL", KEYS[1], ARGV[1])
-	   redis.call("PUBLISH", KEYS[2], ARGV[1].."=")
+	   redis.call("PUBLISH", KEYS[2], "del:" .. ARGV[1])
 	   return v
 	`)
 
@@ -72,7 +72,7 @@ var (
 	luaIncr = redis.NewScript(`
 	   redis.call("HINCRBY", KEYS[1], ARGV[1], ARGV[2])
 	   local v = redis.call("HGET", KEYS[1], ARGV[1])
-	   redis.call("PUBLISH", KEYS[2], ARGV[1].."="..v)
+	   redis.call("PUBLISH", KEYS[2], "set:" .. ARGV[1] .. ":" .. v)
 	   return v
 	`)
 
@@ -106,14 +106,13 @@ var (
 	      -- Update the hash or delete the key if empty
 	      if #newValues == 0 then
 	         redis.call("HDEL", KEYS[1], ARGV[1])
+	         redis.call("PUBLISH", KEYS[2], "del:" .. ARGV[1])
 	         v = ""
 	      else
 	         v = table.concat(newValues, ",")
 	         redis.call("HSET", KEYS[1], ARGV[1], v)
+	         redis.call("PUBLISH", KEYS[2], "set:" .. ARGV[1] .. ":" .. v)
 	      end
-
-	      -- Publish the result
-	      redis.call("PUBLISH", KEYS[2], ARGV[1] .. "=" .. v)
 	   end
 
 	   return {v, removed}
@@ -122,7 +121,7 @@ var (
 	// luaReset is the Lua script used to reset the map.
 	luaReset = redis.NewScript(`
 	   redis.call("DEL", KEYS[1])
-	   redis.call("PUBLISH", KEYS[2], "*=")
+	   redis.call("PUBLISH", KEYS[2], "reset:*")
 	`)
 
 	// luaSet is the Lua script used to set a key and return its previous value.  We
@@ -131,7 +130,7 @@ var (
 	luaSet = redis.NewScript(`
 	   local v = redis.call("HGET", KEYS[1], ARGV[1])
 	   redis.call("HSET", KEYS[1], ARGV[1], ARGV[2])
-	   redis.call("PUBLISH", KEYS[2], ARGV[1].."="..ARGV[2])
+	   redis.call("PUBLISH", KEYS[2], "set:" .. ARGV[1] .. ":" .. ARGV[2])
 	   return v
 	`)
 
@@ -140,7 +139,7 @@ var (
 	   local v = redis.call("HGET", KEYS[1], ARGV[1])
 	   if v == ARGV[2] then
 	      redis.call("HDEL", KEYS[1], ARGV[1])
-	      redis.call("PUBLISH", KEYS[2], ARGV[1].."=")
+	      redis.call("PUBLISH", KEYS[2], "del:" .. ARGV[1])
 	   end
 	   return v
 	`)
@@ -158,7 +157,7 @@ var (
 	  end
 	  
 	  redis.call("DEL", hash)
-	  redis.call("PUBLISH", KEYS[2], "*=")
+	  redis.call("PUBLISH", KEYS[2], "reset:*")
 	  return 1
 	`)
 
@@ -167,7 +166,7 @@ var (
 	   local v = redis.call("HGET", KEYS[1], ARGV[1])
 	   if v == ARGV[2] then
 	      redis.call("HSET", KEYS[1], ARGV[1], ARGV[3])
-	      redis.call("PUBLISH", KEYS[2], ARGV[1].."="..ARGV[3])
+	      redis.call("PUBLISH", KEYS[2], "set:" .. ARGV[1] .. ":" .. ARGV[3])
 	   end
 	   return v
 	`)

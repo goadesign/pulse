@@ -7,7 +7,6 @@ import (
 	"hash"
 	"hash/crc64"
 	"io"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -382,12 +381,13 @@ func (node *Node) JobKeys() []string {
 // - (nil, false) if the job does not exist
 func (node *Node) JobPayload(key string) ([]byte, bool) {
 	payload, ok := node.jobPayloadsMap.Get(key)
-	if ok {
-		return []byte(payload), true
+	if !ok {
+		return nil, false
 	}
-	keys := node.JobKeys()
-	return nil, slices.Contains(keys, key)
-
+	if payload == "" {
+		return nil, true
+	}
+	return []byte(payload), true
 }
 
 // NotifyWorker notifies the worker that handles the job with the given key.
@@ -873,7 +873,11 @@ func (node *Node) cleanupInactiveWorkers(ctx context.Context) {
 		}
 		requeued := make(map[string]chan error)
 		for _, key := range keys {
-			payload, _ := node.jobPayloadsMap.Get(key) // Some jobs have no payload
+			payload, ok := node.JobPayload(key)
+			if !ok {
+				node.logger.Error(fmt.Errorf("cleanupInactiveWorkers: failed to get job payload for %q: %w", key, err), "worker", id)
+				continue
+			}
 			job := &Job{
 				Key:       key,
 				Payload:   []byte(payload),
