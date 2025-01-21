@@ -170,4 +170,15 @@ var (
 	   end
 	   return v
 	`)
+
+	// luaSetIfNotExists is the Lua script used to set a key if it does not exist.
+	luaSetIfNotExists = redis.NewScript(`
+        local v = redis.call("HGET", KEYS[1], ARGV[1])
+        if not v then
+            redis.call("HSET", KEYS[1], ARGV[1], ARGV[2])
+            redis.call("PUBLISH", KEYS[2], "set:" .. ARGV[1] .. ":" .. ARGV[2])
+            return 1  -- Successfully set the value
+        end
+        return 0    -- Value already existed
+    `)
 )

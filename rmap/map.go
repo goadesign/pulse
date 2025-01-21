@@ -20,27 +20,28 @@ type (
 	// change. Multiple processes can join the same replicated map and
 	// update it.
 	Map struct {
-		Name               string
-		chankey            string                // Redis pubsub channel name
-		hashkey            string                // Redis hash key
-		msgch              <-chan *redis.Message // channel to receive map updates
-		chans              []chan EventKind      // channels to send notifications
-		ichan              chan struct{}         // internal channel to send notifications
-		done               chan struct{}         // channel to signal shutdown
-		wait               sync.WaitGroup        // wait for read goroutine to exit
-		logger             pulse.Logger          // logger
-		sub                *redis.PubSub         // subscription to map updates
-		rdb                *redis.Client
-		setScript          *redis.Script
-		testAndSetScript   *redis.Script
-		appendScript       *redis.Script
-		appendUniqueScript *redis.Script
-		removeScript       *redis.Script
-		incrScript         *redis.Script
-		delScript          *redis.Script
-		testAndDelScript   *redis.Script
-		testAndResetScript *redis.Script
-		resetScript        *redis.Script
+		Name                 string
+		chankey              string                // Redis pubsub channel name
+		hashkey              string                // Redis hash key
+		msgch                <-chan *redis.Message // channel to receive map updates
+		chans                []chan EventKind      // channels to send notifications
+		ichan                chan struct{}         // internal channel to send notifications
+		done                 chan struct{}         // channel to signal shutdown
+		wait                 sync.WaitGroup        // wait for read goroutine to exit
+		logger               pulse.Logger          // logger
+		sub                  *redis.PubSub         // subscription to map updates
+		rdb                  *redis.Client
+		setScript            *redis.Script
+		testAndSetScript     *redis.Script
+		setIfNotExistsScript *redis.Script
+		appendScript         *redis.Script
+		appendUniqueScript   *redis.Script
+		removeScript         *redis.Script
+		incrScript           *redis.Script
+		delScript            *redis.Script
+		testAndDelScript     *redis.Script
+		testAndResetScript   *redis.Script
+		resetScript          *redis.Script
 
 		lock    sync.RWMutex
 		content map[string]string
@@ -81,24 +82,25 @@ func Join(ctx context.Context, name string, rdb *redis.Client, opts ...MapOption
 	}
 	o := parseOptions(opts...)
 	sm := &Map{
-		Name:               name,
-		chankey:            fmt.Sprintf("map:%s:updates", name),
-		hashkey:            fmt.Sprintf("map:%s:content", name),
-		ichan:              make(chan struct{}, 1),
-		done:               make(chan struct{}),
-		logger:             o.Logger.WithPrefix("map", name),
-		rdb:                rdb,
-		content:            make(map[string]string),
-		setScript:          luaSet,
-		testAndSetScript:   luaTestAndSet,
-		incrScript:         luaIncr,
-		appendScript:       luaAppend,
-		appendUniqueScript: luaAppendUnique,
-		removeScript:       luaRemove,
-		delScript:          luaDelete,
-		testAndDelScript:   luaTestAndDel,
-		testAndResetScript: luaTestAndReset,
-		resetScript:        luaReset,
+		Name:                 name,
+		chankey:              fmt.Sprintf("map:%s:updates", name),
+		hashkey:              fmt.Sprintf("map:%s:content", name),
+		ichan:                make(chan struct{}, 1),
+		done:                 make(chan struct{}),
+		logger:               o.Logger.WithPrefix("map", name),
+		rdb:                  rdb,
+		content:              make(map[string]string),
+		setScript:            luaSet,
+		testAndSetScript:     luaTestAndSet,
+		setIfNotExistsScript: luaSetIfNotExists,
+		incrScript:           luaIncr,
+		appendScript:         luaAppend,
+		appendUniqueScript:   luaAppendUnique,
+		removeScript:         luaRemove,
+		delScript:            luaDelete,
+		testAndDelScript:     luaTestAndDel,
+		testAndResetScript:   luaTestAndReset,
+		resetScript:          luaReset,
 	}
 	if err := sm.init(ctx); err != nil {
 		return nil, err
@@ -240,6 +242,16 @@ func (sm *Map) SetAndWait(ctx context.Context, key, value string) (string, error
 			}
 		}
 	}
+}
+
+// SetIfNotExists sets the value for key only if it doesn't exist.
+// Returns true if the value was set, false if the key already existed.
+func (sm *Map) SetIfNotExists(ctx context.Context, key, value string) (bool, error) {
+	v, err := sm.runLuaScript(ctx, "setIfNotExists", sm.setIfNotExistsScript, key, value)
+	if err != nil {
+		return false, err
+	}
+	return v.(int64) == 1, nil
 }
 
 // TestAndSet sets the value for the given key if the current value matches the
@@ -474,6 +486,7 @@ func (sm *Map) init(ctx context.Context) error {
 		sm.testAndDelScript,
 		sm.testAndResetScript,
 		sm.testAndSetScript,
+		sm.setIfNotExistsScript,
 	} {
 		if err := script.Load(ctx, sm.rdb).Err(); err != nil {
 			return fmt.Errorf("pulse map: %s failed to load Lua scripts %v: %w", sm.Name, script, err)
@@ -539,10 +552,6 @@ func (sm *Map) run() {
 				}
 				sm.content[key] = parts[2]
 				sm.logger.Debug("set", "key", key, "val", parts[2])
-			default:
-				sm.logger.Error(fmt.Errorf("unknown operation"), "op", op)
-				sm.lock.Unlock()
-				continue
 			}
 			select {
 			case sm.ichan <- struct{}{}:

@@ -34,6 +34,7 @@ type (
 		nodeReader         *streaming.Reader // node event reader
 		workerMap          *rmap.Map         // worker creation times by ID
 		jobsMap            *rmap.Map         // jobs by worker ID
+		pendingJobsMap     *rmap.Map         // pending jobs by job key
 		jobPayloadsMap     *rmap.Map         // job payloads by job key
 		nodeKeepAliveMap   *rmap.Map         // node keep-alive timestamps indexed by ID
 		workerKeepAliveMap *rmap.Map         // worker keep-alive timestamps indexed by ID
@@ -50,10 +51,10 @@ type (
 		wg                 sync.WaitGroup // allows to wait until all goroutines exit
 		rdb                *redis.Client
 
-		localWorkers  sync.Map // workers created by this node
-		workerStreams sync.Map // worker streams indexed by ID
-		pendingJobs   sync.Map // channels used to send DispatchJob results, nil if event is requeued
-		pendingEvents sync.Map // pending events indexed by sender and event IDs
+		localWorkers       sync.Map // workers created by this node
+		workerStreams      sync.Map // worker streams indexed by ID
+		pendingJobChannels sync.Map // channels used to send DispatchJob results, nil if event is requeued
+		pendingEvents      sync.Map // pending events indexed by sender and event IDs
 
 		lock     sync.RWMutex
 		closing  bool
@@ -87,6 +88,9 @@ const (
 
 // pendingEventTTL is the TTL for pending events.
 var pendingEventTTL = 2 * time.Minute
+
+// ErrJobExists is returned when attempting to dispatch a job with a key that already exists.
+var ErrJobExists = errors.New("job already exists")
 
 // AddNode adds a new node to the pool with the given name and returns it. The
 // node can be used to dispatch jobs and add new workers. A node also routes
@@ -139,6 +143,7 @@ func AddNode(ctx context.Context, poolName string, rdb *redis.Client, opts ...No
 		wm  *rmap.Map
 		jm  *rmap.Map
 		jpm *rmap.Map
+		pjm *rmap.Map
 		km  *rmap.Map
 		tm  *rmap.Map
 
@@ -176,6 +181,12 @@ func AddNode(ctx context.Context, poolName string, rdb *redis.Client, opts ...No
 			return nil, fmt.Errorf("AddNode: failed to join pool ticker replicated map %q: %w", tickerMapName(poolName), err)
 		}
 
+		// Initialize and join pending jobs map
+		pjm, err = rmap.Join(ctx, pendingJobsMapName(poolName), rdb, rmap.WithLogger(logger))
+		if err != nil {
+			return nil, fmt.Errorf("AddNode: failed to join pending jobs replicated map %q: %w", pendingJobsMapName(poolName), err)
+		}
+
 		poolSink, err = poolStream.NewSink(ctx, "events",
 			soptions.WithSinkBlockDuration(o.jobSinkBlockDuration),
 			soptions.WithSinkAckGracePeriod(o.ackGracePeriod))
@@ -203,10 +214,11 @@ func AddNode(ctx context.Context, poolName string, rdb *redis.Client, opts ...No
 		workerMap:          wm,
 		jobsMap:            jm,
 		jobPayloadsMap:     jpm,
+		pendingJobsMap:     pjm,
 		shutdownMap:        wsm,
 		tickerMap:          tm,
 		workerStreams:      sync.Map{},
-		pendingJobs:        sync.Map{},
+		pendingJobChannels: sync.Map{},
 		pendingEvents:      sync.Map{},
 		poolStream:         poolStream,
 		poolSink:           poolSink,
@@ -311,6 +323,7 @@ func (node *Node) PoolWorkers() []*Worker {
 // the job key using consistent hashing.
 // It returns:
 // - nil if the job is successfully dispatched and started by a worker
+// - ErrJobExists if a job with the same key already exists in the pool
 // - an error returned by the worker's start handler if the job fails to start
 // - an error if the pool is closed or if there's a failure in adding the job
 //
@@ -320,14 +333,59 @@ func (node *Node) DispatchJob(ctx context.Context, key string, payload []byte) e
 		return fmt.Errorf("DispatchJob: pool %q is closed", node.PoolName)
 	}
 
+	// Check if job already exists in job payloads map
+	if _, exists := node.jobPayloadsMap.Get(key); exists {
+		return fmt.Errorf("%w: job %q", ErrJobExists, key)
+	}
+
+	// Check if there's a pending dispatch for this job
+	pendingTS, exists := node.pendingJobsMap.Get(key)
+	if exists {
+		ts, err := strconv.ParseInt(pendingTS, 10, 64)
+		if err != nil {
+			_, err := node.pendingJobsMap.TestAndDelete(ctx, key, pendingTS)
+			if err != nil {
+				node.logger.Error(fmt.Errorf("DispatchJob: failed to delete invalid pending timestamp for job %q: %w", key, err))
+			}
+			exists = false
+		} else if time.Until(time.Unix(0, ts)) > 0 {
+			return fmt.Errorf("%w: job %q is already being dispatched", ErrJobExists, key)
+		}
+	}
+
+	// Set pending timestamp using atomic operation
+	pendingUntil := time.Now().Add(2 * node.ackGracePeriod).UnixNano()
+	newTS := strconv.FormatInt(pendingUntil, 10)
+	if exists {
+		current, err := node.pendingJobsMap.TestAndSet(ctx, key, pendingTS, newTS)
+		if err != nil {
+			return fmt.Errorf("DispatchJob: failed to set pending timestamp for job %q: %w", key, err)
+		}
+		if current != pendingTS {
+			return fmt.Errorf("%w: job %q is already being dispatched", ErrJobExists, key)
+		}
+	} else {
+		ok, err := node.pendingJobsMap.SetIfNotExists(ctx, key, newTS)
+		if err != nil {
+			return fmt.Errorf("DispatchJob: failed to set initial pending timestamp for job %q: %w", key, err)
+		}
+		if !ok {
+			return fmt.Errorf("%w: job %q is already being dispatched", ErrJobExists, key)
+		}
+	}
+
 	job := marshalJob(&Job{Key: key, Payload: payload, CreatedAt: time.Now(), NodeID: node.ID})
 	eventID, err := node.poolStream.Add(ctx, evStartJob, job)
 	if err != nil {
+		// Clean up pending entry on failure
+		if _, err := node.pendingJobsMap.Delete(ctx, key); err != nil {
+			node.logger.Error(fmt.Errorf("DispatchJob: failed to clean up pending entry for job %q: %w", key, err))
+		}
 		return fmt.Errorf("DispatchJob: failed to add job to stream %q: %w", node.poolStream.Name, err)
 	}
 
 	cherr := make(chan error, 1)
-	node.pendingJobs.Store(eventID, cherr)
+	node.pendingJobChannels.Store(eventID, cherr)
 
 	timer := time.NewTimer(2 * node.ackGracePeriod)
 	defer timer.Stop()
@@ -340,8 +398,13 @@ func (node *Node) DispatchJob(ctx context.Context, key string, payload []byte) e
 		err = ctx.Err()
 	}
 
-	node.pendingJobs.Delete(eventID)
+	node.pendingJobChannels.Delete(eventID)
 	close(cherr)
+
+	// Clean up pending entry
+	if _, err := node.pendingJobsMap.Delete(ctx, key); err != nil {
+		node.logger.Error(fmt.Errorf("DispatchJob: failed to clean up pending entry for job %q: %w", key, err))
+	}
 
 	if err != nil {
 		node.logger.Error(fmt.Errorf("DispatchJob: failed to dispatch job: %w", err), "key", key)
@@ -654,7 +717,7 @@ func (node *Node) ackWorkerEvent(ctx context.Context, ev *streaming.Event) {
 // returnDispatchStatus returns the start job result to the caller.
 func (node *Node) returnDispatchStatus(_ context.Context, ev *streaming.Event) {
 	ack := unmarshalAck(ev.Payload)
-	val, ok := node.pendingJobs.Load(ack.EventID)
+	val, ok := node.pendingJobChannels.Load(ack.EventID)
 	if !ok {
 		node.logger.Error(fmt.Errorf("returnDispatchStatus: received dispatch return for unknown event"), "id", ack.EventID)
 		return
@@ -662,7 +725,7 @@ func (node *Node) returnDispatchStatus(_ context.Context, ev *streaming.Event) {
 	node.logger.Debug("dispatch return", "event", ev.EventName, "id", ev.ID, "ack-id", ack.EventID)
 	if val == nil {
 		// Event was requeued, just clean up
-		node.pendingJobs.Delete(ack.EventID)
+		node.pendingJobChannels.Delete(ack.EventID)
 		return
 	}
 	var err error
@@ -740,7 +803,7 @@ func (node *Node) requeueJob(ctx context.Context, workerID string, job *Job) (ch
 		return nil, fmt.Errorf("requeueJob: failed to add job %q to stream %q: %w", job.Key, node.poolStream.Name, err)
 	}
 	cherr := make(chan error, 1)
-	node.pendingJobs.Store(eventID, cherr)
+	node.pendingJobChannels.Store(eventID, cherr)
 	return cherr, nil
 }
 
@@ -1204,4 +1267,10 @@ func nodeStreamName(pool, nodeID string) string {
 // stream event ID.
 func pendingEventKey(workerID, eventID string) string {
 	return fmt.Sprintf("%s:%s", workerID, eventID)
+}
+
+// pendingJobsMapName returns the name of the replicated map used to store the
+// pending jobs by job key.
+func pendingJobsMapName(poolName string) string {
+	return poolName + ":pending-jobs"
 }

@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -256,6 +257,135 @@ func TestDispatchJobTwoWorkers(t *testing.T) {
 
 	// Shutdown
 	assert.NoError(t, node.Shutdown(ctx), "Failed to shutdown node")
+}
+
+func TestDispatchJobRaceCondition(t *testing.T) {
+	testName := strings.Replace(t.Name(), "/", "_", -1)
+	ctx := ptesting.NewTestContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+
+	node1 := newTestNode(t, ctx, rdb, testName)
+	node2 := newTestNode(t, ctx, rdb, testName)
+	newTestWorker(t, ctx, node1)
+	newTestWorker(t, ctx, node2)
+	defer func() {
+		assert.NoError(t, node1.Shutdown(ctx))
+		assert.NoError(t, node2.Shutdown(ctx))
+	}()
+
+	t.Run("concurrent dispatch of same job returns error", func(t *testing.T) {
+		// Start dispatching same job from both nodes concurrently
+		errCh := make(chan error, 2)
+		jobKey := "concurrent-job"
+		payload := []byte("test payload")
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			errCh <- node1.DispatchJob(ctx, jobKey, payload)
+		}()
+		go func() {
+			defer wg.Done()
+			errCh <- node2.DispatchJob(ctx, jobKey, payload)
+		}()
+		wg.Wait()
+		close(errCh)
+
+		// Collect results
+		var errs []error
+		for err := range errCh {
+			errs = append(errs, err)
+		}
+
+		// Verify that exactly one dispatch succeeded and one failed
+		successCount := 0
+		errorCount := 0
+		for _, err := range errs {
+			if err == nil {
+				successCount++
+			} else if errors.Is(err, ErrJobExists) {
+				errorCount++
+			} else {
+				t.Errorf("unexpected error: %v", err)
+			}
+		}
+		assert.Equal(t, 1, successCount, "Expected exactly one successful dispatch")
+		assert.Equal(t, 1, errorCount, "Expected exactly one ErrJobExists error")
+	})
+
+	t.Run("dispatch after existing job returns error", func(t *testing.T) {
+		jobKey := "sequential-job"
+		payload := []byte("test payload")
+
+		// First dispatch should succeed
+		err := node1.DispatchJob(ctx, jobKey, payload)
+		require.NoError(t, err, "First dispatch should succeed")
+
+		// Second dispatch should fail with ErrJobExists
+		err = node2.DispatchJob(ctx, jobKey, payload)
+		assert.True(t, errors.Is(err, ErrJobExists), "Expected ErrJobExists, got: %v", err)
+	})
+
+	t.Run("dispatch after pending job times out succeeds", func(t *testing.T) {
+		jobKey := "timeout-job"
+		payload := []byte("test payload")
+
+		// Set a stale pending timestamp
+		staleTS := time.Now().Add(-3 * node1.ackGracePeriod).UnixNano()
+		_, err := node1.pendingJobsMap.Set(ctx, jobKey, strconv.FormatInt(staleTS, 10))
+		require.NoError(t, err, "Failed to set stale pending timestamp")
+
+		// Dispatch should succeed because pending timestamp is in the past
+		err = node2.DispatchJob(ctx, jobKey, payload)
+		assert.NoError(t, err, "Dispatch should succeed after pending timeout")
+	})
+
+	t.Run("dispatch cleans up pending entry on failure", func(t *testing.T) {
+		jobKey := "cleanup-job"
+		payload := []byte("test payload")
+
+		// Corrupt the pool stream to force dispatch failure
+		err := rdb.Del(ctx, "pulse:stream:"+poolStreamName(node1.PoolName)).Err()
+		require.NoError(t, err, "Failed to delete pool stream")
+
+		// Attempt dispatch (should fail)
+		err = node1.DispatchJob(ctx, jobKey, payload)
+		require.Error(t, err, "Expected dispatch to fail")
+
+		// Verify pending entry was cleaned up
+		_, exists := node1.pendingJobsMap.Get(jobKey)
+		assert.False(t, exists, "Pending entry should be cleaned up after failed dispatch")
+	})
+
+	t.Run("dispatch cleans up pending entry on success", func(t *testing.T) {
+		jobKey := "success-cleanup-job"
+		payload := []byte("test payload")
+
+		// Dispatch job
+		err := node1.DispatchJob(ctx, jobKey, payload)
+		require.NoError(t, err, "Dispatch should succeed")
+		// Verify pending entry was cleaned up
+		require.Eventually(t, func() bool {
+			val, exists := node1.pendingJobsMap.Get(jobKey)
+			t.Logf("Got pending value: %q", val)
+			return !exists
+		}, max, delay, "Pending entry should be cleaned up after successful dispatch")
+	})
+
+	t.Run("dispatch with invalid pending timestamp", func(t *testing.T) {
+		jobKey := "invalid-timestamp-job"
+		payload := []byte("test payload")
+
+		// Set an invalid pending timestamp
+		_, err := node1.pendingJobsMap.SetAndWait(ctx, jobKey, "invalid-timestamp")
+		require.NoError(t, err, "Failed to set invalid pending timestamp")
+
+		// Dispatch should succeed (invalid timestamps are logged and ignored)
+		err = node1.DispatchJob(ctx, jobKey, payload)
+		assert.NoError(t, err, "Dispatch should succeed with invalid pending timestamp")
+	})
 }
 
 func TestNotifyWorker(t *testing.T) {
