@@ -15,6 +15,7 @@ import (
 
 func TestNewTicker(t *testing.T) {
 	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, t.Name())
 	ctx := log.Context(ptesting.NewTestContext(t), log.WithOutput(io.Discard))
 	testName := strings.Replace(t.Name(), "/", "_", -1)
 	node := newTestNode(t, ctx, rdb, testName)
@@ -22,7 +23,7 @@ func TestNewTicker(t *testing.T) {
 
 	// Create and test new ticker
 	startTime := time.Now()
-	ticker, err := node.NewTicker(ctx, testName, tickDuration)
+	ticker, err := node.NewTicker(ctx, "ticker1", tickDuration)
 	require.NoError(t, err, "Failed to create new ticker")
 	require.NotNil(t, ticker, "Ticker should not be nil")
 
@@ -52,6 +53,7 @@ func TestNewTicker(t *testing.T) {
 
 func TestReplaceTickerTimer(t *testing.T) {
 	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, true, t.Name())
 	ctx := log.Context(ptesting.NewTestContext(t), log.WithOutput(io.Discard))
 	testName := strings.Replace(t.Name(), "/", "_", -1)
 	node := newTestNode(t, ctx, rdb, testName)

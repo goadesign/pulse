@@ -60,7 +60,7 @@ func (node *Node) NewTicker(ctx context.Context, name string, d time.Duration, o
 	}
 	if t.next == "" {
 		next := serialize(time.Now().Add(d), d)
-		if _, err := t.tickerMap.Set(ctx, t.name, next); err != nil {
+		if _, err := t.tickerMap.SetAndWait(ctx, t.name, next); err != nil {
 			return nil, fmt.Errorf("failed to store tick and duration: %s", err)
 		}
 		t.next = next

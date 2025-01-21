@@ -2,6 +2,7 @@ package rmap
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math/rand"
 	"regexp"
@@ -25,7 +26,7 @@ type (
 		hashkey              string                // Redis hash key
 		msgch                <-chan *redis.Message // channel to receive map updates
 		chans                []chan EventKind      // channels to send notifications
-		ichan                chan struct{}         // internal channel to send notifications
+		ichan                chan string           // internal channel to send set notifications
 		done                 chan struct{}         // channel to signal shutdown
 		wait                 sync.WaitGroup        // wait for read goroutine to exit
 		logger               pulse.Logger          // logger
@@ -85,7 +86,7 @@ func Join(ctx context.Context, name string, rdb *redis.Client, opts ...MapOption
 		Name:                 name,
 		chankey:              fmt.Sprintf("map:%s:updates", name),
 		hashkey:              fmt.Sprintf("map:%s:content", name),
-		ichan:                make(chan struct{}, 1),
+		ichan:                make(chan string, 1),
 		done:                 make(chan struct{}),
 		logger:               o.Logger.WithPrefix("map", name),
 		rdb:                  rdb,
@@ -230,14 +231,11 @@ func (sm *Map) SetAndWait(ctx context.Context, key, value string) (string, error
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
-		case _, ok := <-sm.ichan:
+		case val, ok := <-sm.ichan:
 			if !ok {
 				return "", fmt.Errorf("pulse map: %s is stopped", sm.Name)
 			}
-			sm.lock.RLock()
-			v, ok := sm.content[key]
-			sm.lock.RUnlock()
-			if ok && v == value {
+			if val == value {
 				return prev, nil
 			}
 		}
@@ -527,12 +525,12 @@ func (sm *Map) run() {
 				sm.reconnect()
 				continue
 			}
-			parts := strings.SplitN(msg.Payload, ":", 3)
-			if len(parts) < 2 {
+			parts := strings.SplitN(msg.Payload, ":", 2)
+			if len(parts) != 2 {
 				sm.logger.Error(fmt.Errorf("invalid payload"), "payload", msg.Payload)
 				continue
 			}
-			op, key := parts[0], parts[1]
+			op, data := parts[0], []byte(parts[1])
 			sm.lock.Lock()
 			kind := EventChange
 			switch op {
@@ -541,21 +539,34 @@ func (sm *Map) run() {
 				sm.logger.Debug("reset")
 				kind = EventReset
 			case "del":
+				key, _, err := unpackString(data)
+				if err != nil {
+					sm.logger.Error(fmt.Errorf("invalid del payload"), "payload", msg.Payload, "error", err)
+					sm.lock.Unlock()
+					continue
+				}
 				delete(sm.content, key)
 				sm.logger.Debug("deleted", "key", key)
 				kind = EventDelete
 			case "set":
-				if len(parts) != 3 {
-					sm.logger.Error(fmt.Errorf("invalid set payload"), "payload", msg.Payload)
+				key, rest, err := unpackString(data)
+				if err != nil {
+					sm.logger.Error(fmt.Errorf("invalid set key"), "payload", msg.Payload, "error", err)
 					sm.lock.Unlock()
 					continue
 				}
-				sm.content[key] = parts[2]
-				sm.logger.Debug("set", "key", key, "val", parts[2])
-			}
-			select {
-			case sm.ichan <- struct{}{}:
-			default:
+				val, _, err := unpackString(rest)
+				if err != nil {
+					sm.logger.Error(fmt.Errorf("invalid set value"), "payload", msg.Payload, "error", err)
+					sm.lock.Unlock()
+					continue
+				}
+				sm.content[key] = val
+				select {
+				case sm.ichan <- val:
+				default:
+				}
+				sm.logger.Debug("set", "key", key, "val", val)
 			}
 			for _, c := range sm.chans {
 				select {
@@ -638,4 +649,18 @@ var redisKeyRegex = regexp.MustCompile(`^[^ \0\*\?\[\]]{1,512}$`)
 
 func isValidRedisKeyName(key string) bool {
 	return redisKeyRegex.MatchString(key)
+}
+
+// unpackString reads a length-prefixed string from a buffer using struct.pack
+// format "ic0"
+func unpackString(data []byte) (string, []byte, error) {
+	if len(data) < 4 {
+		return "", nil, fmt.Errorf("buffer too short for length")
+	}
+	length := int(binary.LittleEndian.Uint32(data))
+	data = data[4:]
+	if len(data) < length {
+		return "", nil, fmt.Errorf("buffer too short for string")
+	}
+	return string(data[:length]), data[length:], nil
 }
