@@ -26,7 +26,7 @@ type (
 		hashkey              string                // Redis hash key
 		msgch                <-chan *redis.Message // channel to receive map updates
 		chans                []chan EventKind      // channels to send notifications
-		ichan                chan string           // internal channel to send set notifications
+		ichan                chan setNotification  // internal channel to send set notifications
 		done                 chan struct{}         // channel to signal shutdown
 		wait                 sync.WaitGroup        // wait for read goroutine to exit
 		logger               pulse.Logger          // logger
@@ -52,6 +52,12 @@ type (
 
 	// EventKind is the type of map event.
 	EventKind int
+
+	// setNotification is the type of internal notification sent when a key is set.
+	setNotification struct {
+		key   string
+		value string
+	}
 )
 
 const (
@@ -86,7 +92,7 @@ func Join(ctx context.Context, name string, rdb *redis.Client, opts ...MapOption
 		Name:                 name,
 		chankey:              fmt.Sprintf("map:%s:updates", name),
 		hashkey:              fmt.Sprintf("map:%s:content", name),
-		ichan:                make(chan string, 1),
+		ichan:                make(chan setNotification, 100),
 		done:                 make(chan struct{}),
 		logger:               o.Logger.WithPrefix("map", name),
 		rdb:                  rdb,
@@ -231,11 +237,11 @@ func (sm *Map) SetAndWait(ctx context.Context, key, value string) (string, error
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
-		case val, ok := <-sm.ichan:
+		case ev, ok := <-sm.ichan:
 			if !ok {
 				return "", fmt.Errorf("pulse map: %s is stopped", sm.Name)
 			}
-			if val == value {
+			if ev.key == key && ev.value == value {
 				return prev, nil
 			}
 		}
@@ -562,10 +568,7 @@ func (sm *Map) run() {
 					continue
 				}
 				sm.content[key] = val
-				select {
-				case sm.ichan <- val:
-				default:
-				}
+				sm.ichan <- setNotification{key: key, value: val}
 				sm.logger.Debug("set", "key", key, "val", val)
 			}
 			for _, c := range sm.chans {

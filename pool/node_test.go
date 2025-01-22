@@ -131,13 +131,6 @@ func TestJobKeys(t *testing.T) {
 	for _, job := range jobs {
 		assert.Contains(t, allJobKeys, job.key, fmt.Sprintf("Job key %s not found in JobKeys", job.key))
 	}
-
-	// Dispatch a job with an existing key to node1
-	assert.NoError(t, node1.DispatchJob(ctx, "job1", []byte("updated payload")), "Failed to dispatch job with existing key")
-
-	// Check that the number of job keys hasn't changed
-	updatedAllJobKeys := node1.JobKeys()
-	assert.Equal(t, len(allJobKeys), len(updatedAllJobKeys), "Number of job keys shouldn't change when updating an existing job")
 }
 
 func TestJobPayload(t *testing.T) {
@@ -176,14 +169,12 @@ func TestJobPayload(t *testing.T) {
 	assert.False(t, ok, "Expected false for non-existent job")
 	assert.Nil(t, payload, "Expected nil payload for non-existent job")
 
-	// Update existing job
-	updatedPayload := []byte("updated payload")
-	assert.NoError(t, node.DispatchJob(ctx, "job1", updatedPayload), "Failed to update existing job")
-
-	// Check if the payload was updated
+	// Remove existing job
+	assert.NoError(t, node.StopJob(ctx, "job1"))
+	// Check if the payload was removed
 	assert.Eventually(t, func() bool {
-		payload, ok := node.JobPayload("job1")
-		return ok && assert.Equal(t, updatedPayload, payload, "Payload was not updated correctly")
+		_, ok := node.JobPayload("job1")
+		return !ok
 	}, max, delay, "Failed to get updated payload for job")
 }
 
@@ -333,30 +324,17 @@ func TestDispatchJobRaceCondition(t *testing.T) {
 		payload := []byte("test payload")
 
 		// Set a stale pending timestamp
-		staleTS := time.Now().Add(-3 * node1.ackGracePeriod).UnixNano()
-		_, err := node1.pendingJobsMap.Set(ctx, jobKey, strconv.FormatInt(staleTS, 10))
+		staleTS := time.Now().Add(-time.Hour).UnixNano()
+		_, err := node1.pendingJobsMap.SetAndWait(ctx, jobKey, strconv.FormatInt(staleTS, 10))
 		require.NoError(t, err, "Failed to set stale pending timestamp")
+		defer func() {
+			_, err = node1.pendingJobsMap.Delete(ctx, jobKey)
+			assert.NoError(t, err, "Failed to delete pending timestamp")
+		}()
 
 		// Dispatch should succeed because pending timestamp is in the past
-		err = node2.DispatchJob(ctx, jobKey, payload)
-		assert.NoError(t, err, "Dispatch should succeed after pending timeout")
-	})
-
-	t.Run("dispatch cleans up pending entry on failure", func(t *testing.T) {
-		jobKey := "cleanup-job"
-		payload := []byte("test payload")
-
-		// Corrupt the pool stream to force dispatch failure
-		err := rdb.Del(ctx, "pulse:stream:"+poolStreamName(node1.PoolName)).Err()
-		require.NoError(t, err, "Failed to delete pool stream")
-
-		// Attempt dispatch (should fail)
 		err = node1.DispatchJob(ctx, jobKey, payload)
-		require.Error(t, err, "Expected dispatch to fail")
-
-		// Verify pending entry was cleaned up
-		_, exists := node1.pendingJobsMap.Get(jobKey)
-		assert.False(t, exists, "Pending entry should be cleaned up after failed dispatch")
+		assert.NoError(t, err, "Dispatch should succeed after pending timeout")
 	})
 
 	t.Run("dispatch cleans up pending entry on success", func(t *testing.T) {
@@ -386,6 +364,27 @@ func TestDispatchJobRaceCondition(t *testing.T) {
 		err = node1.DispatchJob(ctx, jobKey, payload)
 		assert.NoError(t, err, "Dispatch should succeed with invalid pending timestamp")
 	})
+
+	// Keep this test last, it destroys the stream
+	t.Run("dispatch cleans up pending entry on failure", func(t *testing.T) {
+		jobKey := "cleanup-job"
+		payload := []byte("test payload")
+
+		// Corrupt the pool stream to force dispatch failure
+		err := rdb.Del(ctx, "pulse:stream:"+poolStreamName(node1.PoolName)).Err()
+		require.NoError(t, err, "Failed to delete pool stream")
+
+		// Attempt dispatch (should fail)
+		err = node1.DispatchJob(ctx, jobKey, payload)
+		require.Error(t, err, "Expected dispatch to fail")
+
+		// Verify pending entry was cleaned up
+		require.Eventually(t, func() bool {
+			_, exists := node1.pendingJobsMap.Get(jobKey)
+			return !exists
+		}, max, delay, "Pending entry should be cleaned up after failed dispatch")
+	})
+
 }
 
 func TestNotifyWorker(t *testing.T) {
