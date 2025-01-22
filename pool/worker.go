@@ -473,7 +473,7 @@ func (w *Worker) requeueJob(ctx context.Context, job *Job) error {
 	if err != nil {
 		return fmt.Errorf("requeueJob: failed to add job to pool stream: %w", err)
 	}
-	w.node.pendingJobs.Store(eventID, nil)
+	w.node.pendingJobChannels.Store(eventID, nil)
 	if err := w.stopJob(ctx, job.Key, true); err != nil {
 		return fmt.Errorf("failed to stop job: %w", err)
 	}

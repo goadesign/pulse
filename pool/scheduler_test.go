@@ -90,7 +90,7 @@ func TestSchedule(t *testing.T) {
 	err = node.Schedule(ctx, producer, d)
 	require.NoError(t, err)
 
-	assert.Eventually(t, func() bool { return it() == 7 }, max, delay, "schedule should have stopped")
+	assert.Eventually(t, func() bool { return it() == 7 }, max, delay, "schedule should have stopped, got %d", it())
 	select {
 	case <-done:
 		reset = true

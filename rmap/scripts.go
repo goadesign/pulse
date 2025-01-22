@@ -13,7 +13,8 @@ var (
 
 	   -- Set the updated value in the hash and publish the change
 	   redis.call("HSET", KEYS[1], ARGV[1], v)
-	   redis.call("PUBLISH", KEYS[2], ARGV[1] .. "=" .. v)
+	   local msg = struct.pack("ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(v), v)
+	   redis.call("PUBLISH", KEYS[2], "set:" .. msg)
 
 	   return v
 	`)
@@ -53,7 +54,8 @@ var (
 	  -- If changes were made, update the hash and publish the event
 	  if changed then
 	    redis.call("HSET", KEYS[1], ARGV[1], v)
-	    redis.call("PUBLISH", KEYS[2], ARGV[1] .. "=" .. v)
+	    local msg = struct.pack("ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(v), v)
+	    redis.call("PUBLISH", KEYS[2], "set:" .. msg)
 	  end
 
 	  return v
@@ -64,7 +66,8 @@ var (
 	luaDelete = redis.NewScript(`
 	   local v = redis.call("HGET", KEYS[1], ARGV[1])
 	   redis.call("HDEL", KEYS[1], ARGV[1])
-	   redis.call("PUBLISH", KEYS[2], ARGV[1].."=")
+	   local msg = struct.pack("ic0", string.len(ARGV[1]), ARGV[1])
+	   redis.call("PUBLISH", KEYS[2], "del:" .. msg)
 	   return v
 	`)
 
@@ -72,7 +75,8 @@ var (
 	luaIncr = redis.NewScript(`
 	   redis.call("HINCRBY", KEYS[1], ARGV[1], ARGV[2])
 	   local v = redis.call("HGET", KEYS[1], ARGV[1])
-	   redis.call("PUBLISH", KEYS[2], ARGV[1].."="..v)
+	   local msg = struct.pack("ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(v), v)
+	   redis.call("PUBLISH", KEYS[2], "set:" .. msg)
 	   return v
 	`)
 
@@ -106,14 +110,15 @@ var (
 	      -- Update the hash or delete the key if empty
 	      if #newValues == 0 then
 	         redis.call("HDEL", KEYS[1], ARGV[1])
+	         local msg = struct.pack("ic0", string.len(ARGV[1]), ARGV[1])
+	         redis.call("PUBLISH", KEYS[2], "del:" .. msg)
 	         v = ""
 	      else
 	         v = table.concat(newValues, ",")
 	         redis.call("HSET", KEYS[1], ARGV[1], v)
+	         local msg = struct.pack("ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(v), v)
+	         redis.call("PUBLISH", KEYS[2], "set:" .. msg)
 	      end
-
-	      -- Publish the result
-	      redis.call("PUBLISH", KEYS[2], ARGV[1] .. "=" .. v)
 	   end
 
 	   return {v, removed}
@@ -122,7 +127,7 @@ var (
 	// luaReset is the Lua script used to reset the map.
 	luaReset = redis.NewScript(`
 	   redis.call("DEL", KEYS[1])
-	   redis.call("PUBLISH", KEYS[2], "*=")
+	   redis.call("PUBLISH", KEYS[2], "reset:*")
 	`)
 
 	// luaSet is the Lua script used to set a key and return its previous value.  We
@@ -131,7 +136,8 @@ var (
 	luaSet = redis.NewScript(`
 	   local v = redis.call("HGET", KEYS[1], ARGV[1])
 	   redis.call("HSET", KEYS[1], ARGV[1], ARGV[2])
-	   redis.call("PUBLISH", KEYS[2], ARGV[1].."="..ARGV[2])
+	   local msg = struct.pack("ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(ARGV[2]), ARGV[2])
+	   redis.call("PUBLISH", KEYS[2], "set:" .. msg)
 	   return v
 	`)
 
@@ -140,7 +146,8 @@ var (
 	   local v = redis.call("HGET", KEYS[1], ARGV[1])
 	   if v == ARGV[2] then
 	      redis.call("HDEL", KEYS[1], ARGV[1])
-	      redis.call("PUBLISH", KEYS[2], ARGV[1].."=")
+	      local msg = struct.pack("ic0", string.len(ARGV[1]), ARGV[1])
+	      redis.call("PUBLISH", KEYS[2], "del:" .. msg)
 	   end
 	   return v
 	`)
@@ -158,7 +165,7 @@ var (
 	  end
 	  
 	  redis.call("DEL", hash)
-	  redis.call("PUBLISH", KEYS[2], "*=")
+	  redis.call("PUBLISH", KEYS[2], "reset:*")
 	  return 1
 	`)
 
@@ -167,8 +174,21 @@ var (
 	   local v = redis.call("HGET", KEYS[1], ARGV[1])
 	   if v == ARGV[2] then
 	      redis.call("HSET", KEYS[1], ARGV[1], ARGV[3])
-	      redis.call("PUBLISH", KEYS[2], ARGV[1].."="..ARGV[3])
+	      local msg = struct.pack("ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(ARGV[3]), ARGV[3])
+	      redis.call("PUBLISH", KEYS[2], "set:" .. msg)
 	   end
 	   return v
 	`)
+
+	// luaSetIfNotExists is the Lua script used to set a key if it does not exist.
+	luaSetIfNotExists = redis.NewScript(`
+        local v = redis.call("HGET", KEYS[1], ARGV[1])
+        if not v then
+            redis.call("HSET", KEYS[1], ARGV[1], ARGV[2])
+            local msg = struct.pack("ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(ARGV[2]), ARGV[2])
+            redis.call("PUBLISH", KEYS[2], "set:" .. msg)
+            return 1  -- Successfully set the value
+        end
+        return 0    -- Value already existed
+    `)
 )

@@ -2,6 +2,7 @@ package rmap
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math/rand"
 	"regexp"
@@ -20,27 +21,28 @@ type (
 	// change. Multiple processes can join the same replicated map and
 	// update it.
 	Map struct {
-		Name               string
-		chankey            string                // Redis pubsub channel name
-		hashkey            string                // Redis hash key
-		msgch              <-chan *redis.Message // channel to receive map updates
-		chans              []chan EventKind      // channels to send notifications
-		ichan              chan struct{}         // internal channel to send notifications
-		done               chan struct{}         // channel to signal shutdown
-		wait               sync.WaitGroup        // wait for read goroutine to exit
-		logger             pulse.Logger          // logger
-		sub                *redis.PubSub         // subscription to map updates
-		rdb                *redis.Client
-		setScript          *redis.Script
-		testAndSetScript   *redis.Script
-		appendScript       *redis.Script
-		appendUniqueScript *redis.Script
-		removeScript       *redis.Script
-		incrScript         *redis.Script
-		delScript          *redis.Script
-		testAndDelScript   *redis.Script
-		testAndResetScript *redis.Script
-		resetScript        *redis.Script
+		Name                 string
+		chankey              string                // Redis pubsub channel name
+		hashkey              string                // Redis hash key
+		msgch                <-chan *redis.Message // channel to receive map updates
+		chans                []chan EventKind      // channels to send notifications
+		ichan                chan setNotification  // internal channel to send set notifications
+		done                 chan struct{}         // channel to signal shutdown
+		wait                 sync.WaitGroup        // wait for read goroutine to exit
+		logger               pulse.Logger          // logger
+		sub                  *redis.PubSub         // subscription to map updates
+		rdb                  *redis.Client
+		setScript            *redis.Script
+		testAndSetScript     *redis.Script
+		setIfNotExistsScript *redis.Script
+		appendScript         *redis.Script
+		appendUniqueScript   *redis.Script
+		removeScript         *redis.Script
+		incrScript           *redis.Script
+		delScript            *redis.Script
+		testAndDelScript     *redis.Script
+		testAndResetScript   *redis.Script
+		resetScript          *redis.Script
 
 		lock    sync.RWMutex
 		content map[string]string
@@ -50,11 +52,19 @@ type (
 
 	// EventKind is the type of map event.
 	EventKind int
+
+	// setNotification is the type of internal notification sent when a key is set.
+	setNotification struct {
+		key   string
+		value string
+	}
 )
 
 const (
-	// EventChange is the event emitted when a key is added, changed or deleted.
+	// EventChange is the event emitted when a key is added or changed.
 	EventChange EventKind = iota + 1
+	// EventDelete is the event emitted when a key is deleted.
+	EventDelete
 	// EventReset is the event emitted when the map is reset.
 	EventReset
 )
@@ -79,24 +89,25 @@ func Join(ctx context.Context, name string, rdb *redis.Client, opts ...MapOption
 	}
 	o := parseOptions(opts...)
 	sm := &Map{
-		Name:               name,
-		chankey:            fmt.Sprintf("map:%s:updates", name),
-		hashkey:            fmt.Sprintf("map:%s:content", name),
-		ichan:              make(chan struct{}, 1),
-		done:               make(chan struct{}),
-		logger:             o.Logger.WithPrefix("map", name),
-		rdb:                rdb,
-		content:            make(map[string]string),
-		setScript:          luaSet,
-		testAndSetScript:   luaTestAndSet,
-		incrScript:         luaIncr,
-		appendScript:       luaAppend,
-		appendUniqueScript: luaAppendUnique,
-		removeScript:       luaRemove,
-		delScript:          luaDelete,
-		testAndDelScript:   luaTestAndDel,
-		testAndResetScript: luaTestAndReset,
-		resetScript:        luaReset,
+		Name:                 name,
+		chankey:              fmt.Sprintf("map:%s:updates", name),
+		hashkey:              fmt.Sprintf("map:%s:content", name),
+		ichan:                make(chan setNotification, 100),
+		done:                 make(chan struct{}),
+		logger:               o.Logger.WithPrefix("map", name),
+		rdb:                  rdb,
+		content:              make(map[string]string),
+		setScript:            luaSet,
+		testAndSetScript:     luaTestAndSet,
+		setIfNotExistsScript: luaSetIfNotExists,
+		incrScript:           luaIncr,
+		appendScript:         luaAppend,
+		appendUniqueScript:   luaAppendUnique,
+		removeScript:         luaRemove,
+		delScript:            luaDelete,
+		testAndDelScript:     luaTestAndDel,
+		testAndResetScript:   luaTestAndReset,
+		resetScript:          luaReset,
 	}
 	if err := sm.init(ctx); err != nil {
 		return nil, err
@@ -226,18 +237,25 @@ func (sm *Map) SetAndWait(ctx context.Context, key, value string) (string, error
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
-		case _, ok := <-sm.ichan:
+		case ev, ok := <-sm.ichan:
 			if !ok {
 				return "", fmt.Errorf("pulse map: %s is stopped", sm.Name)
 			}
-			sm.lock.RLock()
-			v, ok := sm.content[key]
-			sm.lock.RUnlock()
-			if ok && v == value {
+			if ev.key == key && ev.value == value {
 				return prev, nil
 			}
 		}
 	}
+}
+
+// SetIfNotExists sets the value for key only if it doesn't exist.
+// Returns true if the value was set, false if the key already existed.
+func (sm *Map) SetIfNotExists(ctx context.Context, key, value string) (bool, error) {
+	v, err := sm.runLuaScript(ctx, "setIfNotExists", sm.setIfNotExistsScript, key, value)
+	if err != nil {
+		return false, err
+	}
+	return v.(int64) == 1, nil
 }
 
 // TestAndSet sets the value for the given key if the current value matches the
@@ -472,6 +490,7 @@ func (sm *Map) init(ctx context.Context) error {
 		sm.testAndDelScript,
 		sm.testAndResetScript,
 		sm.testAndSetScript,
+		sm.setIfNotExistsScript,
 	} {
 		if err := script.Load(ctx, sm.rdb).Err(); err != nil {
 			return fmt.Errorf("pulse map: %s failed to load Lua scripts %v: %w", sm.Name, script, err)
@@ -512,29 +531,45 @@ func (sm *Map) run() {
 				sm.reconnect()
 				continue
 			}
-			parts := strings.SplitN(msg.Payload, "=", 2)
+			parts := strings.SplitN(msg.Payload, ":", 2)
 			if len(parts) != 2 {
 				sm.logger.Error(fmt.Errorf("invalid payload"), "payload", msg.Payload)
 				continue
 			}
-			key, val := parts[0], parts[1]
+			op, data := parts[0], []byte(parts[1])
 			sm.lock.Lock()
 			kind := EventChange
-			switch {
-			case key == "*":
+			switch op {
+			case "reset":
 				sm.content = make(map[string]string)
 				sm.logger.Debug("reset")
 				kind = EventReset
-			case val == "":
+			case "del":
+				key, _, err := unpackString(data)
+				if err != nil {
+					sm.logger.Error(fmt.Errorf("invalid del payload"), "payload", msg.Payload, "error", err)
+					sm.lock.Unlock()
+					continue
+				}
 				delete(sm.content, key)
 				sm.logger.Debug("deleted", "key", key)
-			default:
+				kind = EventDelete
+			case "set":
+				key, rest, err := unpackString(data)
+				if err != nil {
+					sm.logger.Error(fmt.Errorf("invalid set key"), "payload", msg.Payload, "error", err)
+					sm.lock.Unlock()
+					continue
+				}
+				val, _, err := unpackString(rest)
+				if err != nil {
+					sm.logger.Error(fmt.Errorf("invalid set value"), "payload", msg.Payload, "error", err)
+					sm.lock.Unlock()
+					continue
+				}
 				sm.content[key] = val
+				sm.ichan <- setNotification{key: key, value: val}
 				sm.logger.Debug("set", "key", key, "val", val)
-			}
-			select {
-			case sm.ichan <- struct{}{}:
-			default:
 			}
 			for _, c := range sm.chans {
 				select {
@@ -617,4 +652,18 @@ var redisKeyRegex = regexp.MustCompile(`^[^ \0\*\?\[\]]{1,512}$`)
 
 func isValidRedisKeyName(key string) bool {
 	return redisKeyRegex.MatchString(key)
+}
+
+// unpackString reads a length-prefixed string from a buffer using struct.pack
+// format "ic0"
+func unpackString(data []byte) (string, []byte, error) {
+	if len(data) < 4 {
+		return "", nil, fmt.Errorf("buffer too short for length")
+	}
+	length := int(binary.LittleEndian.Uint32(data))
+	data = data[4:]
+	if len(data) < length {
+		return "", nil, fmt.Errorf("buffer too short for string")
+	}
+	return string(data[:length]), data[length:], nil
 }
