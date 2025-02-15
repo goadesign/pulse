@@ -335,6 +335,7 @@ func (node *Node) DispatchJob(ctx context.Context, key string, payload []byte) e
 
 	// Check if job already exists in job payloads map
 	if _, exists := node.jobPayloadsMap.Get(key); exists {
+		node.logger.Info("DispatchJob: job already exists", "key", key)
 		return fmt.Errorf("%w: job %q", ErrJobExists, key)
 	}
 
@@ -349,7 +350,8 @@ func (node *Node) DispatchJob(ctx context.Context, key string, payload []byte) e
 			}
 			exists = false
 		} else if time.Until(time.Unix(0, ts)) > 0 {
-			return fmt.Errorf("%w: job %q is already being dispatched", ErrJobExists, key)
+			node.logger.Info("DispatchJob: job already dispatched", "key", key)
+			return fmt.Errorf("%w: job %q is already dispatched", ErrJobExists, key)
 		}
 	}
 
@@ -607,6 +609,12 @@ func (node *Node) handlePoolEvents(ctx context.Context, c <-chan *streaming.Even
 
 // routeWorkerEvent routes a dispatched event to the proper worker.
 func (node *Node) routeWorkerEvent(ctx context.Context, ev *streaming.Event) error {
+	// Filter out stale events
+	if time.Since(ev.CreatedAt()) > pendingEventTTL {
+		node.logger.Debug("routeWorkerEvent: stale event, not routing", "event", ev.EventName, "id", ev.ID, "since", time.Since(ev.CreatedAt()), "TTL", pendingEventTTL)
+		return nil
+	}
+
 	// Compute the worker ID that will handle the job.
 	key := unmarshalJobKey(ev.Payload)
 	activeWorkers := node.activeWorkers()
@@ -911,11 +919,11 @@ func (node *Node) cleanupInactiveWorkers(ctx context.Context) {
 		if lsd <= node.workerTTL {
 			continue
 		}
-		node.logger.Debug("cleanupInactiveWorkers: removing worker", "worker", id, "last-seen", lsd, "ttl", node.workerTTL)
+		node.logger.Info("Removing stale worker", "worker", id, "last-seen", lsd, "ttl", node.workerTTL)
 
-		// Use optimistic locking to set the keep-alive timestamp to a value
-		// in the future so that another node does not also requeue the jobs.
-		next := lsi + node.workerTTL.Nanoseconds()
+		// Use optimistic locking to set the keep-alive timestamp so that
+		// another node does not also requeue the jobs.
+		next := time.Now().UnixNano()
 		last, err := node.workerKeepAliveMap.TestAndSet(ctx, id, ls, strconv.FormatInt(next, 10))
 		if err != nil {
 			node.logger.Error(fmt.Errorf("cleanupInactiveWorkers: failed to set keep-alive timestamp: %w", err), "worker", id)
