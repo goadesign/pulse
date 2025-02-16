@@ -627,6 +627,10 @@ func (node *Node) routeWorkerEvent(ctx context.Context, ev *streaming.Event) err
 	// Filter out stale events
 	if time.Since(ev.CreatedAt()) > pendingEventTTL {
 		node.logger.Debug("routeWorkerEvent: stale event, not routing", "event", ev.EventName, "id", ev.ID, "since", time.Since(ev.CreatedAt()), "TTL", pendingEventTTL)
+		// Ack the sink event so it does not get redelivered.
+		if err := node.poolSink.Ack(ctx, ev); err != nil {
+			node.logger.Error(fmt.Errorf("routeWorkerEvent: failed to ack event: %w", err), "event", ev.EventName, "id", ev.ID)
+		}
 		return nil
 	}
 
