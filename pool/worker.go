@@ -291,22 +291,18 @@ func (w *Worker) notify(_ context.Context, key string, payload []byte) error {
 // ackPoolEvent acknowledges the pool event that originated from the node with
 // the given ID.
 func (w *Worker) ackPoolEvent(ctx context.Context, nodeID, eventID string, ackerr error) {
-	stream, ok := w.nodeStreams.Load(nodeID)
-	if !ok {
-		var err error
-		stream, err = streaming.NewStream(nodeStreamName(w.node.PoolName, nodeID), w.node.rdb, soptions.WithStreamLogger(w.logger))
-		if err != nil {
-			w.logger.Error(fmt.Errorf("failed to create stream for node %q: %w", nodeID, err))
-			return
-		}
-		w.nodeStreams.Store(nodeID, stream)
+	stream, err := w.node.getOrCreateWorkerAckStream(ctx, nodeID)
+	if err != nil {
+		w.logger.Error(fmt.Errorf("failed to get ack stream for node %q: %w", nodeID, err))
+		return
 	}
+
 	var msg string
 	if ackerr != nil {
 		msg = ackerr.Error()
 	}
 	ack := &ack{EventID: eventID, Error: msg}
-	if _, err := stream.(*streaming.Stream).Add(ctx, evAck, marshalEnvelope(w.ID, marshalAck(ack))); err != nil {
+	if _, err := stream.Add(ctx, evAck, marshalEnvelope(w.ID, marshalAck(ack))); err != nil {
 		w.logger.Error(fmt.Errorf("failed to ack event %q from node %q: %w", eventID, nodeID, err))
 	}
 }
