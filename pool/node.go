@@ -53,6 +53,7 @@ type (
 
 		localWorkers       sync.Map // workers created by this node
 		workerStreams      sync.Map // worker streams indexed by ID
+		workerAckStreams   sync.Map // streams for worker acks indexed by ID
 		pendingJobChannels sync.Map // channels used to send DispatchJob results, nil if event is requeued
 		pendingEvents      sync.Map // pending events indexed by sender and event IDs
 
@@ -218,6 +219,7 @@ func AddNode(ctx context.Context, poolName string, rdb *redis.Client, opts ...No
 		shutdownMap:        wsm,
 		tickerMap:          tm,
 		workerStreams:      sync.Map{},
+		workerAckStreams:   sync.Map{},
 		pendingJobChannels: sync.Map{},
 		pendingEvents:      sync.Map{},
 		poolStream:         poolStream,
@@ -682,7 +684,7 @@ func (node *Node) ackWorkerEvent(ctx context.Context, ev *streaming.Event) {
 	// dispatched the job.
 	if pending.EventName == evStartJob {
 		_, nodeID := unmarshalJobKeyAndNodeID(pending.Payload)
-		stream, err := streaming.NewStream(nodeStreamName(node.PoolName, nodeID), node.rdb, soptions.WithStreamLogger(node.logger))
+		stream, err := node.getOrCreateWorkerAckStream(ctx, nodeID)
 		if err != nil {
 			node.logger.Error(fmt.Errorf("ackWorkerEvent: failed to create node event stream %q: %w", nodeStreamName(node.PoolName, nodeID), err))
 			return
@@ -1109,6 +1111,29 @@ func (node *Node) workerStream(_ context.Context, id string) (*streaming.Stream,
 		return s, nil
 	}
 	return val.(*streaming.Stream), nil
+}
+
+// getOrCreateWorkerAckStream gets or creates a stream for worker acks
+func (node *Node) getOrCreateWorkerAckStream(ctx context.Context, nodeID string) (*streaming.Stream, error) {
+	if val, ok := node.workerAckStreams.Load(nodeID); ok {
+		return val.(*streaming.Stream), nil
+	}
+
+	stream, err := streaming.NewStream(
+		nodeStreamName(node.PoolName, nodeID),
+		node.rdb,
+		soptions.WithStreamLogger(node.logger),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	actual, loaded := node.workerAckStreams.LoadOrStore(nodeID, stream)
+	if loaded {
+		// Another goroutine created the stream first, just discard our local reference
+		return actual.(*streaming.Stream), nil
+	}
+	return stream, nil
 }
 
 // cleanup removes the worker from all pool maps.

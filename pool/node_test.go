@@ -834,6 +834,44 @@ func TestShutdownStopsAllJobs(t *testing.T) {
 	assert.Empty(t, worker2.Jobs(), "Worker2 should have no remaining jobs")
 }
 
+func TestWorkerAckStreams(t *testing.T) {
+	testName := strings.Replace(t.Name(), "/", "_", -1)
+	ctx := ptesting.NewTestContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	node := newTestNode(t, ctx, rdb, testName)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+
+	// Create a worker and dispatch a job
+	worker := newTestWorker(t, ctx, node)
+	require.NoError(t, node.DispatchJob(ctx, testName, []byte("payload")))
+
+	// Wait for the job to start and be acknowledged
+	require.Eventually(t, func() bool {
+		return len(worker.Jobs()) == 1
+	}, max, delay)
+
+	// Verify stream is created and cached
+	stream1, err := node.getOrCreateWorkerAckStream(ctx, node.ID)
+	require.NoError(t, err)
+	stream2, err := node.getOrCreateWorkerAckStream(ctx, node.ID)
+	require.NoError(t, err)
+	assert.Same(t, stream1, stream2, "Expected same stream instance to be returned")
+
+	// Verify stream exists before shutdown
+	streamKey := "pulse:stream:" + nodeStreamName(testName, node.ID)
+	exists, err := rdb.Exists(ctx, streamKey).Result()
+	assert.NoError(t, err)
+	assert.Equal(t, int64(1), exists, "Expected stream to exist before shutdown")
+
+	// Shutdown node
+	assert.NoError(t, node.Shutdown(ctx))
+
+	// Verify stream is destroyed in Redis
+	exists, err = rdb.Exists(ctx, streamKey).Result()
+	assert.NoError(t, err)
+	assert.Equal(t, int64(0), exists, "Expected stream to be destroyed after shutdown")
+}
+
 type mockAcker struct {
 	XAckFunc func(ctx context.Context, streamKey, sinkName string, ids ...string) *redis.IntCmd
 }
