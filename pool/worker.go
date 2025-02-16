@@ -369,7 +369,7 @@ func (w *Worker) rebalance(ctx context.Context, activeWorkers []string) {
 		delete(rebalanced, key)
 		cherrs[key] = cherr
 	}
-	pulse.Go(ctx, func() { w.node.processRequeuedJobs(ctx, w.ID, cherrs, false) })
+	pulse.Go(ctx, func() { w.node.processRequeuedJobs(ctx, w.ID, cherrs, false, 0) })
 }
 
 // requeueJobs requeues the jobs handled by the worker.

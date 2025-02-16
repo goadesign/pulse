@@ -7,6 +7,7 @@ import (
 	"hash"
 	"hash/crc64"
 	"io"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -39,6 +40,7 @@ type (
 		nodeKeepAliveMap   *rmap.Map         // node keep-alive timestamps indexed by ID
 		workerKeepAliveMap *rmap.Map         // worker keep-alive timestamps indexed by ID
 		shutdownMap        *rmap.Map         // key is node ID that requested shutdown
+		cleanupMap         *rmap.Map         // key is stale worker ID that needs cleanup
 		tickerMap          *rmap.Map         // ticker next tick time indexed by name
 		workerTTL          time.Duration     // Worker considered dead if keep-alive not updated after this duration
 		workerShutdownTTL  time.Duration     // Worker considered dead if not shutdown after this duration
@@ -84,6 +86,10 @@ const (
 	// evDispatchReturn is the event used to forward the worker start return
 	// status to the node that dispatched the job.
 	evDispatchReturn string = "d"
+)
+
+const (
+	maxRequeuingRetries = 3 // Maximum number of times to retry requeuing jobs
 )
 
 // pendingEventTTL is the TTL for pending events.
@@ -146,6 +152,7 @@ func AddNode(ctx context.Context, poolName string, rdb *redis.Client, opts ...No
 		pjm *rmap.Map
 		km  *rmap.Map
 		tm  *rmap.Map
+		cm  *rmap.Map
 
 		poolSink   *streaming.Sink
 		nodeStream *streaming.Stream
@@ -179,6 +186,11 @@ func AddNode(ctx context.Context, poolName string, rdb *redis.Client, opts ...No
 		tm, err = rmap.Join(ctx, tickerMapName(poolName), rdb, rmap.WithLogger(logger))
 		if err != nil {
 			return nil, fmt.Errorf("AddNode: failed to join pool ticker replicated map %q: %w", tickerMapName(poolName), err)
+		}
+
+		cm, err = rmap.Join(ctx, cleanupMapName(poolName), rdb, rmap.WithLogger(logger))
+		if err != nil {
+			return nil, fmt.Errorf("AddNode: failed to join pool cleanup replicated map %q: %w", cleanupMapName(poolName), err)
 		}
 
 		// Initialize and join pending jobs map
@@ -217,6 +229,7 @@ func AddNode(ctx context.Context, poolName string, rdb *redis.Client, opts ...No
 		pendingJobsMap:     pjm,
 		shutdownMap:        wsm,
 		tickerMap:          tm,
+		cleanupMap:         cm,
 		workerStreams:      sync.Map{},
 		pendingJobChannels: sync.Map{},
 		pendingEvents:      sync.Map{},
@@ -919,34 +932,69 @@ func (node *Node) cleanupInactiveWorkers(ctx context.Context) {
 		if lsd <= node.workerTTL {
 			continue
 		}
-		node.logger.Info("Removing stale worker", "worker", id, "last-seen", lsd, "ttl", node.workerTTL)
 
-		// Use optimistic locking to set the keep-alive timestamp so that
-		// another node does not also requeue the jobs.
-		next := time.Now().UnixNano()
-		last, err := node.workerKeepAliveMap.TestAndSet(ctx, id, ls, strconv.FormatInt(next, 10))
-		if err != nil {
-			node.logger.Error(fmt.Errorf("cleanupInactiveWorkers: failed to set keep-alive timestamp: %w", err), "worker", id)
-			continue
-		}
-		if last != ls {
-			node.logger.Debug("cleanupInactiveWorkers: keep-alive timestamp for worker already set by another node", "worker", id)
-			continue
+		// Check if there's an existing cleanup timestamp
+		currentCleanup, exists := node.cleanupMap.Get(id)
+		if exists {
+			// If there is a cleanup timestamp, check if it's stale
+			cleanupTime, err := strconv.ParseInt(currentCleanup, 10, 64)
+			if err != nil {
+				node.logger.Error(fmt.Errorf("cleanupInactiveWorkers: invalid cleanup timestamp: %w", err), "worker", id)
+				continue
+			}
+			if time.Since(time.Unix(0, cleanupTime)) <= node.workerTTL {
+				// Another node is actively cleaning up this worker
+				node.logger.Debug("cleanupInactiveWorkers: cleanup in progress", "worker", id)
+				continue
+			}
+			// Stale cleanup - try to take over
+			now := strconv.FormatInt(time.Now().UnixNano(), 10)
+			prev, err := node.cleanupMap.TestAndSet(ctx, id, currentCleanup, now)
+			if err != nil {
+				node.logger.Error(fmt.Errorf("cleanupInactiveWorkers: failed to take over cleanup: %w", err), "worker", id)
+				continue
+			}
+			if prev != currentCleanup {
+				// Another node grabbed the cleanup
+				node.logger.Debug("cleanupInactiveWorkers: another node took over cleanup", "worker", id)
+				continue
+			}
+		} else {
+			// No cleanup in progress, try to set initial cleanup
+			now := strconv.FormatInt(time.Now().UnixNano(), 10)
+			ok, err := node.cleanupMap.SetIfNotExists(ctx, id, now)
+			if err != nil {
+				node.logger.Error(fmt.Errorf("cleanupInactiveWorkers: failed to set initial cleanup timestamp: %w", err), "worker", id)
+				continue
+			}
+			if !ok {
+				// Another node started cleanup between our check and set
+				node.logger.Debug("cleanupInactiveWorkers: concurrent cleanup started", "worker", id)
+				continue
+			}
 		}
 
+		node.logger.Info("starting cleanup of stale worker", "worker", id, "last-seen", lsd, "ttl", node.workerTTL)
+
+		// Get the jobs for this worker
 		keys, ok := node.jobsMap.GetValues(id)
 		if !ok {
-			// Worker has no jobs, so delete it right away.
+			// Worker has no jobs, delete it and remove cleanup timestamp
 			if err := node.deleteWorker(ctx, id); err != nil {
 				node.logger.Error(fmt.Errorf("cleanupInactiveWorkers: failed to delete worker %q: %w", id, err), "worker", id)
 			}
+			if _, err := node.cleanupMap.Delete(ctx, id); err != nil {
+				node.logger.Error(fmt.Errorf("cleanupInactiveWorkers: failed to remove cleanup timestamp: %w", err), "worker", id)
+			}
 			continue
 		}
+
+		// Requeue the worker's jobs
 		requeued := make(map[string]chan error)
 		for _, key := range keys {
 			payload, ok := node.JobPayload(key)
 			if !ok {
-				node.logger.Error(fmt.Errorf("cleanupInactiveWorkers: failed to get job payload for %q: %w", key, err), "worker", id)
+				node.logger.Error(fmt.Errorf("cleanupInactiveWorkers: failed to get job payload"), "job", key, "worker", id)
 				continue
 			}
 			job := &Job{
@@ -965,10 +1013,13 @@ func (node *Node) cleanupInactiveWorkers(ctx context.Context) {
 
 		allRequeued := len(requeued) == len(keys)
 		if !allRequeued {
-			node.logger.Error(fmt.Errorf("cleanupInactiveWorkers: failed to requeue inactive jobs: %d/%d, will retry later", len(requeued), len(keys)), "worker", id)
+			node.logger.Error(fmt.Errorf("cleanupInactiveWorkers: failed to requeue all inactive jobs: %d/%d", len(requeued), len(keys)), "worker", id)
 		}
 		if len(requeued) > 0 {
-			pulse.Go(ctx, func() { node.processRequeuedJobs(ctx, id, requeued, allRequeued) })
+			// Start the requeue processing in a separate goroutine
+			pulse.Go(ctx, func() {
+				node.processRequeuedJobs(ctx, id, requeued, allRequeued, 0)
+			})
 		}
 	}
 }
@@ -1003,7 +1054,7 @@ func (node *Node) updateNodeKeepAlive(ctx context.Context) {
 }
 
 // processRequeuedJobs processes the requeued jobs concurrently.
-func (node *Node) processRequeuedJobs(ctx context.Context, id string, requeued map[string]chan error, deleteWorker bool) {
+func (node *Node) processRequeuedJobs(ctx context.Context, id string, requeued map[string]chan error, deleteWorker bool, retryCount int) {
 	var wg sync.WaitGroup
 	var succeeded int64
 	for key, cherr := range requeued {
@@ -1018,22 +1069,32 @@ func (node *Node) processRequeuedJobs(ctx context.Context, id string, requeued m
 				}
 				atomic.AddInt64(&succeeded, 1)
 			case <-time.After(node.workerTTL):
-				node.logger.Error(fmt.Errorf("processRequeuedJobs: timeout waiting for requeue result"), "job", key, "worker", id, "timout", node.workerTTL)
+				node.logger.Error(fmt.Errorf("processRequeuedJobs: timeout waiting for requeue result"), "job", key, "worker", id, "timeout", node.workerTTL)
 			}
 		})
 	}
 	wg.Wait()
 
 	if succeeded != int64(len(requeued)) {
-		node.logger.Error(fmt.Errorf("processRequeuedJobs: failed to requeue all inactive jobs: %d/%d, will retry later", succeeded, len(requeued)), "worker", id)
-		return
+		if retryCount < maxRequeuingRetries {
+			backoff := time.Duration(math.Pow(2, float64(retryCount))) * time.Second
+			time.Sleep(backoff)
+			node.processRequeuedJobs(ctx, id, requeued, deleteWorker, retryCount+1)
+			return
+		}
+		node.logger.Error(fmt.Errorf("processRequeuedJobs: failed to requeue all jobs after %d retries: %d/%d", maxRequeuingRetries, succeeded, len(requeued)), "worker", id)
 	}
 
-	node.logger.Info("requeued worker jobs", "worker", id, "requeued", len(requeued))
+	node.logger.Info("requeued worker jobs", "worker", id, "requeued", succeeded)
 	if deleteWorker {
 		if err := node.deleteWorker(ctx, id); err != nil {
 			node.logger.Error(fmt.Errorf("processRequeuedJobs: failed to delete worker %q: %w", id, err), "worker", id)
 		}
+	}
+
+	// Clean up the cleanup timestamp after we're done
+	if _, err := node.cleanupMap.Delete(ctx, id); err != nil {
+		node.logger.Error(fmt.Errorf("processRequeuedJobs: failed to remove cleanup timestamp: %w", err), "worker", id)
 	}
 }
 
@@ -1046,6 +1107,15 @@ func (node *Node) activeWorkers() []string {
 		if createdAt == "-" {
 			continue // worker is in the process of being removed
 		}
+
+		// Skip workers that are being cleaned up
+		if cleanupTS, exists := node.cleanupMap.Get(id); exists {
+			cleanupTime, err := strconv.ParseInt(cleanupTS, 10, 64)
+			if err == nil && time.Since(time.Unix(0, cleanupTime)) <= node.workerTTL {
+				continue // Skip workers being actively cleaned up
+			}
+		}
+
 		cai, err := strconv.ParseInt(createdAt, 10, 64)
 		if err != nil {
 			node.logger.Error(fmt.Errorf("activeWorkers: failed to parse created at timestamp: %w", err), "worker", id)
@@ -1197,6 +1267,7 @@ func (node *Node) maps() []*rmap.Map {
 		node.workerKeepAliveMap,
 		node.shutdownMap,
 		node.tickerMap,
+		node.cleanupMap,
 		node.workerMap,
 	}
 }
@@ -1253,6 +1324,12 @@ func workerKeepAliveMapName(pool string) string {
 // ticks.
 func tickerMapName(pool string) string {
 	return fmt.Sprintf("%s:tickers", pool)
+}
+
+// cleanupMapName returns the name of the replicated map used to store the
+// worker status.
+func cleanupMapName(pool string) string {
+	return fmt.Sprintf("%s:cleanup", pool)
 }
 
 // shutdownMapName returns the name of the replicated map used to store the
