@@ -112,7 +112,7 @@ func newReader(ctx context.Context, stream *Stream, opts ...options.Reader) (*Re
 	}
 
 	reader.wait.Add(1)
-	pulse.Go(ctx, reader.read)
+	pulse.Go(reader.logger, reader.read)
 
 	return reader, nil
 }

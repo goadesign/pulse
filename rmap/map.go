@@ -11,9 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"goa.design/pulse/pulse"
-
 	"github.com/redis/go-redis/v9"
+	"goa.design/pulse/pulse"
 )
 
 type (
@@ -115,7 +114,7 @@ func Join(ctx context.Context, name string, rdb *redis.Client, opts ...MapOption
 
 	// read updates
 	sm.wait.Add(1)
-	pulse.Go(ctx, sm.run)
+	pulse.Go(sm.logger, sm.run)
 
 	sm.logger.Info("joined")
 	return sm, nil

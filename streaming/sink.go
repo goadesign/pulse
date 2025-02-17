@@ -13,6 +13,7 @@ import (
 	"github.com/oklog/ulid/v2"
 	redis "github.com/redis/go-redis/v9"
 
+	"goa.design/clue/log"
 	"goa.design/pulse/pulse"
 	"goa.design/pulse/rmap"
 	"goa.design/pulse/streaming/options"
@@ -162,10 +163,14 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...options.S
 	sink.consumer = consumer
 	sink.logger = sink.logger.WithPrefix("consumer", consumer)
 
+	// create new logger context for goroutines.
+	logCtx := context.Background()
+	logCtx = log.WithContext(logCtx, ctx)
+
 	sink.wait.Add(3)
-	pulse.Go(ctx, func() { sink.read(ctx) })
-	pulse.Go(ctx, sink.periodicKeepAlive)
-	pulse.Go(ctx, sink.periodicIdleMessageCheck)
+	pulse.Go(logger, func() { sink.read(logCtx) })
+	pulse.Go(logger, sink.periodicKeepAlive)
+	pulse.Go(logger, sink.periodicIdleMessageCheck)
 
 	sink.logger.Info("created", "start", sink.startID, "stream", stream.Name, "max_polled", sink.maxPolled, "block_duration", sink.blockDuration, "buffer_size", sink.bufferSize, "no_ack", sink.noAck, "ack_grace_period", sink.ackGracePeriod)
 

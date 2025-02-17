@@ -99,8 +99,9 @@ func (node *Node) Schedule(ctx context.Context, producer JobProducer, interval t
 	if err := sched.stopJobs(ctx, plan); err != nil {
 		return fmt.Errorf("failed to stop jobs: %w", err)
 	}
-	pulse.Go(ctx, func() { sched.scheduleJobs(ctx, ticker, producer) })
-	pulse.Go(ctx, func() { sched.handleStop(ctx) })
+
+	pulse.Go(sched.logger, func() { sched.scheduleJobs(ctx, ticker, producer) })
+	pulse.Go(sched.logger, func() { sched.handleStop() })
 	return nil
 }
 
@@ -175,7 +176,7 @@ func (sched *scheduler) stopJobs(ctx context.Context, plan *JobPlan) error {
 }
 
 // handleStop handles the scheduler stop signal.
-func (sched *scheduler) handleStop(_ context.Context) {
+func (sched *scheduler) handleStop() {
 	ch := sched.jobMap.Subscribe()
 	for ev := range ch {
 		if ev == rmap.EventReset {

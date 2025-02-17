@@ -325,10 +325,10 @@ func TestDispatchJobRaceCondition(t *testing.T) {
 
 		// Set a stale pending timestamp
 		staleTS := time.Now().Add(-time.Hour).UnixNano()
-		_, err := node1.pendingJobsMap.SetAndWait(ctx, jobKey, strconv.FormatInt(staleTS, 10))
+		_, err := node1.jobPendingMap.SetAndWait(ctx, jobKey, strconv.FormatInt(staleTS, 10))
 		require.NoError(t, err, "Failed to set stale pending timestamp")
 		defer func() {
-			_, err = node1.pendingJobsMap.Delete(ctx, jobKey)
+			_, err = node1.jobPendingMap.Delete(ctx, jobKey)
 			assert.NoError(t, err, "Failed to delete pending timestamp")
 		}()
 
@@ -346,7 +346,7 @@ func TestDispatchJobRaceCondition(t *testing.T) {
 		require.NoError(t, err, "Dispatch should succeed")
 		// Verify pending entry was cleaned up
 		require.Eventually(t, func() bool {
-			val, exists := node1.pendingJobsMap.Get(jobKey)
+			val, exists := node1.jobPendingMap.Get(jobKey)
 			t.Logf("Got pending value: %q", val)
 			return !exists
 		}, max, delay, "Pending entry should be cleaned up after successful dispatch")
@@ -357,7 +357,7 @@ func TestDispatchJobRaceCondition(t *testing.T) {
 		payload := []byte("test payload")
 
 		// Set an invalid pending timestamp
-		_, err := node1.pendingJobsMap.SetAndWait(ctx, jobKey, "invalid-timestamp")
+		_, err := node1.jobPendingMap.SetAndWait(ctx, jobKey, "invalid-timestamp")
 		require.NoError(t, err, "Failed to set invalid pending timestamp")
 
 		// Dispatch should succeed (invalid timestamps are logged and ignored)
@@ -380,7 +380,7 @@ func TestDispatchJobRaceCondition(t *testing.T) {
 
 		// Verify pending entry was cleaned up
 		require.Eventually(t, func() bool {
-			_, exists := node1.pendingJobsMap.Get(jobKey)
+			_, exists := node1.jobPendingMap.Get(jobKey)
 			return !exists
 		}, max, delay, "Pending entry should be cleaned up after failed dispatch")
 	})
@@ -623,7 +623,7 @@ func TestAckWorkerEventWithMissingPendingEvent(t *testing.T) {
 	}
 
 	// Call ackWorkerEvent with the mock event
-	node.ackWorkerEvent(ctx, mockEvent)
+	node.ackWorkerEvent(mockEvent)
 
 	// Verify that no panic occurred and the function completed successfully
 	assert.True(t, true, "ackWorkerEvent should complete without panic")
@@ -681,7 +681,7 @@ func TestStaleEventsAreRemoved(t *testing.T) {
 	node.pendingEvents.Store(pendingEventKey("worker", mockEventID), mockEvent)
 
 	// Call ackWorkerEvent to trigger the stale event cleanup
-	node.ackWorkerEvent(ctx, mockEvent)
+	node.ackWorkerEvent(mockEvent)
 
 	assert.Eventually(t, func() bool {
 		_, ok := node.pendingEvents.Load(pendingEventKey("worker", staleEventID))
@@ -851,9 +851,9 @@ func TestWorkerAckStreams(t *testing.T) {
 	}, max, delay)
 
 	// Verify stream is created and cached
-	stream1, err := node.getOrCreateWorkerAckStream(ctx, node.ID)
+	stream1, err := node.getNodeStream(node.ID)
 	require.NoError(t, err)
-	stream2, err := node.getOrCreateWorkerAckStream(ctx, node.ID)
+	stream2, err := node.getNodeStream(node.ID)
 	require.NoError(t, err)
 	assert.Same(t, stream1, stream2, "Expected same stream instance to be returned")
 

@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/oklog/ulid/v2"
+	"goa.design/clue/log"
+
 	"goa.design/pulse/pulse"
 	"goa.design/pulse/rmap"
 	"goa.design/pulse/streaming"
@@ -110,10 +112,10 @@ func newWorker(ctx context.Context, node *Node, h JobHandler) (*Worker, error) {
 		stream:            stream,
 		reader:            reader,
 		done:              make(chan struct{}),
-		jobsMap:           node.jobsMap,
-		jobPayloadsMap:    node.jobPayloadsMap,
+		jobsMap:           node.jobMap,
+		jobPayloadsMap:    node.jobPayloadMap,
 		keepAliveMap:      node.workerKeepAliveMap,
-		shutdownMap:       node.shutdownMap,
+		shutdownMap:       node.nodeShutdownMap,
 		workerTTL:         node.workerTTL,
 		workerShutdownTTL: node.workerShutdownTTL,
 		logger:            node.logger.WithPrefix("worker", wid),
@@ -126,8 +128,13 @@ func newWorker(ctx context.Context, node *Node, h JobHandler) (*Worker, error) {
 		"worker_shutdown_ttl", w.workerShutdownTTL)
 
 	w.wg.Add(2)
-	pulse.Go(ctx, func() { w.handleEvents(ctx, reader.Subscribe()) })
-	pulse.Go(ctx, func() { w.keepAlive(ctx) })
+
+	// Create new context for the worker so that canceling the original one does
+	// not cancel the worker.
+	logCtx := context.Background()
+	logCtx = log.WithContext(logCtx, ctx)
+	pulse.Go(w.logger, func() { w.handleEvents(logCtx, reader.Subscribe()) })
+	pulse.Go(w.logger, func() { w.keepAlive(logCtx) })
 
 	return w, nil
 }
@@ -291,7 +298,7 @@ func (w *Worker) notify(_ context.Context, key string, payload []byte) error {
 // ackPoolEvent acknowledges the pool event that originated from the node with
 // the given ID.
 func (w *Worker) ackPoolEvent(ctx context.Context, nodeID, eventID string, ackerr error) {
-	stream, err := w.node.getOrCreateWorkerAckStream(ctx, nodeID)
+	stream, err := w.node.getNodeStream(nodeID)
 	if err != nil {
 		w.logger.Error(fmt.Errorf("failed to get ack stream for node %q: %w", nodeID, err))
 		return
@@ -354,7 +361,7 @@ func (w *Worker) rebalance(ctx context.Context, activeWorkers []string) {
 		}
 		w.logger.Debug("stopped job", "job", key)
 		w.jobs.Delete(key)
-		cherr, err := w.node.requeueJob(ctx, w.ID, job)
+		cherr, err := w.node.requeueJob(w.ID, job)
 		if err != nil {
 			w.logger.Error(fmt.Errorf("rebalance: failed to requeue job: %w", err), "job", key)
 			if err := w.handler.Start(job); err != nil {
@@ -365,7 +372,7 @@ func (w *Worker) rebalance(ctx context.Context, activeWorkers []string) {
 		delete(rebalanced, key)
 		cherrs[key] = cherr
 	}
-	pulse.Go(ctx, func() { w.node.processRequeuedJobs(ctx, w.ID, cherrs, false, 0) })
+	pulse.Go(w.logger, func() { w.node.processRequeuedJobs(ctx, w.ID, cherrs, false, 0) })
 }
 
 // requeueJobs requeues the jobs handled by the worker.
@@ -428,7 +435,7 @@ func (w *Worker) attemptRequeue(ctx context.Context, jobsToRequeue map[string]*J
 
 	wg.Add(len(jobsToRequeue))
 	for key, job := range jobsToRequeue {
-		pulse.Go(ctx, func() {
+		pulse.Go(w.logger, func() {
 			defer wg.Done()
 			err := w.requeueJob(ctx, job)
 			if err != nil {
