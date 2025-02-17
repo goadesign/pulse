@@ -826,7 +826,7 @@ func (node *Node) requeueJob(workerID string, job *Job) (chan error, error) {
 		node.logger.Debug("requeueJob: job already removed from jobs map", "key", job.Key, "worker", workerID)
 		return nil, nil
 	}
-	node.logger.Debug("requeuing job", "key", job.Key, "worker", workerID)
+	node.logger.Info("requeuing job", "key", job.Key, "worker", workerID)
 	job.NodeID = node.ID
 
 	eventID, err := node.poolStream.Add(ctx, evStartJob, marshalJob(job))
@@ -989,13 +989,36 @@ func (node *Node) cleanupInactiveWorkers(ctx context.Context) {
 func (node *Node) cleanupWorker(ctx context.Context, workerID string) {
 	// Try to acquire cleanup lock
 	now := strconv.FormatInt(time.Now().UnixNano(), 10)
+	existingTS, exists := node.workerCleanupMap.Get(workerID)
+	if exists {
+		ts, err := strconv.ParseInt(existingTS, 10, 64)
+		if err != nil {
+			// Invalid timestamp, we can delete and retry
+			if _, err := node.workerCleanupMap.Delete(ctx, workerID); err != nil {
+				node.logger.Error(fmt.Errorf("cleanupWorkerJobs: failed to delete invalid cleanup timestamp: %w", err), "worker", workerID)
+				return
+			}
+		} else if time.Since(time.Unix(0, ts)) > node.workerTTL {
+			// Stale lock, we can delete and retry
+			node.logger.Info("cleanupWorkerJobs: found stale cleanup lock", "worker", workerID, "age", time.Since(time.Unix(0, ts)))
+			if _, err := node.workerCleanupMap.Delete(ctx, workerID); err != nil {
+				node.logger.Error(fmt.Errorf("cleanupWorkerJobs: failed to delete stale cleanup timestamp: %w", err), "worker", workerID)
+				return
+			}
+		} else {
+			// Lock is still valid
+			node.logger.Debug("cleanupWorkerJobs: cleanup already in progress", "worker", workerID)
+			return
+		}
+	}
+
 	ok, err := node.workerCleanupMap.SetIfNotExists(ctx, workerID, now)
 	if err != nil {
 		node.logger.Error(fmt.Errorf("cleanupWorkerJobs: failed to set cleanup timestamp: %w", err), "worker", workerID)
 		return
 	}
 	if !ok {
-		// Another node is handling cleanup
+		// Another node just acquired the lock
 		node.logger.Debug("cleanupWorkerJobs: cleanup already in progress", "worker", workerID)
 		return
 	}
@@ -1007,6 +1030,7 @@ func (node *Node) cleanupWorker(ctx context.Context, workerID string) {
 		if err := node.deleteWorker(workerID); err != nil {
 			node.logger.Error(fmt.Errorf("cleanupWorkerJobs: failed to delete worker: %w", err), "worker", workerID)
 		}
+		node.logger.Info("cleaned up worker with no jobs", "worker", workerID)
 		return
 	}
 
@@ -1091,6 +1115,9 @@ func (node *Node) processRequeuedJobs(ctx context.Context, id string, requeued m
 					return
 				}
 				atomic.AddInt64(&succeeded, 1)
+				if _, _, err := node.jobMap.RemoveValues(ctx, id, key); err != nil {
+					node.logger.Error(fmt.Errorf("processRequeuedJobs: failed to remove job: %w", err), "job", key, "worker", id)
+				}
 			case <-time.After(node.workerTTL):
 				node.logger.Error(fmt.Errorf("processRequeuedJobs: timeout waiting for requeue result"), "job", key, "worker", id, "timeout", node.workerTTL)
 			}
