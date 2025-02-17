@@ -7,7 +7,6 @@ import (
 	"hash"
 	"hash/crc64"
 	"io"
-	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,7 +39,7 @@ type (
 		workerKeepAliveMap *rmap.Map         // worker keep-alive timestamps indexed by ID
 		workerCleanupMap   *rmap.Map         // key is stale worker ID that needs cleanup
 		jobMap             *rmap.Map         // jobs by worker ID
-		jobPendingMap      *rmap.Map         // pending jobs by job key
+		jobPendingMap      *rmap.Map         // pending jobs by worker ID
 		jobPayloadMap      *rmap.Map         // job payloads by job key
 		tickerMap          *rmap.Map         // ticker next tick time indexed by name
 		workerTTL          time.Duration     // Worker considered dead if keep-alive not updated after this duration
@@ -304,7 +303,7 @@ func (node *Node) RemoveWorker(ctx context.Context, w *Worker) error {
 	if err := w.requeueJobs(ctx); err != nil {
 		node.logger.Error(fmt.Errorf("RemoveWorker: failed to requeue jobs for worker %q: %w", w.ID, err))
 	}
-	node.cleanupWorker(ctx, w.ID)
+	node.removeWorker(ctx, w.ID)
 	node.localWorkers.Delete(w.ID)
 	node.logger.Info("removed worker", "worker", w.ID)
 	return nil
@@ -556,12 +555,13 @@ func (node *Node) close(ctx context.Context, shutdown bool) error {
 	// Stop all workers before waiting for goroutines
 	var wg sync.WaitGroup
 	node.localWorkers.Range(func(key, value any) bool {
+		worker := value.(*Worker)
 		wg.Add(1)
 		pulse.Go(node.logger, func() {
 			defer wg.Done()
-			value.(*Worker).stop(ctx)
+			worker.stop(ctx)
 			// Remove worker immediately to avoid job requeuing by other nodes
-			node.cleanupWorker(ctx, value.(*Worker).ID)
+			node.removeWorker(ctx, worker.ID)
 		})
 		return true
 	})
@@ -648,7 +648,7 @@ func (node *Node) routeWorkerEvent(ev *streaming.Event) error {
 	wid := activeWorkers[node.h.Hash(key, int64(len(activeWorkers)))]
 
 	// Stream the event to the worker corresponding to the key hash.
-	stream, err := node.workerStream(wid)
+	stream, err := node.getWorkerStream(wid)
 	if err != nil {
 		return err
 	}
@@ -892,6 +892,8 @@ func (node *Node) processInactiveNodes() {
 	}
 }
 
+// cleanupInactiveNodes checks for inactive nodes, destroys their streams and
+// removes them from the keep-alive map.
 func (node *Node) cleanupInactiveNodes() {
 	nodeMap := node.nodeKeepAliveMap.Map()
 	for nodeID, lastSeen := range nodeMap {
@@ -917,7 +919,7 @@ func (node *Node) cleanupInactiveNodes() {
 	}
 }
 
-// processInactiveWorkers periodically checks for inactive workers and requeues their jobs.
+// processInactiveWorkers periodically cleans up inactive workers.
 func (node *Node) processInactiveWorkers(ctx context.Context) {
 	defer node.wg.Done()
 	ticker := time.NewTicker(node.workerTTL)
@@ -933,106 +935,115 @@ func (node *Node) processInactiveWorkers(ctx context.Context) {
 	}
 }
 
+// cleanupInactiveWorkers ensures all jobs are assigned to active workers by performing
+// two types of cleanup:
+//  1. Orphaned jobs: finds and requeues jobs assigned to workers that no longer exist
+//     in the keep-alive map, which can happen if a worker was improperly terminated
+//  2. Inactive workers: finds workers that haven't updated their keep-alive timestamp
+//     within workerTTL duration and requeues their jobs
+//
+// The cleanup process is distributed and idempotent - multiple nodes can attempt
+// cleanup concurrently, but only one will succeed for each worker due to cleanup
+// lock acquisition. Jobs are requeued and will be reassigned to active workers
+// through consistent hashing.
 func (node *Node) cleanupInactiveWorkers(ctx context.Context) {
 	alive := node.workerKeepAliveMap.Map()
-	for id, ls := range alive {
-		lsi, err := strconv.ParseInt(ls, 10, 64)
-		if err != nil {
-			node.logger.Error(fmt.Errorf("cleanupInactiveWorkers: failed to parse last seen timestamp: %w", err), "worker", id)
+
+	// Remove stale entries from the worker cleanup map
+	cleanedUp := node.workerCleanupMap.Keys()
+	for _, workerID := range cleanedUp {
+		_, isAlive := alive[workerID]
+		if !isAlive {
+			if _, err := node.workerCleanupMap.Delete(ctx, workerID); err != nil {
+				node.logger.Error(fmt.Errorf("cleanupInactiveWorkers: failed to delete stale cleanup entry: %w", err), "worker", workerID)
+			}
+			node.logger.Info("removed stale cleanup entry", "worker", workerID)
 			continue
-		}
-		lastSeen := time.Unix(0, lsi)
-		lsd := time.Since(lastSeen)
-		if lsd <= node.workerTTL {
-			continue
-		}
-
-		// Check if there's an existing cleanup timestamp
-		currentCleanup, exists := node.workerCleanupMap.Get(id)
-		if exists {
-			// If there is a cleanup timestamp, check if it's stale
-			cleanupTime, err := strconv.ParseInt(currentCleanup, 10, 64)
-			if err != nil {
-				node.logger.Error(fmt.Errorf("cleanupInactiveWorkers: invalid cleanup timestamp: %w", err), "worker", id)
-				continue
-			}
-			if time.Since(time.Unix(0, cleanupTime)) <= node.workerTTL {
-				// Another node is actively cleaning up this worker
-				node.logger.Debug("cleanupInactiveWorkers: cleanup in progress", "worker", id)
-				continue
-			}
-			// Stale cleanup - try to take over
-			now := strconv.FormatInt(time.Now().UnixNano(), 10)
-			prev, err := node.workerCleanupMap.TestAndSet(ctx, id, currentCleanup, now)
-			if err != nil {
-				node.logger.Error(fmt.Errorf("cleanupInactiveWorkers: failed to take over cleanup: %w", err), "worker", id)
-				continue
-			}
-			if prev != currentCleanup {
-				// Another node grabbed the cleanup
-				node.logger.Debug("cleanupInactiveWorkers: another node took over cleanup", "worker", id)
-				continue
-			}
-		} else {
-			// No cleanup in progress, try to set initial cleanup
-			now := strconv.FormatInt(time.Now().UnixNano(), 10)
-			ok, err := node.workerCleanupMap.SetIfNotExists(ctx, id, now)
-			if err != nil {
-				node.logger.Error(fmt.Errorf("cleanupInactiveWorkers: failed to set initial cleanup timestamp: %w", err), "worker", id)
-				continue
-			}
-			if !ok {
-				// Another node started cleanup between our check and set
-				node.logger.Debug("cleanupInactiveWorkers: concurrent cleanup started", "worker", id)
-				continue
-			}
-		}
-
-		node.logger.Info("starting cleanup of stale worker", "worker", id, "last-seen", lsd, "ttl", node.workerTTL)
-
-		// Get the jobs for this worker
-		keys, ok := node.jobMap.GetValues(id)
-		if !ok || len(keys) == 0 {
-			// Worker has no jobs, delete it and remove cleanup timestamp
-			if err := node.deleteWorker(id); err != nil {
-				node.logger.Error(fmt.Errorf("cleanupInactiveWorkers: failed to delete worker %q: %w", id, err), "worker", id)
-			}
-			continue
-		}
-
-		// Requeue the worker's jobs
-		requeued := make(map[string]chan error)
-		for _, key := range keys {
-			payload, ok := node.JobPayload(key)
-			if !ok {
-				node.logger.Error(fmt.Errorf("cleanupInactiveWorkers: failed to get job payload"), "job", key, "worker", id)
-				continue
-			}
-			job := &Job{
-				Key:       key,
-				Payload:   []byte(payload),
-				CreatedAt: time.Now(),
-				NodeID:    node.ID,
-			}
-			cherr, err := node.requeueJob(id, job)
-			if err != nil {
-				node.logger.Error(fmt.Errorf("cleanupInactiveWorkers: failed to requeue inactive job: %w", err), "job", job.Key, "worker", id)
-				continue
-			}
-			requeued[job.Key] = cherr
-		}
-
-		allRequeued := len(requeued) == len(keys)
-		if !allRequeued {
-			node.logger.Error(fmt.Errorf("cleanupInactiveWorkers: failed to requeue all inactive jobs: %d/%d", len(requeued), len(keys)), "worker", id)
-		}
-		if len(requeued) > 0 {
-			// Start the requeue processing in a separate goroutine
-			pulse.Go(node.logger, func() {
-				node.processRequeuedJobs(ctx, id, requeued, allRequeued, 0)
-			})
 		}
 	}
+
+	// Check for workers that have jobs but don't exist in keep-alive map
+	for _, workerID := range node.jobMap.Keys() {
+		if _, exists := alive[workerID]; !exists {
+			node.logger.Info("found worker with jobs but no keep-alive entry", "worker", workerID)
+			node.cleanupWorker(ctx, workerID)
+		}
+	}
+
+	// Check for workers that haven't been seen for too long
+	for workerID, lastSeen := range alive {
+		lsi, err := strconv.ParseInt(lastSeen, 10, 64)
+		if err != nil {
+			node.logger.Error(fmt.Errorf("cleanupInactiveWorkers: invalid last seen timestamp: %w", err), "worker", workerID)
+			continue
+		}
+		if time.Since(time.Unix(0, lsi)) > node.workerTTL {
+			node.logger.Info("found inactive worker", "worker", workerID, "last-seen", time.Since(time.Unix(0, lsi)), "ttl", node.workerTTL)
+			node.cleanupWorker(ctx, workerID)
+		}
+	}
+}
+
+// cleanupWorker requeues the jobs assigned to the worker and deletes it from
+// the pool.
+func (node *Node) cleanupWorker(ctx context.Context, workerID string) {
+	// Try to acquire cleanup lock
+	now := strconv.FormatInt(time.Now().UnixNano(), 10)
+	ok, err := node.workerCleanupMap.SetIfNotExists(ctx, workerID, now)
+	if err != nil {
+		node.logger.Error(fmt.Errorf("cleanupWorkerJobs: failed to set cleanup timestamp: %w", err), "worker", workerID)
+		return
+	}
+	if !ok {
+		// Another node is handling cleanup
+		node.logger.Debug("cleanupWorkerJobs: cleanup already in progress", "worker", workerID)
+		return
+	}
+
+	// Get the worker's jobs
+	keys, ok := node.jobMap.GetValues(workerID)
+	if !ok || len(keys) == 0 {
+		// Worker has no jobs, just delete it
+		if err := node.deleteWorker(workerID); err != nil {
+			node.logger.Error(fmt.Errorf("cleanupWorkerJobs: failed to delete worker: %w", err), "worker", workerID)
+		}
+		return
+	}
+
+	// Requeue each job
+	requeued := make(map[string]chan error)
+	for _, key := range keys {
+		payload, ok := node.JobPayload(key)
+		if !ok {
+			node.logger.Error(fmt.Errorf("cleanupWorkerJobs: failed to get job payload"), "job", key, "worker", workerID)
+			continue
+		}
+		job := &Job{
+			Key:       key,
+			Payload:   []byte(payload),
+			CreatedAt: time.Now(),
+			NodeID:    node.ID,
+		}
+		cherr, err := node.requeueJob(workerID, job)
+		if err != nil {
+			node.logger.Error(fmt.Errorf("cleanupWorkerJobs: failed to requeue job: %w", err), "job", job.Key, "worker", workerID)
+			continue
+		}
+		requeued[job.Key] = cherr
+	}
+
+	if len(requeued) == 0 {
+		return
+	}
+
+	// Process requeued jobs
+	allRequeued := len(requeued) == len(keys)
+	if !allRequeued {
+		node.logger.Error(fmt.Errorf("cleanupWorkerJobs: only requeued %d/%d jobs", len(requeued), len(keys)), "worker", workerID)
+	}
+	pulse.Go(node.logger, func() {
+		node.processRequeuedJobs(ctx, workerID, requeued, allRequeued)
+	})
 }
 
 // isActive checks if a timestamp is within TTL
@@ -1066,7 +1077,7 @@ func (node *Node) updateNodeKeepAlive() {
 }
 
 // processRequeuedJobs processes the requeued jobs concurrently.
-func (node *Node) processRequeuedJobs(ctx context.Context, id string, requeued map[string]chan error, deleteWorker bool, retryCount int) {
+func (node *Node) processRequeuedJobs(ctx context.Context, id string, requeued map[string]chan error, deleteWorker bool) {
 	var wg sync.WaitGroup
 	var succeeded int64
 	for key, cherr := range requeued {
@@ -1086,16 +1097,6 @@ func (node *Node) processRequeuedJobs(ctx context.Context, id string, requeued m
 		})
 	}
 	wg.Wait()
-
-	if succeeded != int64(len(requeued)) {
-		if retryCount < maxRequeuingRetries {
-			backoff := time.Duration(math.Pow(2, float64(retryCount))) * time.Second
-			time.Sleep(backoff)
-			node.processRequeuedJobs(ctx, id, requeued, deleteWorker, retryCount+1)
-			return
-		}
-		node.logger.Error(fmt.Errorf("processRequeuedJobs: failed to requeue all jobs after %d retries: %d/%d", maxRequeuingRetries, succeeded, len(requeued)), "worker", id)
-	}
 
 	node.logger.Info("requeued worker jobs", "worker", id, "requeued", succeeded)
 	if deleteWorker {
@@ -1168,19 +1169,12 @@ func (node *Node) activeWorkers() []string {
 func (node *Node) deleteWorker(id string) error {
 	ctx := context.Background()
 	node.logger.Debug("deleteWorker: deleting worker", "worker", id)
-	if _, err := node.workerMap.Delete(ctx, id); err != nil {
-		node.logger.Error(fmt.Errorf("deleteWorker: failed to delete worker %q from workers map: %w", id, err))
-	}
-	if _, err := node.workerKeepAliveMap.Delete(ctx, id); err != nil {
-		node.logger.Error(fmt.Errorf("deleteWorker: failed to delete worker %q from keep-alive map: %w", id, err))
-	}
-	if _, err := node.workerCleanupMap.Delete(ctx, id); err != nil {
-		node.logger.Error(fmt.Errorf("deleteWorker: failed to remove cleanup timestamp: %w", err), "worker", id)
-	}
-	if _, err := node.jobMap.Delete(ctx, id); err != nil {
-		node.logger.Error(fmt.Errorf("deleteWorker: failed to delete worker %q from jobs map: %w", id, err))
-	}
-	stream, err := node.workerStream(id)
+
+	// Remove from all maps including cleanup map
+	node.removeWorkerFromMaps(ctx, id)
+
+	// Destroy the worker's stream
+	stream, err := node.getWorkerStream(id)
 	if err != nil {
 		return fmt.Errorf("deleteWorker: failed to retrieve worker stream for %q: %w", id, err)
 	}
@@ -1190,9 +1184,33 @@ func (node *Node) deleteWorker(id string) error {
 	return nil
 }
 
-// workerStream retrieves the stream for a worker. It caches the result in the
-// workerStreams map. Caller is responsible for locking.
-func (node *Node) workerStream(id string) (*streaming.Stream, error) {
+// removeWorker removes a worker that was created by this node.
+// This is used during graceful shutdown or explicit worker removal.
+func (node *Node) removeWorker(ctx context.Context, id string) {
+	node.removeWorkerFromMaps(ctx, id)
+	node.workerStreams.Delete(id)
+}
+
+// removeWorkerFromMaps removes the worker from all tracking maps.
+// This is the common cleanup needed for both local and remote worker removal.
+func (node *Node) removeWorkerFromMaps(ctx context.Context, id string) {
+	if _, err := node.workerMap.Delete(ctx, id); err != nil {
+		node.logger.Error(fmt.Errorf("removeWorkerFromMaps: failed to remove worker %s from worker map: %w", id, err))
+	}
+	if _, err := node.workerKeepAliveMap.Delete(ctx, id); err != nil {
+		node.logger.Error(fmt.Errorf("removeWorkerFromMaps: failed to remove worker %s from keep-alive map: %w", id, err))
+	}
+	if _, err := node.workerCleanupMap.Delete(ctx, id); err != nil {
+		node.logger.Error(fmt.Errorf("removeWorkerFromMaps: failed to remove cleanup timestamp: %w", err), "worker", id)
+	}
+	if _, err := node.jobMap.Delete(ctx, id); err != nil {
+		node.logger.Error(fmt.Errorf("removeWorkerFromMaps: failed to remove worker %s from jobs map: %w", id, err))
+	}
+}
+
+// getWorkerStream retrieves the stream for a worker. It caches the result in the
+// workerStreams map.
+func (node *Node) getWorkerStream(id string) (*streaming.Stream, error) {
 	val, ok := node.workerStreams.Load(id)
 	if !ok {
 		s, err := streaming.NewStream(workerStreamName(id), node.rdb, options.WithStreamLogger(node.logger))
@@ -1210,35 +1228,16 @@ func (node *Node) getNodeStream(nodeID string) (*streaming.Stream, error) {
 	if nodeID == node.ID {
 		return node.nodeStream, nil
 	}
-	if val, ok := node.nodeStreams.Load(nodeID); ok {
-		return val.(*streaming.Stream), nil
+	val, ok := node.nodeStreams.Load(nodeID)
+	if !ok {
+		s, err := streaming.NewStream(nodeStreamName(node.PoolName, nodeID), node.rdb, options.WithStreamLogger(node.logger))
+		if err != nil {
+			return nil, fmt.Errorf("getNodeStream: failed to create node stream %q: %w", nodeStreamName(node.PoolName, nodeID), err)
+		}
+		node.nodeStreams.Store(nodeID, s)
+		return s, nil
 	}
-
-	stream, err := streaming.NewStream(nodeStreamName(node.PoolName, nodeID), node.rdb, options.WithStreamLogger(node.logger))
-	if err != nil {
-		return nil, err
-	}
-
-	actual, loaded := node.nodeStreams.LoadOrStore(nodeID, stream)
-	if loaded {
-		// Another goroutine created the stream first, just discard our local reference
-		return actual.(*streaming.Stream), nil
-	}
-	return stream, nil
-}
-
-// cleanup removes the worker from all pool maps.
-func (node *Node) cleanupWorker(ctx context.Context, id string) {
-	if _, err := node.workerMap.Delete(ctx, id); err != nil {
-		node.logger.Error(fmt.Errorf("failed to remove worker %s from worker map: %w", id, err))
-	}
-	if _, err := node.workerKeepAliveMap.Delete(ctx, id); err != nil {
-		node.logger.Error(fmt.Errorf("failed to remove worker %s from keep alive map: %w", id, err))
-	}
-	if _, err := node.jobMap.Delete(ctx, id); err != nil {
-		node.logger.Error(fmt.Errorf("failed to remove worker %s from jobs map: %w", id, err))
-	}
-	node.workerStreams.Delete(id)
+	return val.(*streaming.Stream), nil
 }
 
 // requeueAllJobs requeues all jobs from all local workers in parallel. It waits for all
@@ -1329,6 +1328,12 @@ func (jh jumpHash) Hash(key string, numBuckets int64) int64 {
 	return b
 }
 
+// pendingEventKey computes the key of a pending event from a worker ID and a
+// stream event ID.
+func pendingEventKey(workerID, eventID string) string {
+	return fmt.Sprintf("%s:%s", workerID, eventID)
+}
+
 // nodeKeepAliveMapName returns the name of the replicated map used to store the
 // node keep-alive timestamps.
 func nodeKeepAliveMapName(pool string) string {
@@ -1391,10 +1396,4 @@ func poolStreamName(pool string) string {
 // nodeStreamName returns the name of the stream used by node events.
 func nodeStreamName(pool, nodeID string) string {
 	return fmt.Sprintf("%s:node:%s", pool, nodeID)
-}
-
-// pendingEventKey computes the key of a pending event from a worker ID and a
-// stream event ID.
-func pendingEventKey(workerID, eventID string) string {
-	return fmt.Sprintf("%s:%s", workerID, eventID)
 }
