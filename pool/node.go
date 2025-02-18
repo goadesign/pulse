@@ -902,7 +902,7 @@ func (node *Node) processInactiveNodes() {
 func (node *Node) cleanupInactiveNodes() {
 	nodeMap := node.nodeKeepAliveMap.Map()
 	for nodeID, lastSeen := range nodeMap {
-		if nodeID == node.ID || node.isActive(lastSeen, node.workerTTL) {
+		if nodeID == node.ID || node.isWithinTTL(lastSeen, node.workerTTL) {
 			continue
 		}
 
@@ -952,79 +952,47 @@ func (node *Node) processInactiveWorkers(ctx context.Context) {
 // lock acquisition. Jobs are requeued and will be reassigned to active workers
 // through consistent hashing.
 func (node *Node) cleanupInactiveWorkers(ctx context.Context) {
-	alive := node.workerKeepAliveMap.Map()
-
-	// Remove stale entries from the worker cleanup map
-	cleanedUp := node.workerCleanupMap.Keys()
-	for _, workerID := range cleanedUp {
-		_, isAlive := alive[workerID]
-		if !isAlive {
-			if _, err := node.workerCleanupMap.Delete(ctx, workerID); err != nil {
-				node.logger.Error(fmt.Errorf("cleanupInactiveWorkers: failed to delete stale cleanup entry: %w", err), "worker", workerID)
-			}
-			node.logger.Info("removed stale cleanup entry", "worker", workerID)
-			continue
-		}
+	active := node.activeWorkers()
+	activeMap := make(map[string]struct{})
+	for _, id := range active {
+		activeMap[id] = struct{}{}
 	}
 
-	// Check for workers that have jobs but don't exist in keep-alive map
+	// Get all workers that need cleanup (either in jobMap or workerMap)
+	workersToCheck := make(map[string]struct{})
 	for _, workerID := range node.jobMap.Keys() {
-		if _, exists := alive[workerID]; !exists {
-			node.logger.Info("found worker with jobs but no keep-alive entry", "worker", workerID)
-			node.cleanupWorker(ctx, workerID)
-		}
+		workersToCheck[workerID] = struct{}{}
+	}
+	for _, workerID := range node.workerMap.Keys() {
+		workersToCheck[workerID] = struct{}{}
 	}
 
-	// Check for workers that haven't been seen for too long
-	for workerID, lastSeen := range alive {
-		lsi, err := strconv.ParseInt(lastSeen, 10, 64)
-		if err != nil {
-			node.logger.Error(fmt.Errorf("cleanupInactiveWorkers: invalid last seen timestamp: %w", err), "worker", workerID)
+	// Check each worker
+	for workerID := range workersToCheck {
+		// Skip active workers
+		if _, ok := activeMap[workerID]; ok {
 			continue
 		}
-		if time.Since(time.Unix(0, lsi)) > node.workerTTL {
-			node.logger.Info("found inactive worker", "worker", workerID, "last-seen", time.Since(time.Unix(0, lsi)), "ttl", node.workerTTL)
-			node.cleanupWorker(ctx, workerID)
+
+		// Skip workers being cleaned up
+		if cleanupTS, exists := node.workerCleanupMap.Get(workerID); exists {
+			if node.isWithinTTL(cleanupTS, node.workerTTL) {
+				node.logger.Debug("cleanupInactiveWorkers: worker already being cleaned up", "worker", workerID)
+				continue
+			}
 		}
+
+		// Worker needs cleanup
+		node.logger.Info("cleanupInactiveWorkers: found inactive worker", "worker", workerID)
+		node.cleanupWorker(ctx, workerID)
 	}
 }
 
 // cleanupWorker requeues the jobs assigned to the worker and deletes it from
 // the pool.
 func (node *Node) cleanupWorker(ctx context.Context, workerID string) {
-	// Try to acquire cleanup lock
-	now := strconv.FormatInt(time.Now().UnixNano(), 10)
-	existingTS, exists := node.workerCleanupMap.Get(workerID)
-	if exists {
-		ts, err := strconv.ParseInt(existingTS, 10, 64)
-		if err != nil {
-			// Invalid timestamp, we can delete and retry
-			if _, err := node.workerCleanupMap.Delete(ctx, workerID); err != nil {
-				node.logger.Error(fmt.Errorf("cleanupWorkerJobs: failed to delete invalid cleanup timestamp: %w", err), "worker", workerID)
-				return
-			}
-		} else if time.Since(time.Unix(0, ts)) > node.workerTTL {
-			// Stale lock, we can delete and retry
-			node.logger.Info("cleanupWorkerJobs: found stale cleanup lock", "worker", workerID, "age", time.Since(time.Unix(0, ts)))
-			if _, err := node.workerCleanupMap.Delete(ctx, workerID); err != nil {
-				node.logger.Error(fmt.Errorf("cleanupWorkerJobs: failed to delete stale cleanup timestamp: %w", err), "worker", workerID)
-				return
-			}
-		} else {
-			// Lock is still valid
-			node.logger.Debug("cleanupWorkerJobs: cleanup already in progress", "worker", workerID)
-			return
-		}
-	}
-
-	ok, err := node.workerCleanupMap.SetIfNotExists(ctx, workerID, now)
-	if err != nil {
-		node.logger.Error(fmt.Errorf("cleanupWorkerJobs: failed to set cleanup timestamp: %w", err), "worker", workerID)
-		return
-	}
-	if !ok {
-		// Another node just acquired the lock
-		node.logger.Debug("cleanupWorkerJobs: cleanup already in progress", "worker", workerID)
+	// Try to acquire or clear stale cleanup lock
+	if !node.acquireCleanupLock(ctx, workerID) {
 		return
 	}
 
@@ -1039,7 +1007,47 @@ func (node *Node) cleanupWorker(ctx context.Context, workerID string) {
 		return
 	}
 
-	// Requeue each job
+	// Requeue jobs and process them
+	node.requeueWorkerJobs(ctx, workerID, keys)
+}
+
+// acquireCleanupLock tries to acquire the cleanup lock for a worker.
+// It returns true if the lock was acquired, false if another node holds the lock.
+// It will clear any stale or invalid locks it finds.
+func (node *Node) acquireCleanupLock(ctx context.Context, workerID string) bool {
+	// Check for existing lock
+	if existingTS, exists := node.workerCleanupMap.Get(workerID); exists {
+		if !node.isWithinTTL(existingTS, node.workerTTL) {
+			// Invalid or stale lock, delete it
+			if _, err := node.workerCleanupMap.Delete(ctx, workerID); err != nil {
+				node.logger.Error(fmt.Errorf("cleanupWorkerJobs: failed to delete stale cleanup timestamp: %w", err), "worker", workerID)
+				return false
+			}
+			node.logger.Info("cleanupWorkerJobs: cleared stale cleanup lock", "worker", workerID)
+		} else {
+			// Lock is still valid
+			node.logger.Debug("cleanupWorkerJobs: cleanup already in progress", "worker", workerID)
+			return false
+		}
+	}
+
+	// Try to acquire lock
+	now := strconv.FormatInt(time.Now().UnixNano(), 10)
+	ok, err := node.workerCleanupMap.SetIfNotExists(ctx, workerID, now)
+	if err != nil {
+		node.logger.Error(fmt.Errorf("cleanupWorkerJobs: failed to set cleanup timestamp: %w", err), "worker", workerID)
+		return false
+	}
+	if !ok {
+		node.logger.Debug("cleanupWorkerJobs: cleanup already in progress", "worker", workerID)
+		return false
+	}
+
+	return true
+}
+
+// requeueWorkerJobs requeues all jobs from a worker and processes them.
+func (node *Node) requeueWorkerJobs(ctx context.Context, workerID string, keys []string) {
 	requeued := make(map[string]chan error)
 	for _, key := range keys {
 		payload, ok := node.JobPayload(key)
@@ -1075,11 +1083,11 @@ func (node *Node) cleanupWorker(ctx context.Context, workerID string) {
 	})
 }
 
-// isActive checks if a timestamp is within TTL
-func (node *Node) isActive(lastSeen string, ttl time.Duration) bool {
+// isWithinTTL checks if a timestamp is within TTL
+func (node *Node) isWithinTTL(lastSeen string, ttl time.Duration) bool {
 	lsi, err := strconv.ParseInt(lastSeen, 10, 64)
 	if err != nil {
-		node.logger.Error(fmt.Errorf("isActive: failed to parse last seen timestamp: %w", err))
+		node.logger.Error(fmt.Errorf("isWithinTTL: failed to parse last seen timestamp: %w", err))
 		return false
 	}
 	return time.Since(time.Unix(0, lsi)) <= ttl
@@ -1160,7 +1168,6 @@ func (node *Node) activeWorkers() []string {
 				continue // Skip workers being actively cleaned up
 			}
 		}
-
 		cai, err := strconv.ParseInt(createdAt, 10, 64)
 		if err != nil {
 			node.logger.Error(fmt.Errorf("activeWorkers: failed to parse created at timestamp: %w", err), "worker", id)
