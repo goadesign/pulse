@@ -15,7 +15,7 @@ import (
 	"goa.design/pulse/pulse"
 	"goa.design/pulse/rmap"
 	"goa.design/pulse/streaming"
-	soptions "goa.design/pulse/streaming/options"
+	"goa.design/pulse/streaming/options"
 )
 
 type (
@@ -96,11 +96,14 @@ func newWorker(ctx context.Context, node *Node, h JobHandler) (*Worker, error) {
 	if _, err := node.workerKeepAliveMap.SetAndWait(ctx, wid, now); err != nil {
 		return nil, fmt.Errorf("failed to update worker keep-alive: %w", err)
 	}
-	stream, err := streaming.NewStream(workerStreamName(wid), node.rdb, soptions.WithStreamLogger(node.logger))
+	stream, err := streaming.NewStream(workerStreamName(wid), node.rdb, options.WithStreamLogger(node.logger))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create jobs stream for worker %q: %w", wid, err)
 	}
-	reader, err := stream.NewReader(ctx, soptions.WithReaderBlockDuration(node.workerTTL/2), soptions.WithReaderStartAtOldest())
+	if _, err := stream.Add(ctx, evInit, marshalEnvelope(node.ID, []byte(wid))); err != nil {
+		return nil, fmt.Errorf("failed to add init event to worker stream %q: %w", workerStreamName(wid), err)
+	}
+	reader, err := stream.NewReader(ctx, options.WithReaderBlockDuration(node.workerTTL/2), options.WithReaderStartAtOldest())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create reader for worker %q: %w", wid, err)
 	}
@@ -185,6 +188,9 @@ func (w *Worker) handleEvents(ctx context.Context, c <-chan *streaming.Event) {
 			nodeID, payload := unmarshalEnvelope(ev.Payload)
 			var err error
 			switch ev.EventName {
+			case evInit:
+				w.logger.Debug("handleEvents: received init", "event", ev.EventName, "id", ev.ID)
+				continue
 			case evStartJob:
 				w.logger.Debug("handleEvents: received start job", "event", ev.EventName, "id", ev.ID)
 				err = w.startJob(ctx, unmarshalJob(payload))
@@ -309,7 +315,7 @@ func (w *Worker) ackPoolEvent(ctx context.Context, nodeID, eventID string, acker
 		msg = ackerr.Error()
 	}
 	ack := &ack{EventID: eventID, Error: msg}
-	if _, err := stream.Add(ctx, evAck, marshalEnvelope(w.ID, marshalAck(ack)), soptions.WithOnlyIfStreamExists()); err != nil {
+	if _, err := stream.Add(ctx, evAck, marshalEnvelope(w.ID, marshalAck(ack)), options.WithOnlyIfStreamExists()); err != nil {
 		w.logger.Error(fmt.Errorf("failed to ack event %q from node %q: %w", eventID, nodeID, err))
 	}
 }

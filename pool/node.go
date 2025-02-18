@@ -76,8 +76,8 @@ type (
 )
 
 const (
-	// evInitNode is the event used to initialize a node stream.
-	evInitNode string = "i"
+	// evInit is the event used to initialize a node or worker stream.
+	evInit string = "i"
 	// evStartJob is the event used to send new job to workers.
 	evStartJob string = "j"
 	// evNotify is the event used to notify a worker running a specific job.
@@ -215,7 +215,7 @@ func AddNode(ctx context.Context, poolName string, rdb *redis.Client, opts ...No
 	if err != nil {
 		return nil, fmt.Errorf("AddNode: failed to create node event stream %q: %w", nodeStreamName(poolName, nodeID), err)
 	}
-	if _, err = nodeStream.Add(ctx, evInitNode, []byte(nodeID)); err != nil {
+	if _, err = nodeStream.Add(ctx, evInit, []byte(nodeID)); err != nil {
 		return nil, fmt.Errorf("AddNode: failed to add init event to node event stream %q: %w", nodeStreamName(poolName, nodeID), err)
 	}
 
@@ -657,9 +657,7 @@ func (node *Node) routeWorkerEvent(ev *streaming.Event) error {
 	if err != nil {
 		return err
 	}
-
-	var eventID string
-	eventID, err = stream.Add(context.Background(), ev.EventName, marshalEnvelope(node.ID, ev.Payload))
+	eventID, err := stream.Add(context.Background(), ev.EventName, marshalEnvelope(node.ID, ev.Payload), options.WithOnlyIfStreamExists())
 	if err != nil {
 		return fmt.Errorf("routeWorkerEvent: failed to add event %s to worker stream %q: %w", ev.EventName, workerStreamName(wid), err)
 	}
@@ -690,7 +688,7 @@ func (node *Node) handleNodeEvents(c <-chan *streaming.Event) {
 // processNodeEvent processes a node event.
 func (node *Node) processNodeEvent(ev *streaming.Event) {
 	switch ev.EventName {
-	case evInitNode:
+	case evInit:
 		// Event sent by pool node to initialize the node event stream.
 		node.logger.Debug("handleNodeEvents: received init node", "event", ev.EventName, "id", ev.ID)
 	case evAck:
