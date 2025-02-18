@@ -999,7 +999,16 @@ func (node *Node) cleanupWorker(ctx context.Context, workerID string) {
 		}
 		requeued++
 	}
-	node.logger.Info("requeued stale worker jobs", "requeued", requeued, "jobs", len(keys), "worker", workerID)
+	if len(keys) != requeued {
+		node.logger.Info("partially requeued stale worker jobs", "requeued", requeued, "jobs", len(keys), "worker", workerID)
+		return
+	}
+
+	// Delete worker
+	node.logger.Info("cleaned up worker", "worker", workerID, "requeued", requeued)
+	if err := node.deleteWorker(workerID); err != nil {
+		node.logger.Error(fmt.Errorf("cleanupWorkerJobs: failed to delete worker: %w", err), "worker", workerID)
+	}
 }
 
 // processInactiveJobs periodically checks for and removes stale entries in the pending jobs map.
@@ -1047,7 +1056,7 @@ func (node *Node) acquireCleanupLock(ctx context.Context, workerID string) bool 
 				node.logger.Error(fmt.Errorf("cleanupWorkerJobs: failed to delete stale cleanup timestamp: %w", err), "worker", workerID)
 				return false
 			}
-			node.logger.Info("cleanupWorkerJobs: cleared stale cleanup lock", "worker", workerID)
+			node.logger.Info("cleanupWorkerJobs: cleared stale cleanup lock", "worker", workerID, "ts", existingTS, "ttl", node.workerTTL)
 		} else {
 			// Lock is still valid
 			node.logger.Debug("cleanupWorkerJobs: cleanup already in progress", "worker", workerID)
@@ -1070,7 +1079,9 @@ func (node *Node) acquireCleanupLock(ctx context.Context, workerID string) bool 
 	return true
 }
 
-// isWithinTTL checks if a timestamp is within TTL
+// isWithinTTL checks if a timestamp is within a TTL. If lastSeen is not a valid
+// timestamp, false is returned. lastSeen is a string representation of a unix
+// timestamp in nanoseconds.
 func (node *Node) isWithinTTL(lastSeen string, ttl time.Duration) bool {
 	lsi, err := strconv.ParseInt(lastSeen, 10, 64)
 	if err != nil {
