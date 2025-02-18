@@ -727,7 +727,7 @@ func (node *Node) ackWorkerEvent(ev *streaming.Event) {
 			return
 		}
 		ack.EventID = pending.ID
-		if _, err := stream.Add(ctx, evDispatchReturn, marshalAck(ack)); err != nil {
+		if _, err := stream.Add(ctx, evDispatchReturn, marshalAck(ack), options.WithOnlyIfStreamExists()); err != nil {
 			node.logger.Error(fmt.Errorf("ackWorkerEvent: failed to dispatch return to stream %q: %w", nodeStreamName(node.PoolName, nodeID), err))
 		}
 	}
