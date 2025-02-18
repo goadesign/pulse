@@ -832,9 +832,7 @@ func (node *Node) requeueJob(workerID string, job *Job) (chan error, error) {
 		node.logger.Debug("requeueJob: job already removed from jobs map", "key", job.Key, "worker", workerID)
 		return nil, nil
 	}
-	node.logger.Info("requeuing job", "key", job.Key, "worker", workerID)
 	job.NodeID = node.ID
-
 	eventID, err := node.poolStream.Add(ctx, evStartJob, marshalJob(job))
 	if err != nil {
 		if _, err := node.jobMap.AppendValues(ctx, workerID, job.Key); err != nil {
@@ -842,6 +840,7 @@ func (node *Node) requeueJob(workerID string, job *Job) (chan error, error) {
 		}
 		return nil, fmt.Errorf("requeueJob: failed to add job %q to stream %q: %w", job.Key, node.poolStream.Name, err)
 	}
+	node.logger.Info("requeued job", "key", job.Key, "worker", workerID, "event", eventID)
 	cherr := make(chan error, 1)
 	node.pendingJobChannels.Store(eventID, cherr)
 	return cherr, nil
