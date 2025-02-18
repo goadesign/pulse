@@ -213,6 +213,7 @@ func (w *Worker) handleEvents(ctx context.Context, c <-chan *streaming.Event) {
 			}
 			w.ackPoolEvent(ctx, nodeID, ev.ID, nil)
 		case <-w.done:
+			w.logger.Debug("handleEvents: done")
 			return
 		}
 	}
@@ -337,6 +338,7 @@ func (w *Worker) keepAlive(ctx context.Context) {
 				w.logger.Error(fmt.Errorf("failed to update worker keep-alive: %w", err))
 			}
 		case <-w.done:
+			w.logger.Debug("keepAlive: done")
 			return
 		}
 	}

@@ -39,7 +39,7 @@ type (
 		workerKeepAliveMap *rmap.Map         // worker keep-alive timestamps indexed by ID
 		workerCleanupMap   *rmap.Map         // key is stale worker ID that needs cleanup
 		jobMap             *rmap.Map         // jobs by worker ID
-		jobPendingMap      *rmap.Map         // pending jobs by worker ID
+		jobPendingMap      *rmap.Map         // pending jobs by job key
 		jobPayloadMap      *rmap.Map         // job payloads by job key
 		tickerMap          *rmap.Map         // ticker next tick time indexed by name
 		workerTTL          time.Duration     // Worker considered dead if keep-alive not updated after this duration
@@ -270,13 +270,14 @@ func AddNode(ctx context.Context, poolName string, rdb *redis.Client, opts ...No
 	logCtx := context.Background()
 	logCtx = log.WithContext(logCtx, ctx)
 
-	p.wg.Add(7)
+	p.wg.Add(8) // Increment for all background goroutines
 	pulse.Go(logger, func() { p.handlePoolEvents(poolSink.Subscribe()) })
 	pulse.Go(logger, func() { p.handleNodeEvents(nch) })
 	pulse.Go(logger, func() { p.watchWorkers(logCtx) })
 	pulse.Go(logger, func() { p.watchShutdown(logCtx) })
 	pulse.Go(logger, func() { p.processInactiveNodes() })
 	pulse.Go(logger, func() { p.processInactiveWorkers(logCtx) })
+	pulse.Go(logger, func() { p.processInactiveJobs(logCtx) })
 	pulse.Go(logger, func() { p.updateNodeKeepAlive() })
 
 	return p, nil
@@ -366,14 +367,7 @@ func (node *Node) DispatchJob(ctx context.Context, key string, payload []byte) e
 	// Check if there's a pending dispatch for this job
 	pendingTS, exists := node.jobPendingMap.Get(key)
 	if exists {
-		ts, err := strconv.ParseInt(pendingTS, 10, 64)
-		if err != nil {
-			_, err := node.jobPendingMap.TestAndDelete(ctx, key, pendingTS)
-			if err != nil {
-				node.logger.Error(fmt.Errorf("DispatchJob: failed to delete invalid pending timestamp for job %q: %w", key, err))
-			}
-			exists = false
-		} else if time.Until(time.Unix(0, ts)) > 0 {
+		if node.isWithinTTL(pendingTS, 0) {
 			node.logger.Info("DispatchJob: job already dispatched", "key", key)
 			return fmt.Errorf("%w: job %q is already dispatched", ErrJobExists, key)
 		}
@@ -1011,6 +1005,39 @@ func (node *Node) cleanupWorker(ctx context.Context, workerID string) {
 	node.requeueWorkerJobs(ctx, workerID, keys)
 }
 
+// processInactiveJobs periodically checks for and removes stale entries in the pending jobs map.
+func (node *Node) processInactiveJobs(ctx context.Context) {
+	defer node.wg.Done()
+	ticker := time.NewTicker(node.ackGracePeriod) // Run at ackGracePeriod frequency since pending jobs expire after 2*ackGracePeriod
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-node.stop:
+			return
+		case <-ticker.C:
+			node.cleanupStalePendingJobs(ctx)
+		}
+	}
+}
+
+// cleanupStalePendingJobs checks for and removes stale entries in the pending jobs map.
+// An entry is considered stale if its timestamp has expired.
+func (node *Node) cleanupStalePendingJobs(ctx context.Context) {
+	for key, pendingTS := range node.jobPendingMap.Map() {
+		if node.isWithinTTL(pendingTS, 0) {
+			continue
+		}
+		prev, err := node.jobPendingMap.TestAndDelete(ctx, key, pendingTS)
+		if err != nil {
+			node.logger.Error(fmt.Errorf("cleanupStalePendingJobs: failed to delete stale pending entry: %w", err))
+		}
+		if prev == pendingTS {
+			node.logger.Info("cleanupStalePendingJobs: removed stale pending entry", "key", key)
+		}
+	}
+}
+
 // acquireCleanupLock tries to acquire the cleanup lock for a worker.
 // It returns true if the lock was acquired, false if another node holds the lock.
 // It will clear any stale or invalid locks it finds.
@@ -1163,8 +1190,7 @@ func (node *Node) activeWorkers() []string {
 
 		// Skip workers that are being cleaned up
 		if cleanupTS, exists := node.workerCleanupMap.Get(id); exists {
-			cleanupTime, err := strconv.ParseInt(cleanupTS, 10, 64)
-			if err == nil && time.Since(time.Unix(0, cleanupTime)) <= node.workerTTL {
+			if node.isWithinTTL(cleanupTS, node.workerTTL) {
 				continue // Skip workers being actively cleaned up
 			}
 		}
@@ -1191,14 +1217,10 @@ func (node *Node) activeWorkers() []string {
 			// the workers map deletion.
 			continue
 		}
-		lsi, err := strconv.ParseInt(ls, 10, 64)
-		if err != nil {
-			node.logger.Error(fmt.Errorf("activeWorkers: failed to parse last seen timestamp for worker %q: %w", id, err))
+		if !node.isWithinTTL(ls, node.workerTTL) {
 			continue
 		}
-		if time.Since(time.Unix(0, lsi)) <= node.workerTTL {
-			activeIDs = append(activeIDs, id)
-		}
+		activeIDs = append(activeIDs, id)
 	}
 
 	return activeIDs
