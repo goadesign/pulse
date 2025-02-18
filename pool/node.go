@@ -76,6 +76,8 @@ type (
 )
 
 const (
+	// evInitNode is the event used to initialize a node stream.
+	evInitNode string = "i"
 	// evStartJob is the event used to send new job to workers.
 	evStartJob string = "j"
 	// evNotify is the event used to notify a worker running a specific job.
@@ -212,6 +214,9 @@ func AddNode(ctx context.Context, poolName string, rdb *redis.Client, opts ...No
 	nodeStream, err = streaming.NewStream(nodeStreamName(poolName, nodeID), rdb, options.WithStreamLogger(logger))
 	if err != nil {
 		return nil, fmt.Errorf("AddNode: failed to create node event stream %q: %w", nodeStreamName(poolName, nodeID), err)
+	}
+	if _, err = nodeStream.Add(ctx, evInitNode, []byte(nodeID)); err != nil {
+		return nil, fmt.Errorf("AddNode: failed to add init event to node event stream %q: %w", nodeStreamName(poolName, nodeID), err)
 	}
 
 	nodeReader, err = nodeStream.NewReader(ctx, options.WithReaderBlockDuration(o.jobSinkBlockDuration), options.WithReaderStartAtOldest())
@@ -685,6 +690,9 @@ func (node *Node) handleNodeEvents(c <-chan *streaming.Event) {
 // processNodeEvent processes a node event.
 func (node *Node) processNodeEvent(ev *streaming.Event) {
 	switch ev.EventName {
+	case evInitNode:
+		// Event sent by pool node to initialize the node event stream.
+		node.logger.Debug("handleNodeEvents: received init node", "event", ev.EventName, "id", ev.ID)
 	case evAck:
 		// Event sent by worker to ack a dispatched job.
 		node.logger.Debug("handleNodeEvents: received ack", "event", ev.EventName, "id", ev.ID)

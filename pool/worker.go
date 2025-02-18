@@ -309,7 +309,7 @@ func (w *Worker) ackPoolEvent(ctx context.Context, nodeID, eventID string, acker
 		msg = ackerr.Error()
 	}
 	ack := &ack{EventID: eventID, Error: msg}
-	if _, err := stream.Add(ctx, evAck, marshalEnvelope(w.ID, marshalAck(ack))); err != nil {
+	if _, err := stream.Add(ctx, evAck, marshalEnvelope(w.ID, marshalAck(ack)), soptions.WithOnlyIfStreamExists()); err != nil {
 		w.logger.Error(fmt.Errorf("failed to ack event %q from node %q: %w", eventID, nodeID, err))
 	}
 }
