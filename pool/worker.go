@@ -361,7 +361,6 @@ func (w *Worker) rebalance(ctx context.Context, activeWorkers []string) {
 		w.logger.Debug("rebalance: no jobs to rebalance")
 		return
 	}
-	cherrs := make(map[string]chan error, total)
 	for key, job := range rebalanced {
 		if err := w.handler.Stop(key); err != nil {
 			w.logger.Error(fmt.Errorf("rebalance: failed to stop job: %w", err), "job", key)
@@ -369,7 +368,7 @@ func (w *Worker) rebalance(ctx context.Context, activeWorkers []string) {
 		}
 		w.logger.Debug("stopped job", "job", key)
 		w.jobs.Delete(key)
-		cherr, err := w.node.requeueJob(w.ID, job)
+		err := w.node.dispatchJob(ctx, key, marshalJob(job), true)
 		if err != nil {
 			w.logger.Error(fmt.Errorf("rebalance: failed to requeue job: %w", err), "job", key)
 			if err := w.handler.Start(job); err != nil {
@@ -378,9 +377,7 @@ func (w *Worker) rebalance(ctx context.Context, activeWorkers []string) {
 			continue
 		}
 		delete(rebalanced, key)
-		cherrs[key] = cherr
 	}
-	pulse.Go(w.logger, func() { w.node.processRequeuedJobs(ctx, w.ID, cherrs, false) })
 }
 
 // requeueJobs requeues the jobs handled by the worker.
