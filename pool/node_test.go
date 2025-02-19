@@ -325,10 +325,10 @@ func TestDispatchJobRaceCondition(t *testing.T) {
 
 		// Set a stale pending timestamp
 		staleTS := time.Now().Add(-time.Hour).UnixNano()
-		_, err := node1.pendingJobsMap.SetAndWait(ctx, jobKey, strconv.FormatInt(staleTS, 10))
+		_, err := node1.jobPendingMap.SetAndWait(ctx, jobKey, strconv.FormatInt(staleTS, 10))
 		require.NoError(t, err, "Failed to set stale pending timestamp")
 		defer func() {
-			_, err = node1.pendingJobsMap.Delete(ctx, jobKey)
+			_, err = node1.jobPendingMap.Delete(ctx, jobKey)
 			assert.NoError(t, err, "Failed to delete pending timestamp")
 		}()
 
@@ -346,7 +346,7 @@ func TestDispatchJobRaceCondition(t *testing.T) {
 		require.NoError(t, err, "Dispatch should succeed")
 		// Verify pending entry was cleaned up
 		require.Eventually(t, func() bool {
-			val, exists := node1.pendingJobsMap.Get(jobKey)
+			val, exists := node1.jobPendingMap.Get(jobKey)
 			t.Logf("Got pending value: %q", val)
 			return !exists
 		}, max, delay, "Pending entry should be cleaned up after successful dispatch")
@@ -357,7 +357,7 @@ func TestDispatchJobRaceCondition(t *testing.T) {
 		payload := []byte("test payload")
 
 		// Set an invalid pending timestamp
-		_, err := node1.pendingJobsMap.SetAndWait(ctx, jobKey, "invalid-timestamp")
+		_, err := node1.jobPendingMap.SetAndWait(ctx, jobKey, "invalid-timestamp")
 		require.NoError(t, err, "Failed to set invalid pending timestamp")
 
 		// Dispatch should succeed (invalid timestamps are logged and ignored)
@@ -380,7 +380,7 @@ func TestDispatchJobRaceCondition(t *testing.T) {
 
 		// Verify pending entry was cleaned up
 		require.Eventually(t, func() bool {
-			_, exists := node1.pendingJobsMap.Get(jobKey)
+			_, exists := node1.jobPendingMap.Get(jobKey)
 			return !exists
 		}, max, delay, "Pending entry should be cleaned up after failed dispatch")
 	})
@@ -623,7 +623,7 @@ func TestAckWorkerEventWithMissingPendingEvent(t *testing.T) {
 	}
 
 	// Call ackWorkerEvent with the mock event
-	node.ackWorkerEvent(ctx, mockEvent)
+	node.ackWorkerEvent(mockEvent)
 
 	// Verify that no panic occurred and the function completed successfully
 	assert.True(t, true, "ackWorkerEvent should complete without panic")
@@ -681,7 +681,7 @@ func TestStaleEventsAreRemoved(t *testing.T) {
 	node.pendingEvents.Store(pendingEventKey("worker", mockEventID), mockEvent)
 
 	// Call ackWorkerEvent to trigger the stale event cleanup
-	node.ackWorkerEvent(ctx, mockEvent)
+	node.ackWorkerEvent(mockEvent)
 
 	assert.Eventually(t, func() bool {
 		_, ok := node.pendingEvents.Load(pendingEventKey("worker", staleEventID))
@@ -832,6 +832,116 @@ func TestShutdownStopsAllJobs(t *testing.T) {
 	// Verify workers have no remaining jobs
 	assert.Empty(t, worker1.Jobs(), "Worker1 should have no remaining jobs")
 	assert.Empty(t, worker2.Jobs(), "Worker2 should have no remaining jobs")
+}
+
+func TestWorkerAckStreams(t *testing.T) {
+	testName := strings.Replace(t.Name(), "/", "_", -1)
+	ctx := ptesting.NewTestContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	node := newTestNode(t, ctx, rdb, testName)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+
+	// Create a worker and dispatch a job
+	worker := newTestWorker(t, ctx, node)
+	require.NoError(t, node.DispatchJob(ctx, testName, []byte("payload")))
+
+	// Wait for the job to start and be acknowledged
+	require.Eventually(t, func() bool {
+		return len(worker.Jobs()) == 1
+	}, max, delay)
+
+	// Verify stream is created and cached
+	stream1, err := node.getNodeStream(node.ID)
+	require.NoError(t, err)
+	stream2, err := node.getNodeStream(node.ID)
+	require.NoError(t, err)
+	assert.Same(t, stream1, stream2, "Expected same stream instance to be returned")
+
+	// Verify stream exists before shutdown
+	streamKey := "pulse:stream:" + nodeStreamName(testName, node.ID)
+	exists, err := rdb.Exists(ctx, streamKey).Result()
+	assert.NoError(t, err)
+	assert.Equal(t, int64(1), exists, "Expected stream to exist before shutdown")
+
+	// Shutdown node
+	assert.NoError(t, node.Shutdown(ctx))
+
+	// Verify stream is destroyed in Redis
+	exists, err = rdb.Exists(ctx, streamKey).Result()
+	assert.NoError(t, err)
+	assert.Equal(t, int64(0), exists, "Expected stream to be destroyed after shutdown")
+}
+
+func TestStaleWorkerCleanupAfterJobRequeue(t *testing.T) {
+	// Setup test environment
+	ctx := ptesting.NewTestContext(t)
+	testName := strings.Replace(t.Name(), "/", "_", -1)
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+
+	node := newTestNode(t, ctx, rdb, testName)
+	defer func() { assert.NoError(t, node.Shutdown(ctx)) }()
+
+	// Create a worker that will become stale
+	staleWorker := newTestWorker(t, ctx, node)
+
+	// Dispatch some jobs to the worker
+	for i := 0; i < 3; i++ {
+		jobKey := fmt.Sprintf("%s_%d", testName, i)
+		require.NoError(t, node.DispatchJob(ctx, jobKey, []byte("test-payload")))
+	}
+
+	// Wait for jobs to be assigned
+	require.Eventually(t, func() bool {
+		return len(staleWorker.Jobs()) == 3
+	}, max, delay, "Jobs were not assigned to worker")
+
+	// Make the worker stale by stopping it and setting an old keepalive
+	staleWorker.stop(ctx)
+	_, err := node.workerKeepAliveMap.Set(ctx, staleWorker.ID,
+		strconv.FormatInt(time.Now().Add(-2*node.workerTTL).UnixNano(), 10))
+	require.NoError(t, err)
+
+	// Create a new worker to receive requeued jobs
+	newWorker := newTestWorker(t, ctx, node)
+
+	// Wait for cleanup to happen and jobs to be requeued
+	require.Eventually(t, func() bool {
+		return len(newWorker.Jobs()) == 3
+	}, max, delay, "Jobs were not requeued to new worker")
+
+	// Verify stale worker was deleted
+	require.Eventually(t, func() bool {
+		// Check that worker is removed from all tracking maps
+		workers := node.Workers()
+		if len(workers) != 1 {
+			t.Logf("Expected 1 worker, got %d", len(workers))
+			return false
+		}
+
+		// Check worker is removed from worker map
+		workerMap := node.workerMap.Map()
+		if _, exists := workerMap[staleWorker.ID]; exists {
+			t.Log("Worker still exists in worker map")
+			return false
+		}
+
+		// Check keepalive is removed
+		keepAlive := node.workerKeepAliveMap.Map()
+		if _, exists := keepAlive[staleWorker.ID]; exists {
+			t.Log("Worker still has keepalive entry")
+			return false
+		}
+
+		// Check jobs are removed
+		jobs := node.jobMap.Map()
+		if _, exists := jobs[staleWorker.ID]; exists {
+			t.Log("Worker still has jobs assigned")
+			return false
+		}
+
+		return true
+	}, max, delay, "Stale worker was not properly cleaned up")
 }
 
 type mockAcker struct {

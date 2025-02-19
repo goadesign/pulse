@@ -1,11 +1,8 @@
 package pulse
 
 import (
-	"context"
 	"fmt"
 	"runtime/debug"
-
-	"goa.design/clue/log"
 )
 
 // Go runs the given function in a separate goroutine and recovers from any panic,
@@ -16,14 +13,14 @@ import (
 //	Go(ctx, func() {
 //	    // Your code here
 //	})
-func Go(ctx context.Context, f func()) {
-	go func() {
-		defer func(ctx context.Context) {
+func Go(logger Logger, f func()) {
+	go func(logger Logger) {
+		defer func() {
 			if r := recover(); r != nil {
 				panicErr := fmt.Errorf("Panic recovered: %v\n%s", r, debug.Stack())
-				log.Error(ctx, panicErr)
+				logger.Error(panicErr)
 			}
-		}(ctx)
+		}()
 		f()
-	}()
+	}(logger)
 }

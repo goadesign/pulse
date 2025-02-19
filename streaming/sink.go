@@ -13,6 +13,7 @@ import (
 	"github.com/oklog/ulid/v2"
 	redis "github.com/redis/go-redis/v9"
 
+	"goa.design/clue/log"
 	"goa.design/pulse/pulse"
 	"goa.design/pulse/rmap"
 	"goa.design/pulse/streaming/options"
@@ -59,7 +60,7 @@ type (
 		// streams are the streams the sink consumes events from.
 		streams []*Stream
 		// streamCursors is the stream cursors used to read events in
-		// the form [stream1, ">", stream2, ">", ..."]
+		// the form [stream1, ">", stream2, ">", ...]
 		streamCursors []string
 		// blockDuration is the XREADGROUP timeout.
 		blockDuration time.Duration
@@ -155,6 +156,12 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...options.S
 		logger:                logger,
 		rdb:                   stream.rdb,
 	}
+
+	// Clean up any existing stale consumers before creating our own
+	if err := sink.deleteStreamStaleConsumers(ctx, stream); err != nil {
+		sink.logger.Error(fmt.Errorf("failed to cleanup stale consumers: %w", err))
+	}
+
 	consumer, err := sink.newConsumer(ctx, stream)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create consumer: %w", err)
@@ -162,10 +169,14 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...options.S
 	sink.consumer = consumer
 	sink.logger = sink.logger.WithPrefix("consumer", consumer)
 
+	// create new logger context for goroutines.
+	logCtx := context.Background()
+	logCtx = log.WithContext(logCtx, ctx)
+
 	sink.wait.Add(3)
-	pulse.Go(ctx, func() { sink.read(ctx) })
-	pulse.Go(ctx, sink.periodicKeepAlive)
-	pulse.Go(ctx, sink.periodicIdleMessageCheck)
+	pulse.Go(logger, func() { sink.read(logCtx) })
+	pulse.Go(logger, sink.periodicKeepAlive)
+	pulse.Go(logger, sink.periodicIdleMessageCheck)
 
 	sink.logger.Info("created", "start", sink.startID, "stream", stream.Name, "max_polled", sink.maxPolled, "block_duration", sink.blockDuration, "buffer_size", sink.bufferSize, "no_ack", sink.noAck, "ack_grace_period", sink.ackGracePeriod)
 
@@ -273,20 +284,6 @@ func (s *Sink) RemoveStream(ctx context.Context, stream *Stream) error {
 	return nil
 }
 
-// removeStreamConsumer removes the stream consumer from the sink.
-func (s *Sink) removeStreamConsumer(ctx context.Context, stream *Stream) error {
-	remains, _, err := s.consumersMap[stream.Name].RemoveValues(ctx, s.Name, s.consumer)
-	if err != nil {
-		return fmt.Errorf("failed to remove consumer %s from replicated map for stream %s: %w", s.consumer, stream.Name, err)
-	}
-	if len(remains) == 0 {
-		if err := s.deleteConsumerGroup(ctx, stream); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // Close stops event polling, waits for all events to be processed, and closes the sink channel.
 // It is safe to call Close multiple times.
 func (s *Sink) Close(ctx context.Context) {
@@ -319,6 +316,76 @@ func (s *Sink) IsClosed() bool {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 	return s.closed
+}
+
+// deleteStreamStaleConsumers deletes stale consumers for a specific stream.
+// s.lock must be held.
+func (s *Sink) deleteStreamStaleConsumers(ctx context.Context, stream *Stream) error {
+	// Get all consumers for this group
+	consumers, err := s.rdb.XInfoConsumers(ctx, stream.key, s.Name).Result()
+	if err != nil {
+		return fmt.Errorf("failed to get consumers info: %w", err)
+	}
+
+	// Check keep-alive map
+	keepAlives := s.consumersKeepAliveMap.Map()
+	for _, consumer := range consumers {
+		ts, hasKeepAlive := keepAlives[consumer.Name]
+		if !hasKeepAlive {
+			s.logger.Info("cleaning up consumer with no keep-alive", "consumer", consumer.Name)
+			if err := s.rdb.XGroupDelConsumer(ctx, stream.key, s.Name, consumer.Name).Err(); err != nil {
+				s.logger.Error(fmt.Errorf("failed to delete consumer with no keep-alive: %w", err), "consumer", consumer.Name)
+			}
+			continue
+		}
+
+		// Check if consumer is stale based on keep-alive timestamp
+		keepAliveTs, err := strconv.ParseInt(ts, 10, 64)
+		if err != nil {
+			s.logger.Error(fmt.Errorf("failed to parse keep-alive timestamp: %w", err), "consumer", consumer.Name, "timestamp", ts)
+			continue
+		}
+
+		if time.Since(time.Unix(0, keepAliveTs)) > 2*s.ackGracePeriod {
+			s.logger.Info("cleaning up stale consumer", "consumer", consumer.Name)
+			if err := s.rdb.XGroupDelConsumer(ctx, stream.key, s.Name, consumer.Name).Err(); err != nil {
+				s.logger.Error(fmt.Errorf("failed to delete stale consumer: %w", err), "consumer", consumer.Name)
+			}
+			if _, err := s.consumersKeepAliveMap.Delete(ctx, consumer.Name); err != nil {
+				s.logger.Error(fmt.Errorf("failed to delete keep-alive for stale consumer: %w", err), "consumer", consumer.Name)
+			}
+			if sinks := s.consumersMap[stream.Name]; sinks != nil {
+				if _, _, err := sinks.RemoveValues(ctx, s.Name, consumer.Name); err != nil {
+					s.logger.Error(fmt.Errorf("failed to remove consumer from map: %w", err), "stream", stream.Name, "consumer", consumer.Name)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// deleteStaleConsumers deletes stale consumers.
+// s.lock must be held.
+func (s *Sink) deleteStaleConsumers(ctx context.Context) {
+	for _, stream := range s.streams {
+		if err := s.deleteStreamStaleConsumers(ctx, stream); err != nil {
+			s.logger.Error(fmt.Errorf("failed to delete stale consumers for stream %s: %w", stream.Name, err))
+		}
+	}
+}
+
+// removeStreamConsumer removes the stream consumer from the sink.
+func (s *Sink) removeStreamConsumer(ctx context.Context, stream *Stream) error {
+	remains, _, err := s.consumersMap[stream.Name].RemoveValues(ctx, s.Name, s.consumer)
+	if err != nil {
+		return fmt.Errorf("failed to remove consumer %s from replicated map for stream %s: %w", s.consumer, stream.Name, err)
+	}
+	if len(remains) == 0 {
+		if err := s.deleteConsumerGroup(ctx, stream); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // newConsumer creates a new consumer and registers it in the consumers and
@@ -493,54 +560,6 @@ func (s *Sink) claimIdleMessages(ctx context.Context) {
 				break
 			}
 		}
-	}
-}
-
-// deleteStaleConsumers deletes stale consumers.
-// s.lock must be held.
-func (s *Sink) deleteStaleConsumers(ctx context.Context) {
-	keepAlives := s.consumersKeepAliveMap.Map()
-	staleConsumers := make(map[string]struct{})
-	for consumer, timestamp := range keepAlives {
-		ts, err := strconv.ParseInt(timestamp, 10, 64)
-		if err != nil {
-			s.logger.Error(fmt.Errorf("failed to parse timestamp for consumers: %w", err), "consumer", consumer)
-			continue
-		}
-		if time.Since(time.Unix(0, ts)) > 2*s.ackGracePeriod {
-			staleConsumers[consumer] = struct{}{}
-			s.logger.Debug("stale consumer", "consumer", consumer, "since", time.Since(time.Unix(0, ts)), "ttl", 2*s.ackGracePeriod)
-		}
-	}
-	// Delete any stale consumers from the consumer group.
-	for _, stream := range s.streams {
-		sinks := s.consumersMap[stream.Name]
-		for _, sink := range sinks.Keys() {
-			consumers, _ := sinks.GetValues(sink)
-			for _, consumer := range consumers {
-				if _, ok := staleConsumers[consumer]; !ok {
-					continue
-				}
-				if err := s.rdb.XGroupDelConsumer(ctx, stream.key, s.Name, consumer).Err(); err != nil {
-					s.logger.Error(fmt.Errorf("failed to delete stale consumer %s: %w", consumer, err))
-				}
-				if _, err := s.consumersKeepAliveMap.Delete(ctx, consumer); err != nil {
-					s.logger.Error(fmt.Errorf("failed to delete sink keep-alive for stale consumer %s: %w", consumer, err))
-				}
-				if _, _, err := sinks.RemoveValues(ctx, s.Name, consumer); err != nil {
-					s.logger.Error(fmt.Errorf("failed to remove consumer from map: %w", err), "stream", stream.Name, "consumer", consumer)
-				}
-				delete(staleConsumers, consumer)
-				s.logger.Debug("deleted stale consumer", "consumer", consumer)
-			}
-		}
-	}
-	// Delete any remaining stale consumers from the keep-alive map.
-	for consumer := range staleConsumers {
-		if _, err := s.consumersKeepAliveMap.Delete(ctx, consumer); err != nil {
-			s.logger.Error(fmt.Errorf("failed to delete sink keep-alive for orphaned consumer %s: %w", consumer, err))
-		}
-		s.logger.Debug("deleted orphaned consumer", "consumer", consumer)
 	}
 }
 

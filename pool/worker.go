@@ -10,10 +10,12 @@ import (
 	"time"
 
 	"github.com/oklog/ulid/v2"
+	"goa.design/clue/log"
+
 	"goa.design/pulse/pulse"
 	"goa.design/pulse/rmap"
 	"goa.design/pulse/streaming"
-	soptions "goa.design/pulse/streaming/options"
+	"goa.design/pulse/streaming/options"
 )
 
 type (
@@ -94,11 +96,14 @@ func newWorker(ctx context.Context, node *Node, h JobHandler) (*Worker, error) {
 	if _, err := node.workerKeepAliveMap.SetAndWait(ctx, wid, now); err != nil {
 		return nil, fmt.Errorf("failed to update worker keep-alive: %w", err)
 	}
-	stream, err := streaming.NewStream(workerStreamName(wid), node.rdb, soptions.WithStreamLogger(node.logger))
+	stream, err := streaming.NewStream(workerStreamName(wid), node.rdb, options.WithStreamLogger(node.logger))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create jobs stream for worker %q: %w", wid, err)
 	}
-	reader, err := stream.NewReader(ctx, soptions.WithReaderBlockDuration(node.workerTTL/2), soptions.WithReaderStartAtOldest())
+	if _, err := stream.Add(ctx, evInit, marshalEnvelope(node.ID, []byte(wid))); err != nil {
+		return nil, fmt.Errorf("failed to add init event to worker stream %q: %w", workerStreamName(wid), err)
+	}
+	reader, err := stream.NewReader(ctx, options.WithReaderBlockDuration(node.workerTTL/2), options.WithReaderStartAtOldest())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create reader for worker %q: %w", wid, err)
 	}
@@ -110,10 +115,10 @@ func newWorker(ctx context.Context, node *Node, h JobHandler) (*Worker, error) {
 		stream:            stream,
 		reader:            reader,
 		done:              make(chan struct{}),
-		jobsMap:           node.jobsMap,
-		jobPayloadsMap:    node.jobPayloadsMap,
+		jobsMap:           node.jobMap,
+		jobPayloadsMap:    node.jobPayloadMap,
 		keepAliveMap:      node.workerKeepAliveMap,
-		shutdownMap:       node.shutdownMap,
+		shutdownMap:       node.nodeShutdownMap,
 		workerTTL:         node.workerTTL,
 		workerShutdownTTL: node.workerShutdownTTL,
 		logger:            node.logger.WithPrefix("worker", wid),
@@ -126,8 +131,13 @@ func newWorker(ctx context.Context, node *Node, h JobHandler) (*Worker, error) {
 		"worker_shutdown_ttl", w.workerShutdownTTL)
 
 	w.wg.Add(2)
-	pulse.Go(ctx, func() { w.handleEvents(ctx, reader.Subscribe()) })
-	pulse.Go(ctx, func() { w.keepAlive(ctx) })
+
+	// Create new context for the worker so that canceling the original one does
+	// not cancel the worker.
+	logCtx := context.Background()
+	logCtx = log.WithContext(logCtx, ctx)
+	pulse.Go(w.logger, func() { w.handleEvents(logCtx, reader.Subscribe()) })
+	pulse.Go(w.logger, func() { w.keepAlive(logCtx) })
 
 	return w, nil
 }
@@ -178,6 +188,9 @@ func (w *Worker) handleEvents(ctx context.Context, c <-chan *streaming.Event) {
 			nodeID, payload := unmarshalEnvelope(ev.Payload)
 			var err error
 			switch ev.EventName {
+			case evInit:
+				w.logger.Debug("handleEvents: received init", "event", ev.EventName, "id", ev.ID)
+				continue
 			case evStartJob:
 				w.logger.Debug("handleEvents: received start job", "event", ev.EventName, "id", ev.ID)
 				err = w.startJob(ctx, unmarshalJob(payload))
@@ -200,6 +213,7 @@ func (w *Worker) handleEvents(ctx context.Context, c <-chan *streaming.Event) {
 			}
 			w.ackPoolEvent(ctx, nodeID, ev.ID, nil)
 		case <-w.done:
+			w.logger.Debug("handleEvents: done")
 			return
 		}
 	}
@@ -291,22 +305,18 @@ func (w *Worker) notify(_ context.Context, key string, payload []byte) error {
 // ackPoolEvent acknowledges the pool event that originated from the node with
 // the given ID.
 func (w *Worker) ackPoolEvent(ctx context.Context, nodeID, eventID string, ackerr error) {
-	stream, ok := w.nodeStreams.Load(nodeID)
-	if !ok {
-		var err error
-		stream, err = streaming.NewStream(nodeStreamName(w.node.PoolName, nodeID), w.node.rdb, soptions.WithStreamLogger(w.logger))
-		if err != nil {
-			w.logger.Error(fmt.Errorf("failed to create stream for node %q: %w", nodeID, err))
-			return
-		}
-		w.nodeStreams.Store(nodeID, stream)
+	stream, err := w.node.getNodeStream(nodeID)
+	if err != nil {
+		w.logger.Error(fmt.Errorf("failed to get ack stream for node %q: %w", nodeID, err))
+		return
 	}
+
 	var msg string
 	if ackerr != nil {
 		msg = ackerr.Error()
 	}
 	ack := &ack{EventID: eventID, Error: msg}
-	if _, err := stream.(*streaming.Stream).Add(ctx, evAck, marshalEnvelope(w.ID, marshalAck(ack))); err != nil {
+	if _, err := stream.Add(ctx, evAck, marshalEnvelope(w.ID, marshalAck(ack)), options.WithOnlyIfStreamExists()); err != nil {
 		w.logger.Error(fmt.Errorf("failed to ack event %q from node %q: %w", eventID, nodeID, err))
 	}
 }
@@ -328,6 +338,7 @@ func (w *Worker) keepAlive(ctx context.Context) {
 				w.logger.Error(fmt.Errorf("failed to update worker keep-alive: %w", err))
 			}
 		case <-w.done:
+			w.logger.Debug("keepAlive: done")
 			return
 		}
 	}
@@ -350,7 +361,6 @@ func (w *Worker) rebalance(ctx context.Context, activeWorkers []string) {
 		w.logger.Debug("rebalance: no jobs to rebalance")
 		return
 	}
-	cherrs := make(map[string]chan error, total)
 	for key, job := range rebalanced {
 		if err := w.handler.Stop(key); err != nil {
 			w.logger.Error(fmt.Errorf("rebalance: failed to stop job: %w", err), "job", key)
@@ -358,7 +368,7 @@ func (w *Worker) rebalance(ctx context.Context, activeWorkers []string) {
 		}
 		w.logger.Debug("stopped job", "job", key)
 		w.jobs.Delete(key)
-		cherr, err := w.node.requeueJob(ctx, w.ID, job)
+		err := w.node.dispatchJob(ctx, key, marshalJob(job), true)
 		if err != nil {
 			w.logger.Error(fmt.Errorf("rebalance: failed to requeue job: %w", err), "job", key)
 			if err := w.handler.Start(job); err != nil {
@@ -367,9 +377,7 @@ func (w *Worker) rebalance(ctx context.Context, activeWorkers []string) {
 			continue
 		}
 		delete(rebalanced, key)
-		cherrs[key] = cherr
 	}
-	pulse.Go(ctx, func() { w.node.processRequeuedJobs(ctx, w.ID, cherrs, false) })
 }
 
 // requeueJobs requeues the jobs handled by the worker.
@@ -432,7 +440,7 @@ func (w *Worker) attemptRequeue(ctx context.Context, jobsToRequeue map[string]*J
 
 	wg.Add(len(jobsToRequeue))
 	for key, job := range jobsToRequeue {
-		pulse.Go(ctx, func() {
+		pulse.Go(w.logger, func() {
 			defer wg.Done()
 			err := w.requeueJob(ctx, job)
 			if err != nil {

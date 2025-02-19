@@ -11,9 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"goa.design/pulse/pulse"
-
 	"github.com/redis/go-redis/v9"
+	"goa.design/pulse/pulse"
 )
 
 type (
@@ -26,7 +25,6 @@ type (
 		hashkey              string                // Redis hash key
 		msgch                <-chan *redis.Message // channel to receive map updates
 		chans                []chan EventKind      // channels to send notifications
-		ichan                chan setNotification  // internal channel to send set notifications
 		done                 chan struct{}         // channel to signal shutdown
 		wait                 sync.WaitGroup        // wait for read goroutine to exit
 		logger               pulse.Logger          // logger
@@ -35,10 +33,10 @@ type (
 		setScript            *redis.Script
 		testAndSetScript     *redis.Script
 		setIfNotExistsScript *redis.Script
+		incrScript           *redis.Script
 		appendScript         *redis.Script
 		appendUniqueScript   *redis.Script
 		removeScript         *redis.Script
-		incrScript           *redis.Script
 		delScript            *redis.Script
 		testAndDelScript     *redis.Script
 		testAndResetScript   *redis.Script
@@ -47,7 +45,10 @@ type (
 		lock    sync.RWMutex
 		content map[string]string
 		closing bool // true if Close was called
-		closed  bool // true if Close returned
+		closed  bool // true if Close returned - used by tests
+
+		wlock   sync.Mutex
+		waiters sync.Map // map of key to []*setWaiter
 	}
 
 	// EventKind is the type of map event.
@@ -57,6 +58,15 @@ type (
 	setNotification struct {
 		key   string
 		value string
+	}
+
+	// setWaiter represents a waiting SetAndWait operation
+	setWaiter struct {
+		ch     chan setNotification
+		key    string
+		value  string
+		ctx    context.Context // context for cancellation
+		cancel func()          // cleanup function
 	}
 )
 
@@ -92,7 +102,6 @@ func Join(ctx context.Context, name string, rdb *redis.Client, opts ...MapOption
 		Name:                 name,
 		chankey:              fmt.Sprintf("map:%s:updates", name),
 		hashkey:              fmt.Sprintf("map:%s:content", name),
-		ichan:                make(chan setNotification, 100),
 		done:                 make(chan struct{}),
 		logger:               o.Logger.WithPrefix("map", name),
 		rdb:                  rdb,
@@ -115,7 +124,7 @@ func Join(ctx context.Context, name string, rdb *redis.Client, opts ...MapOption
 
 	// read updates
 	sm.wait.Add(1)
-	pulse.Go(ctx, sm.run)
+	pulse.Go(sm.logger, sm.run)
 
 	sm.logger.Info("joined")
 	return sm, nil
@@ -225,26 +234,86 @@ func (sm *Map) Set(ctx context.Context, key, value string) (string, error) {
 	return prev.(string), nil
 }
 
-// SetAndWait is a convenience method that calls Set and then waits for the
-// update to be applied and the notification to be sent.
+// SetAndWait is a convenience method that calls Set and waits for the update to be
+// applied and the notification to be sent. Multiple concurrent calls with the same
+// key and value are allowed - each call will receive its own notification when the
+// update is applied.
+//
+// The method will return an error if:
+// - The key is empty
+// - The key contains an equal sign
+// - The context is cancelled
+// - The map is stopped
+// - There's an issue with the Redis operation
 func (sm *Map) SetAndWait(ctx context.Context, key, value string) (string, error) {
+	notifyCh := make(chan setNotification, 1)
+
+	// Create cancellable context for cleanup
+	waitCtx, cancel := context.WithCancel(ctx)
+	waiter := &setWaiter{
+		ch:     notifyCh,
+		key:    key,
+		value:  value,
+		ctx:    waitCtx,
+		cancel: cancel,
+	}
+
+	// First mark the channel as closing before removing from waiters
+	defer func() {
+		// Cancel first to prevent new sends
+		cancel()
+
+		// Remove waiter under lock
+		sm.wlock.Lock()
+		if v, ok := sm.waiters.Load(key); ok {
+			waiters := v.([]*setWaiter)
+			newWaiters := make([]*setWaiter, 0, len(waiters))
+			for _, w := range waiters {
+				if w != waiter {
+					newWaiters = append(newWaiters, w)
+				}
+			}
+			if len(newWaiters) > 0 {
+				sm.waiters.Store(key, newWaiters)
+			} else {
+				sm.waiters.Delete(key)
+			}
+		}
+		sm.wlock.Unlock()
+
+		// Now safe to close channel as no more sends will occur
+		close(notifyCh)
+	}()
+
+	// Prepare new waiters list under lock
+	sm.wlock.Lock()
+	if v, ok := sm.waiters.Load(key); ok {
+		waiters := v.([]*setWaiter)
+		newWaiters := append(append([]*setWaiter(nil), waiters...), waiter) // Note: need to copy to avoid data race
+		sm.waiters.Store(key, newWaiters)
+	} else {
+		sm.waiters.Store(key, []*setWaiter{waiter})
+	}
+	sm.wlock.Unlock()
+
+	// Call Set - if it fails, the deferred cleanup will remove our waiter
 	prev, err := sm.Set(ctx, key, value)
 	if err != nil {
 		return "", err
 	}
-	// Wait for the update to be applied.
-	for {
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		case ev, ok := <-sm.ichan:
-			if !ok {
-				return "", fmt.Errorf("pulse map: %s is stopped", sm.Name)
-			}
-			if ev.key == key && ev.value == value {
-				return prev, nil
-			}
+
+	// Wait for notification or context cancellation
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-sm.done:
+		return "", fmt.Errorf("pulse map: %s is stopped", sm.Name)
+	case ev := <-notifyCh:
+		if ev.key == key && ev.value == value {
+			return prev, nil
 		}
+		// This shouldn't happen as we only send matching notifications
+		return "", fmt.Errorf("pulse map: received unexpected notification key=%s value=%s", ev.key, ev.value)
 	}
 }
 
@@ -468,9 +537,21 @@ func (sm *Map) Close() {
 	}
 	sm.closing = true
 	sm.lock.Unlock()
+
+	// Signal run() to stop and wait for it to complete
 	close(sm.done)
 	sm.wait.Wait()
-	close(sm.ichan)
+
+	// Clean up all waiters
+	sm.wlock.Lock()
+	sm.waiters.Range(func(key, value interface{}) bool {
+		waiters := value.([]*setWaiter)
+		for _, w := range waiters {
+			w.cancel()
+		}
+		return true
+	})
+	sm.wlock.Unlock()
 	sm.lock.Lock()
 	sm.closed = true
 	sm.lock.Unlock()
@@ -539,6 +620,7 @@ func (sm *Map) run() {
 			op, data := parts[0], []byte(parts[1])
 			sm.lock.Lock()
 			kind := EventChange
+			var notification *setNotification
 			switch op {
 			case "reset":
 				sm.content = make(map[string]string)
@@ -568,9 +650,10 @@ func (sm *Map) run() {
 					continue
 				}
 				sm.content[key] = val
-				sm.ichan <- setNotification{key: key, value: val}
+				notification = &setNotification{key: key, value: val}
 				sm.logger.Debug("set", "key", key, "val", val)
 			}
+
 			for _, c := range sm.chans {
 				select {
 				case c <- kind:
@@ -578,6 +661,31 @@ func (sm *Map) run() {
 				}
 			}
 			sm.lock.Unlock()
+
+			// For set operations, notify waiters after releasing lock
+			if notification != nil {
+				// Load waiters for this key
+				if w, ok := sm.waiters.Load(notification.key); ok {
+					// Take lock only while reading waiters list
+					sm.wlock.Lock()
+					waiters := w.([]*setWaiter)
+					sm.wlock.Unlock()
+
+					// Notify matching waiters - no lock needed as each waiter has its own channel
+					for _, waiter := range waiters {
+						if waiter.key == notification.key && waiter.value == notification.value {
+							select {
+							case waiter.ch <- *notification:
+							case <-sm.done:
+								return
+							case <-waiter.ctx.Done():
+								// Waiter was cancelled or timed out
+								continue
+							}
+						}
+					}
+				}
+			}
 
 		case <-sm.done:
 			sm.logger.Info("closed")

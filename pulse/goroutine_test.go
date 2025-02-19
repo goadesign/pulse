@@ -14,12 +14,11 @@ import (
 
 func TestGo(t *testing.T) {
 	t.Run("executes function without panic", func(t *testing.T) {
-		ctx := context.Background()
 		var wg sync.WaitGroup
 		wg.Add(1)
 		executed := false
 
-		Go(ctx, func() {
+		Go(NoopLogger(), func() {
 			defer wg.Done()
 			executed = true
 		})
@@ -35,8 +34,9 @@ func TestGo(t *testing.T) {
 
 		var buf strings.Builder
 		ctx = log.Context(ctx, log.WithOutput(&buf))
+		logger := ClueLogger(ctx)
 
-		Go(ctx, func() {
+		Go(logger, func() {
 			defer wg.Done()
 			panic("test panic")
 		})
@@ -58,8 +58,9 @@ func TestGo(t *testing.T) {
 
 		var buf strings.Builder
 		ctx = log.Context(ctx, log.WithOutput(&buf))
+		logger := ClueLogger(ctx)
 
-		Go(ctx, func() {
+		Go(logger, func() {
 			defer wg.Done()
 			panic(errors.New("custom error"))
 		})

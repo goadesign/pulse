@@ -67,7 +67,7 @@ func (node *Node) NewTicker(ctx context.Context, name string, d time.Duration, o
 	}
 	t.initTimer()
 	t.wg.Add(1)
-	pulse.Go(ctx, func() { t.handleEvents() })
+	pulse.Go(logger, func() { t.handleEvents() })
 	return t, nil
 }
 
