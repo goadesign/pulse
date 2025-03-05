@@ -80,7 +80,9 @@ func (t *Ticker) Stop() {
 	if _, err := t.tickerMap.Delete(context.Background(), t.name); err != nil {
 		t.logger.Error(err, "msg", "failed to delete ticker")
 	}
-	t.tickerMap.Unsubscribe(t.mapch)
+	if t.mapch != nil {
+		t.tickerMap.Unsubscribe(t.mapch)
+	}
 	t.mapch = nil
 	t.lock.Unlock()
 	t.wg.Wait()
@@ -90,6 +92,10 @@ func (t *Ticker) Stop() {
 func (t *Ticker) handleEvents() {
 	defer t.wg.Done()
 	t.lock.Lock()
+	if t.mapch == nil {
+		t.lock.Unlock()
+		return
+	}
 	ch := t.mapch
 	t.lock.Unlock()
 	for {
@@ -103,7 +109,9 @@ func (t *Ticker) handleEvents() {
 			if !ok {
 				t.logger.Info("stopped remotely")
 				t.lock.Lock()
-				t.tickerMap.Unsubscribe(t.mapch)
+				if t.mapch != nil {
+					t.tickerMap.Unsubscribe(t.mapch)
+				}
 				t.mapch = nil
 				t.lock.Unlock()
 				return

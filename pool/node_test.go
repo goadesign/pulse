@@ -944,6 +944,144 @@ func TestStaleWorkerCleanupAfterJobRequeue(t *testing.T) {
 	}, max, delay, "Stale worker was not properly cleaned up")
 }
 
+func TestRemoveWorkerCleansJobPayloads(t *testing.T) {
+	testName := strings.Replace(t.Name(), "/", "_", -1)
+	ctx := ptesting.NewTestContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	node := newTestNode(t, ctx, rdb, testName)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+
+	// Create a worker and dispatch jobs to it
+	worker := newTestWorker(t, ctx, node)
+	jobs := []struct {
+		key     string
+		payload []byte
+	}{
+		{key: "job1", payload: []byte("payload1")},
+		{key: "job2", payload: []byte("payload2")},
+	}
+
+	// Dispatch jobs
+	for _, job := range jobs {
+		assert.NoError(t, node.DispatchJob(ctx, job.key, job.payload), "Failed to dispatch job")
+	}
+
+	// Verify jobs are received and payloads are stored
+	require.Eventually(t, func() bool {
+		return len(worker.Jobs()) == len(jobs)
+	}, max, delay, "Worker did not receive all jobs")
+
+	// Verify payloads are in the map
+	for _, job := range jobs {
+		payload, ok := node.JobPayload(job.key)
+		assert.True(t, ok, "Job payload not found for key %s", job.key)
+		assert.Equal(t, job.payload, payload, "Incorrect payload for job %s", job.key)
+	}
+
+	// Remove the worker maps
+	node.removeWorkerFromMaps(ctx, worker.ID)
+
+	// Verify job payloads are removed
+	assert.Eventually(t, func() bool {
+		for _, job := range jobs {
+			if _, ok := node.JobPayload(job.key); ok {
+				return false
+			}
+		}
+		return true
+	}, max, delay, "Job payloads were not cleaned up after worker removal")
+
+	// Shutdown node
+	assert.NoError(t, node.Shutdown(ctx), "Failed to shutdown node")
+}
+
+func TestCleanupOrphanedJobPayloads(t *testing.T) {
+	type jobInfo struct {
+		key     string
+		payload []byte
+	}
+
+	tests := []struct {
+		name        string
+		setupJobs   []jobInfo
+		deletedJobs []string
+	}{
+		{
+			name: "no orphaned payloads",
+			setupJobs: []jobInfo{
+				{key: "job1", payload: []byte("payload1")},
+				{key: "job2", payload: []byte("payload2")},
+				{key: "job3", payload: []byte("payload3")},
+			},
+		},
+		{
+			name: "some orphaned payloads",
+			setupJobs: []jobInfo{
+				{key: "job1", payload: []byte("payload1")},
+				{key: "job2", payload: []byte("payload2")},
+				{key: "job3", payload: []byte("payload3")},
+			},
+			deletedJobs: []string{"job1", "job3"},
+		},
+		{
+			name: "all orphaned payloads",
+			setupJobs: []jobInfo{
+				{key: "job1", payload: []byte("payload1")},
+				{key: "job2", payload: []byte("payload2")},
+			},
+			deletedJobs: []string{"job1", "job2"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			testName := strings.Replace(t.Name(), "/", "_", -1)
+			ctx := ptesting.NewTestContext(t)
+			rdb := ptesting.NewRedisClient(t)
+			node := newTestNode(t, ctx, rdb, testName)
+			worker := newTestWorker(t, ctx, node)
+			defer ptesting.CleanupRedis(t, rdb, true, testName)
+
+			// Dispatch jobs to the worker
+			for _, job := range tt.setupJobs {
+				require.NoError(t, node.DispatchJob(ctx, job.key, job.payload))
+			}
+
+			// Wait for jobs to be assigned
+			require.Eventually(t, func() bool {
+				jobs, _ := node.jobMap.GetValues(worker.ID)
+				return len(jobs) == len(tt.setupJobs)
+			}, max, delay, "Jobs were not assigned, got %d jobs in jobMap, expected %d", node.jobMap.Len(), len(tt.setupJobs))
+
+			// Delete some job keys
+			for _, key := range tt.deletedJobs {
+				_, _, err := node.jobMap.RemoveValues(ctx, worker.ID, key)
+				assert.NoError(t, err)
+			}
+
+			assert.Eventually(t, func() bool {
+				jobs, _ := node.jobMap.GetValues(worker.ID)
+				return len(jobs) == len(tt.setupJobs)-len(tt.deletedJobs)
+			}, max, delay, "Job keys were not deleted")
+
+			// Run cleanup
+			node.cleanupOrphanedJobPayloads(ctx)
+
+			// Verify payloads
+			assert.Eventually(t, func() bool {
+				for _, key := range tt.deletedJobs {
+					if _, ok := node.JobPayload(key); ok {
+						return false
+					}
+				}
+				return true
+			}, max, delay, fmt.Sprintf("Payload cleanup did not complete as expected, expected %d payloads, got %d", len(tt.setupJobs)-len(tt.deletedJobs), len(node.jobPayloadMap.Map())))
+
+			assert.NoError(t, node.Shutdown(ctx))
+		})
+	}
+}
+
 type mockAcker struct {
 	XAckFunc func(ctx context.Context, streamKey, sinkName string, ids ...string) *redis.IntCmd
 }

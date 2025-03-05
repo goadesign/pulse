@@ -196,7 +196,7 @@ func (w *Worker) handleEvents(ctx context.Context, c <-chan *streaming.Event) {
 				err = w.startJob(ctx, unmarshalJob(payload))
 			case evStopJob:
 				w.logger.Debug("handleEvents: received stop job", "event", ev.EventName, "id", ev.ID)
-				err = w.stopJob(ctx, unmarshalJobKey(payload), false)
+				err = w.stopJob(ctx, unmarshalJobKey(payload))
 			case evNotify:
 				w.logger.Debug("handleEvents: received notify", "event", ev.EventName, "id", ev.ID)
 				key, payload := unmarshalNotification(payload)
@@ -266,7 +266,7 @@ func (w *Worker) startJob(ctx context.Context, job *Job) error {
 }
 
 // stopJob stops a job.
-func (w *Worker) stopJob(ctx context.Context, key string, forRequeue bool) error {
+func (w *Worker) stopJob(ctx context.Context, key string) error {
 	if _, ok := w.jobs.Load(key); !ok {
 		return fmt.Errorf("job %s not found in local worker", key)
 	}
@@ -278,12 +278,10 @@ func (w *Worker) stopJob(ctx context.Context, key string, forRequeue bool) error
 	if _, _, err := w.jobsMap.RemoveValues(ctx, w.ID, key); err != nil {
 		w.logger.Error(fmt.Errorf("stop job: failed to remove job %q from jobs map: %w", key, err))
 	}
-	if !forRequeue {
-		if _, err := w.jobPayloadsMap.Delete(ctx, key); err != nil {
-			w.logger.Error(fmt.Errorf("stop job: failed to remove job payload %q from job payloads map: %w", key, err))
-		}
+	if _, err := w.jobPayloadsMap.Delete(ctx, key); err != nil {
+		w.logger.Error(fmt.Errorf("stop job: failed to remove job payload %q from job payloads map: %w", key, err))
 	}
-	w.logger.Info("stopped job", "job", key, "for_requeue", forRequeue)
+	w.logger.Info("stopped job", "job", key)
 	return nil
 }
 
@@ -482,7 +480,7 @@ func (w *Worker) requeueJob(ctx context.Context, job *Job) error {
 		return fmt.Errorf("requeueJob: failed to add job to pool stream: %w", err)
 	}
 	w.node.pendingJobChannels.Store(eventID, nil)
-	if err := w.stopJob(ctx, job.Key, true); err != nil {
+	if err := w.stopJob(ctx, job.Key); err != nil {
 		return fmt.Errorf("failed to stop job: %w", err)
 	}
 	return nil
