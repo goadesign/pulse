@@ -91,10 +91,6 @@ const (
 	evDispatchReturn string = "d"
 )
 
-const (
-	maxRequeuingRetries = 3 // Maximum number of times to retry requeuing jobs
-)
-
 // pendingEventTTL is the TTL for pending events.
 var pendingEventTTL = 2 * time.Minute
 
@@ -506,7 +502,7 @@ func (node *Node) Shutdown(ctx context.Context) error {
 	}
 
 	// Signal all nodes to shutdown.
-	if _, err := node.nodeShutdownMap.SetAndWait(ctx, "shutdown", node.ID); err != nil {
+	if _, err := node.nodeShutdownMap.Set(ctx, "shutdown", node.ID); err != nil {
 		node.logger.Error(fmt.Errorf("Shutdown: failed to set shutdown status in shutdown map: %w", err))
 	}
 	<-node.closed // Wait for this node to be closed
@@ -603,7 +599,7 @@ func (node *Node) stopAllJobs(ctx context.Context) {
 		pulse.Go(node.logger, func() {
 			defer wg.Done()
 			for _, job := range worker.Jobs() {
-				if err := worker.stopJob(ctx, job.Key, false); err != nil {
+				if err := worker.stopJob(ctx, job.Key); err != nil {
 					node.logger.Error(fmt.Errorf("Close: failed to stop job %q for worker %q: %w", job.Key, worker.ID, err))
 				}
 				total.Add(1)
@@ -990,6 +986,7 @@ func (node *Node) cleanupWorker(ctx context.Context, workerID string) {
 		payload, ok := node.JobPayload(key)
 		if !ok {
 			node.logger.Error(fmt.Errorf("requeueWorkerJobs: failed to get job payload"), "job", key, "worker", workerID)
+			requeued++ // We will never be able to requeue this job
 			continue
 		}
 		job := &Job{Key: key, Payload: []byte(payload), CreatedAt: time.Now(), NodeID: node.ID}
@@ -1017,12 +1014,21 @@ func (node *Node) processInactiveJobs(ctx context.Context) {
 	ticker := time.NewTicker(node.ackGracePeriod) // Run at ackGracePeriod frequency since pending jobs expire after 2*ackGracePeriod
 	defer ticker.Stop()
 
+	payloadCleanupTicker, err := node.NewTicker(ctx, "jobPayloadCleanup", node.workerTTL)
+	if err != nil {
+		node.logger.Error(fmt.Errorf("processInactiveJobs: failed to create payload cleanup ticker: %w", err))
+		return
+	}
+	defer payloadCleanupTicker.Stop()
+
 	for {
 		select {
 		case <-node.stop:
 			return
 		case <-ticker.C:
 			node.cleanupStalePendingJobs(ctx)
+		case <-payloadCleanupTicker.C:
+			node.cleanupOrphanedJobPayloads(ctx)
 		}
 	}
 }
@@ -1040,6 +1046,29 @@ func (node *Node) cleanupStalePendingJobs(ctx context.Context) {
 		}
 		if prev == pendingTS {
 			node.logger.Info("cleanupStalePendingJobs: removed stale pending entry", "key", key)
+		}
+	}
+}
+
+// cleanupOrphanedJobPayloads checks for and removes entries in the job payload map
+// that don't have a corresponding entry in the job map.
+func (node *Node) cleanupOrphanedJobPayloads(ctx context.Context) {
+	// Get all existing job keys from the job map
+	existingJobs := make(map[string]struct{})
+	for _, jobs := range node.jobMap.Map() {
+		for _, key := range strings.Split(jobs, ",") {
+			existingJobs[key] = struct{}{}
+		}
+	}
+
+	// Check each payload entry
+	for key := range node.jobPayloadMap.Map() {
+		if _, exists := existingJobs[key]; !exists {
+			if _, err := node.jobPayloadMap.Delete(ctx, key); err != nil {
+				node.logger.Error(fmt.Errorf("cleanupOrphanedJobPayloads: failed to delete orphaned payload for job %q: %w", key, err))
+				continue
+			}
+			node.logger.Info("cleanupOrphanedJobPayloads: removed orphaned payload", "key", key)
 		}
 	}
 }
@@ -1196,6 +1225,12 @@ func (node *Node) removeWorkerFromMaps(ctx context.Context, id string) {
 	}
 	if _, err := node.workerCleanupMap.Delete(ctx, id); err != nil {
 		node.logger.Error(fmt.Errorf("removeWorkerFromMaps: failed to remove cleanup timestamp: %w", err), "worker", id)
+	}
+	jobKeys, _ := node.jobMap.GetValues(id)
+	for _, key := range jobKeys {
+		if _, err := node.jobPayloadMap.Delete(ctx, key); err != nil {
+			node.logger.Error(fmt.Errorf("removeWorkerFromMaps: failed to remove job %s from payload map: %w", key, err))
+		}
 	}
 	if _, err := node.jobMap.Delete(ctx, id); err != nil {
 		node.logger.Error(fmt.Errorf("removeWorkerFromMaps: failed to remove worker %s from jobs map: %w", id, err))
