@@ -28,8 +28,12 @@ func TestNewSink(t *testing.T) {
 	assert.NoError(t, err)
 	sink, err := s.NewSink(ctx, "sink", options.WithSinkBlockDuration(testBlockDuration))
 	assert.NoError(t, err)
-	assert.NotNil(t, sink)
-	cleanupSink(t, ctx, s, sink)
+	if assert.NotNil(t, sink) {
+		defer cleanupSink(t, ctx, s, sink)
+	}
+
+	_, err = s.NewSink(ctx, "sink", options.WithSinkTopicPattern("("))
+	assert.EqualError(t, err, "topic pattern must be a valid regex: error parsing regexp: missing closing ): `(`")
 }
 
 func TestReadOnce(t *testing.T) {

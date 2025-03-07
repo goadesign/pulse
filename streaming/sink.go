@@ -115,7 +115,10 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...options.S
 	if o.Topic != "" {
 		eventMatcher = func(e *Event) bool { return e.Topic == o.Topic }
 	} else if o.TopicPattern != "" {
-		topicPatternRegexp := regexp.MustCompile(o.TopicPattern)
+		topicPatternRegexp, err := regexp.Compile(o.TopicPattern)
+		if err != nil {
+			return nil, fmt.Errorf("topic pattern must be a valid regex: %w", err)
+		}
 		eventMatcher = func(e *Event) bool { return topicPatternRegexp.MatchString(e.Topic) }
 	}
 

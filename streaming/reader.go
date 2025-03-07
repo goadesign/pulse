@@ -86,13 +86,16 @@ type (
 )
 
 // newReader creates a new reader.
-func newReader(ctx context.Context, stream *Stream, opts ...options.Reader) (*Reader, error) {
+func newReader(stream *Stream, opts ...options.Reader) (*Reader, error) {
 	o := options.ParseReaderOptions(opts...)
 	var eventFilter eventFilterFunc
 	if o.Topic != "" {
 		eventFilter = func(e *Event) bool { return e.Topic == o.Topic }
 	} else if o.TopicPattern != "" {
-		topicPatternRegexp := regexp.MustCompile(o.TopicPattern)
+		topicPatternRegexp, err := regexp.Compile(o.TopicPattern)
+		if err != nil {
+			return nil, fmt.Errorf("topic pattern must be a valid regex: %w", err)
+		}
 		eventFilter = func(e *Event) bool { return topicPatternRegexp.MatchString(e.Topic) }
 	}
 

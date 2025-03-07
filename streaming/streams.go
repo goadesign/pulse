@@ -77,10 +77,9 @@ func NewStream(name string, rdb *redis.Client, opts ...options.Stream) (*Stream,
 //   - from the event added on or after the timestamp provided via
 //     WithReaderStartAt if still in the stream, oldest event otherwise
 func (s *Stream) NewReader(ctx context.Context, opts ...options.Reader) (*Reader, error) {
-	reader, err := newReader(ctx, s, opts...)
+	reader, err := newReader(s, opts...)
 	if err != nil {
-		err := fmt.Errorf("failed to create reader: %w", err)
-		s.logger.Error(err)
+		s.logger.Error(fmt.Errorf("failed to create reader: %w", err))
 		return nil, err
 	}
 	s.logger.Info("create reader", "start", reader.startID)

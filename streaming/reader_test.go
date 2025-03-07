@@ -24,8 +24,12 @@ func TestNewReader(t *testing.T) {
 	assert.NoError(t, err)
 	reader, err := s.NewReader(ctx, options.WithReaderBlockDuration(testBlockDuration))
 	assert.NoError(t, err)
-	assert.NotNil(t, reader)
-	defer cleanupReader(t, ctx, s, reader)
+	if assert.NotNil(t, reader) {
+		defer cleanupReader(t, ctx, s, reader)
+	}
+
+	_, err = s.NewReader(ctx, options.WithReaderTopicPattern("("))
+	assert.EqualError(t, err, "topic pattern must be a valid regex: error parsing regexp: missing closing ): `(`")
 }
 
 func TestReaderReadOnce(t *testing.T) {
