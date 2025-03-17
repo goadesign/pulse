@@ -13,8 +13,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// redisPwd is the default test redis password, overridden by REDIS_PASSWORD env var
-var redisPwd = "redispassword"
+var (
+	// redisPwd is the default test redis password, overridden by REDIS_PASSWORD env var
+	redisPwd = "redispassword"
+	// streamRegexp is a regular expression that matches valid stream keys
+	streamRegexp = regexp.MustCompile(`^pulse:stream:[^:]+:node:.*`)
+)
 
 func init() {
 	if p := os.Getenv("REDIS_PASSWORD"); p != "" {
@@ -45,7 +49,7 @@ func CleanupRedis(t *testing.T, rdb *redis.Client, checkClean bool, testName str
 				// Sinks content is cleaned up asynchronously, so ignore it
 				continue
 			}
-			if regexp.MustCompile(`^pulse:stream:[^:]+:node:.*`).MatchString(k) {
+			if streamRegexp.MatchString(k) {
 				// Node streams are cleaned up asynchronously, so ignore them
 				continue
 			}
