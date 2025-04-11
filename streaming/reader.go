@@ -44,9 +44,6 @@ type (
 		chans []chan *Event
 		// startOnce is used to ensure the reader is started only once.
 		startOnce sync.Once
-		// startExplicitly indicates the the reader should only start when Start is called, otherwise it will start after
-		// the first call to Subscribe.
-		startExplicitly bool
 		// donechan is the reader donechan channel.
 		donechan chan struct{}
 		// streamschan notifies the reader when streams are added or
@@ -105,28 +102,21 @@ func newReader(stream *Stream, opts ...options.Reader) (*Reader, error) {
 	}
 
 	reader := &Reader{
-		startID:         o.LastEventID,
-		streams:         []*Stream{stream},
-		streamKeys:      []string{stream.key},
-		streamCursors:   []string{o.LastEventID},
-		blockDuration:   o.BlockDuration,
-		maxPolled:       o.MaxPolled,
-		bufferSize:      o.BufferSize,
-		startExplicitly: o.StartExplicitly,
-		donechan:        make(chan struct{}),
-		streamschan:     make(chan struct{}),
-		eventFilter:     eventFilter,
-		logger:          stream.rootLogger.WithPrefix("reader", stream.Name),
-		rdb:             stream.rdb,
+		startID:       o.LastEventID,
+		streams:       []*Stream{stream},
+		streamKeys:    []string{stream.key},
+		streamCursors: []string{o.LastEventID},
+		blockDuration: o.BlockDuration,
+		maxPolled:     o.MaxPolled,
+		bufferSize:    o.BufferSize,
+		donechan:      make(chan struct{}),
+		streamschan:   make(chan struct{}),
+		eventFilter:   eventFilter,
+		logger:        stream.rootLogger.WithPrefix("reader", stream.Name),
+		rdb:           stream.rdb,
 	}
 
 	return reader, nil
-}
-
-// Start starts the reader. This is only needed if the reader is created with
-// WithReaderStartExplicitly. It is idempotent.
-func (r *Reader) Start() {
-	r.start()
 }
 
 // Subscribe returns a channel that receives events from the stream.
@@ -136,9 +126,7 @@ func (r *Reader) Subscribe() <-chan *Event {
 	r.lock.Lock()
 	defer r.lock.Unlock()
 	r.chans = append(r.chans, c)
-	if !r.startExplicitly {
-		r.start()
-	}
+	r.start()
 	return c
 }
 

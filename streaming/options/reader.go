@@ -10,13 +10,12 @@ type (
 	Reader func(*ReaderOptions)
 
 	ReaderOptions struct {
-		BlockDuration   time.Duration
-		MaxPolled       int64
-		Topic           string
-		TopicPattern    string
-		BufferSize      int
-		LastEventID     string
-		StartExplicitly bool
+		BlockDuration time.Duration
+		MaxPolled     int64
+		Topic         string
+		TopicPattern  string
+		BufferSize    int
+		LastEventID   string
 	}
 )
 
@@ -93,14 +92,6 @@ func WithReaderStartAfter(id string) Reader {
 func WithReaderStartAt(startAt time.Time) Reader {
 	return func(o *ReaderOptions) {
 		o.LastEventID = fmt.Sprintf("%d-0", startAt.UnixMilli())
-	}
-}
-
-// WithReaderStartExplicitly sets the reader to start explicitly when Start is called.
-// By default the reader starts after the first call to Subscribe.
-func WithReaderStartExplicitly() Reader {
-	return func(o *ReaderOptions) {
-		o.StartExplicitly = true
 	}
 }
 
