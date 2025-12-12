@@ -366,12 +366,15 @@ func (w *Worker) rebalance(ctx context.Context, activeWorkers []string) {
 		}
 		w.logger.Debug("stopped job", "job", key)
 		w.jobs.Delete(key)
-		err := w.node.dispatchJob(ctx, key, marshalJob(job), true)
-		if err != nil {
+		if _, err := w.node.poolStream.Add(ctx, evStartJob, marshalJob(job)); err != nil {
 			w.logger.Error(fmt.Errorf("rebalance: failed to requeue job: %w", err), "job", key)
 			if err := w.handler.Start(job); err != nil {
 				w.logger.Error(fmt.Errorf("rebalance: failed to restart job: %w", err), "job", key)
+				continue
 			}
+			// Requeue failed but we restarted the job locally; restore local
+			// tracking so future close/shutdown can still requeue it.
+			w.jobs.Store(key, job)
 			continue
 		}
 		delete(rebalanced, key)
@@ -405,6 +408,14 @@ func (w *Worker) requeueJobs(ctx context.Context) error {
 	if prev == "-" {
 		w.logger.Debug("requeueJobs: jobs already requeued, skipping requeue")
 		return nil
+	}
+	// If the optimistic lock failed (unexpected value), force the worker to
+	// inactive anyway. This worker is stopped and must not receive requeued jobs.
+	if prev != createdAt {
+		w.logger.Error(fmt.Errorf("requeueJobs: failed optimistic lock for worker inactive mark"), "worker", w.ID, "expected", createdAt, "got", prev)
+		if _, err := w.node.workerMap.Set(ctx, w.ID, "-"); err != nil {
+			return fmt.Errorf("requeueJobs: failed to force worker inactive state: %w", err)
+		}
 	}
 
 	retryUntil := time.Now().Add(w.workerTTL)
@@ -479,9 +490,18 @@ func (w *Worker) requeueJob(ctx context.Context, job *Job) error {
 	if err != nil {
 		return fmt.Errorf("requeueJob: failed to add job to pool stream: %w", err)
 	}
+	// Mark this event as a "requeue" so any node waiting for a dispatch return (if any)
+	// can simply clean up without blocking.
 	w.node.pendingJobChannels.Store(eventID, nil)
-	if err := w.stopJob(ctx, job.Key); err != nil {
-		return fmt.Errorf("failed to stop job: %w", err)
+
+	// Stop locally, but do not touch the replicated job/payload maps: we want the
+	// payload to remain available for distributed recovery until the job is
+	// confirmed running elsewhere.
+	if _, ok := w.jobs.Load(job.Key); ok {
+		if err := w.handler.Stop(job.Key); err != nil {
+			return fmt.Errorf("requeueJob: failed to stop job %q: %w", job.Key, err)
+		}
+		w.jobs.Delete(job.Key)
 	}
 	return nil
 }
