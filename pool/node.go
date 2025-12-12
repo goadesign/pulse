@@ -58,6 +58,7 @@ type (
 		nodeStreams        sync.Map // streams for worker acks indexed by ID
 		pendingJobChannels sync.Map // channels used to send DispatchJob results, nil if event is requeued
 		pendingEvents      sync.Map // pending events indexed by sender and event IDs
+		orphanedPayloads   sync.Map // job key -> first time observed orphaned payload (unix nanos)
 
 		lock     sync.RWMutex
 		closing  bool
@@ -355,7 +356,10 @@ func (node *Node) DispatchJob(ctx context.Context, key string, payload []byte) e
 }
 
 func (node *Node) dispatchJob(ctx context.Context, key string, job []byte, requeue bool) error {
-	if node.IsClosed() {
+	// Allow internal requeue operations to proceed while the node is closing.
+	// External callers use DispatchJob which passes requeue=false and should be
+	// rejected once Close begins.
+	if node.IsClosed() && !requeue {
 		return fmt.Errorf("DispatchJob: pool %q is closed", node.PoolName)
 	}
 
@@ -553,7 +557,12 @@ func (node *Node) close(ctx context.Context, shutdown bool) error {
 		node.stopAllJobs(ctx)
 	}
 
-	// Stop all workers before waiting for goroutines
+	// Stop all workers before waiting for goroutines.
+	//
+	// IMPORTANT: do NOT remove workers from the replicated maps here.
+	// Removing the worker deletes the worker->jobs mapping which is what other
+	// nodes use to recover/requeue jobs if this node dies mid-close. We only
+	// remove workers from maps after we've attempted to requeue.
 	var wg sync.WaitGroup
 	node.localWorkers.Range(func(key, value any) bool {
 		worker := value.(*Worker)
@@ -561,8 +570,6 @@ func (node *Node) close(ctx context.Context, shutdown bool) error {
 		pulse.Go(node.logger, func() {
 			defer wg.Done()
 			worker.stop(ctx)
-			// Remove worker immediately to avoid job requeuing by other nodes
-			node.removeWorker(ctx, worker.ID)
 		})
 		return true
 	})
@@ -572,12 +579,23 @@ func (node *Node) close(ctx context.Context, shutdown bool) error {
 	close(node.stop)
 	node.wg.Wait()
 
-	// Requeue jobs if not shutting down, after stopping goroutines to avoid receiving new jobs
+	// Requeue jobs if not shutting down.
+	//
+	// This is done after stopping node goroutines so we don't route any new pool
+	// events to workers that have already been stopped.
 	if !shutdown {
 		if err := node.requeueAllJobs(ctx); err != nil {
 			node.logger.Error(fmt.Errorf("close: failed to requeue jobs: %w", err))
 		}
 	}
+
+	// Now that we attempted requeue, remove all local workers from pool maps.
+	node.localWorkers.Range(func(key, value any) bool {
+		worker := value.(*Worker)
+		node.removeWorker(ctx, worker.ID)
+		node.localWorkers.Delete(key)
+		return true
+	})
 
 	// Cleanup resources
 	node.cleanupNode(ctx)
@@ -959,6 +977,65 @@ func (node *Node) cleanupInactiveWorkers(ctx context.Context) {
 		node.logger.Info("cleanupInactiveWorkers: found inactive worker", "worker", workerID)
 		node.cleanupWorker(ctx, workerID)
 	}
+
+	// Also recover any jobs that still have payloads but are missing from the job map.
+	// This can happen transiently during cascading failures and is preferable to leaving
+	// jobs "stuck" (payload exists, but no worker owns the job).
+	node.requeueOrphanedPayloads(ctx)
+}
+
+// requeueOrphanedPayloads detects payloads for job keys that are not present in
+// the job map and requeues them after a short grace period.
+func (node *Node) requeueOrphanedPayloads(ctx context.Context) {
+	// Build a set of all job keys referenced by the job map.
+	existingJobs := make(map[string]struct{})
+	for _, jobs := range node.jobMap.Map() {
+		for _, key := range strings.Split(jobs, ",") {
+			if key == "" {
+				continue
+			}
+			existingJobs[key] = struct{}{}
+		}
+	}
+
+	// Use a short grace period: we want recovery to be fast under churn,
+	// but still avoid requeuing during brief map inconsistencies.
+	grace := 2 * node.workerTTL
+	if grace < node.ackGracePeriod {
+		grace = node.ackGracePeriod
+	}
+
+	now := time.Now()
+	for key := range node.jobPayloadMap.Map() {
+		if _, ok := existingJobs[key]; ok {
+			node.orphanedPayloads.Delete(key)
+			continue
+		}
+
+		firstAny, ok := node.orphanedPayloads.Load(key)
+		if !ok {
+			node.orphanedPayloads.Store(key, now.UnixNano())
+			continue
+		}
+		firstNS, _ := firstAny.(int64)
+		if firstNS == 0 || now.Sub(time.Unix(0, firstNS)) < grace {
+			continue
+		}
+
+		payload, ok := node.JobPayload(key)
+		if !ok {
+			node.orphanedPayloads.Delete(key)
+			continue
+		}
+		job := &Job{Key: key, Payload: payload, CreatedAt: now, NodeID: node.ID}
+		if _, err := node.poolStream.Add(ctx, evStartJob, marshalJob(job)); err != nil {
+			node.logger.Error(fmt.Errorf("requeueOrphanedPayloads: failed to requeue orphaned job: %w", err), "key", key)
+			continue
+		}
+
+		node.orphanedPayloads.Delete(key)
+		node.logger.Info("requeueOrphanedPayloads: requeued orphaned job", "key", key, "grace", grace)
+	}
 }
 
 // cleanupWorker requeues the jobs assigned to the worker and deletes it from
@@ -981,23 +1058,38 @@ func (node *Node) cleanupWorker(ctx context.Context, workerID string) {
 	}
 
 	// Requeue jobs and process them
-	var requeued int
+	var (
+		requeued  int // jobs successfully requeued
+		processed int // jobs that were either requeued or cleaned up as stale
+	)
 	for _, key := range keys {
 		payload, ok := node.JobPayload(key)
 		if !ok {
-			node.logger.Error(fmt.Errorf("requeueWorkerJobs: failed to get job payload"), "job", key, "worker", workerID)
-			requeued++ // We will never be able to requeue this job
+			// The job key can remain in the jobs map even if the payload has already
+			// been removed (e.g. the job was stopped, or another node already handled
+			// the requeue). Treat it as a stale entry and remove it so future cleanup
+			// attempts don't keep looping on it.
+			if _, _, err := node.jobMap.RemoveValues(ctx, workerID, key); err != nil {
+				node.logger.Error(fmt.Errorf("cleanupWorker: failed to remove stale job from jobs map: %w", err), "job", key, "worker", workerID)
+				continue
+			}
+			node.logger.Info("cleanupWorker: removed stale job key with missing payload", "job", key, "worker", workerID)
+			processed++
 			continue
 		}
-		job := &Job{Key: key, Payload: []byte(payload), CreatedAt: time.Now(), NodeID: node.ID}
-		if err := node.dispatchJob(ctx, job.Key, marshalJob(job), true); err != nil {
+		job := &Job{Key: key, Payload: payload, CreatedAt: time.Now(), NodeID: node.ID}
+		// Requeue by adding an event back to the pool stream.
+		// We intentionally do not wait for the job to start (which can time out
+		// under heavy churn) - the pool sink will retry routing until it is acked.
+		if _, err := node.poolStream.Add(ctx, evStartJob, marshalJob(job)); err != nil {
 			node.logger.Error(fmt.Errorf("requeueWorkerJobs: failed to requeue job: %w", err), "job", job.Key, "worker", workerID)
 			continue
 		}
 		requeued++
+		processed++
 	}
-	if len(keys) != requeued {
-		node.logger.Info("partially requeued stale worker jobs", "requeued", requeued, "jobs", len(keys), "worker", workerID)
+	if len(keys) != processed {
+		node.logger.Info("partially processed stale worker jobs", "requeued", requeued, "processed", processed, "jobs", len(keys), "worker", workerID)
 		return
 	}
 
@@ -1014,21 +1106,12 @@ func (node *Node) processInactiveJobs(ctx context.Context) {
 	ticker := time.NewTicker(node.ackGracePeriod) // Run at ackGracePeriod frequency since pending jobs expire after 2*ackGracePeriod
 	defer ticker.Stop()
 
-	payloadCleanupTicker, err := node.NewTicker(ctx, "jobPayloadCleanup", node.workerTTL)
-	if err != nil {
-		node.logger.Error(fmt.Errorf("processInactiveJobs: failed to create payload cleanup ticker: %w", err))
-		return
-	}
-	defer payloadCleanupTicker.Stop()
-
 	for {
 		select {
 		case <-node.stop:
 			return
 		case <-ticker.C:
 			node.cleanupStalePendingJobs(ctx)
-		case <-payloadCleanupTicker.C:
-			node.cleanupOrphanedJobPayloads(ctx)
 		}
 	}
 }
@@ -1046,29 +1129,6 @@ func (node *Node) cleanupStalePendingJobs(ctx context.Context) {
 		}
 		if prev == pendingTS {
 			node.logger.Info("cleanupStalePendingJobs: removed stale pending entry", "key", key)
-		}
-	}
-}
-
-// cleanupOrphanedJobPayloads checks for and removes entries in the job payload map
-// that don't have a corresponding entry in the job map.
-func (node *Node) cleanupOrphanedJobPayloads(ctx context.Context) {
-	// Get all existing job keys from the job map
-	existingJobs := make(map[string]struct{})
-	for _, jobs := range node.jobMap.Map() {
-		for _, key := range strings.Split(jobs, ",") {
-			existingJobs[key] = struct{}{}
-		}
-	}
-
-	// Check each payload entry
-	for key := range node.jobPayloadMap.Map() {
-		if _, exists := existingJobs[key]; !exists {
-			if _, err := node.jobPayloadMap.Delete(ctx, key); err != nil {
-				node.logger.Error(fmt.Errorf("cleanupOrphanedJobPayloads: failed to delete orphaned payload for job %q: %w", key, err))
-				continue
-			}
-			node.logger.Info("cleanupOrphanedJobPayloads: removed orphaned payload", "key", key)
 		}
 	}
 }
@@ -1226,12 +1286,15 @@ func (node *Node) removeWorkerFromMaps(ctx context.Context, id string) {
 	if _, err := node.workerCleanupMap.Delete(ctx, id); err != nil {
 		node.logger.Error(fmt.Errorf("removeWorkerFromMaps: failed to remove cleanup timestamp: %w", err), "worker", id)
 	}
-	jobKeys, _ := node.jobMap.GetValues(id)
-	for _, key := range jobKeys {
-		if _, err := node.jobPayloadMap.Delete(ctx, key); err != nil {
-			node.logger.Error(fmt.Errorf("removeWorkerFromMaps: failed to remove job %s from payload map: %w", key, err))
-		}
-	}
+	// NOTE: Do not delete job payloads here.
+	//
+	// Payload entries are job-scoped (not worker-scoped) and are required to
+	// safely requeue jobs from a stale worker during distributed cleanup. Deleting
+	// payloads during worker removal can race with another node performing
+	// cleanup/requeue and lead to permanent job loss.
+	//
+	// Payloads are deleted when jobs stop (see Worker.stopJob) and any remaining
+	// orphaned payloads are eventually collected by cleanupOrphanedJobPayloads.
 	if _, err := node.jobMap.Delete(ctx, id); err != nil {
 		node.logger.Error(fmt.Errorf("removeWorkerFromMaps: failed to remove worker %s from jobs map: %w", id, err))
 	}
