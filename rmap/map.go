@@ -258,9 +258,8 @@ func (sm *Map) SetAndWait(ctx context.Context, key, value string) (string, error
 		cancel: cancel,
 	}
 
-	// First mark the channel as closing before removing from waiters
 	defer func() {
-		// Cancel first to prevent new sends
+		// Cancel first so notifiers prefer to drop any late sends.
 		cancel()
 
 		// Remove waiter under lock
@@ -280,9 +279,6 @@ func (sm *Map) SetAndWait(ctx context.Context, key, value string) (string, error
 			}
 		}
 		sm.wlock.Unlock()
-
-		// Now safe to close channel as no more sends will occur
-		close(notifyCh)
 	}()
 
 	// Prepare new waiters list under lock
@@ -681,6 +677,8 @@ func (sm *Map) run() {
 							case <-waiter.ctx.Done():
 								// Waiter was cancelled or timed out
 								continue
+							default:
+								// Non-blocking to avoid stalling the map loop if the waiter is no longer receiving.
 							}
 						}
 					}
