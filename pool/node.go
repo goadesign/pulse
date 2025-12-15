@@ -72,7 +72,8 @@ type (
 
 	// jumpHash implement Jump Consistent Hash.
 	jumpHash struct {
-		h hash.Hash64
+		mu sync.Mutex
+		h  hash.Hash64
 	}
 )
 
@@ -245,7 +246,7 @@ func AddNode(ctx context.Context, poolName string, rdb *redis.Client, opts ...No
 		workerTTL:          o.workerTTL,
 		workerShutdownTTL:  o.workerShutdownTTL,
 		ackGracePeriod:     o.ackGracePeriod,
-		h:                  jumpHash{crc64.New(crc64.MakeTable(crc64.ECMA))},
+		h:                  &jumpHash{h: crc64.New(crc64.MakeTable(crc64.ECMA))},
 		stop:               make(chan struct{}),
 		closed:             closed,
 		rdb:                rdb,
@@ -1404,13 +1405,18 @@ func (node *Node) maps() []*rmap.Map {
 
 // Hash implements the Jump Consistent Hash algorithm.
 // See https://arxiv.org/ftp/arxiv/papers/1406/1406.2294.pdf for details.
-func (jh jumpHash) Hash(key string, numBuckets int64) int64 {
+func (jh *jumpHash) Hash(key string, numBuckets int64) int64 {
 	var b int64 = -1
 	var j int64
 
+	jh.mu.Lock()
 	jh.h.Reset()
-	io.WriteString(jh.h, key) // nolint: errcheck
+	_, err := io.WriteString(jh.h, key)
 	sum := jh.h.Sum64()
+	jh.mu.Unlock()
+	if err != nil {
+		panic(fmt.Errorf("jumpHash: write key: %w", err))
+	}
 
 	for j < numBuckets {
 		b = j
