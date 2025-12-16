@@ -3,6 +3,7 @@ package rmap
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math/rand"
 	"regexp"
@@ -26,6 +27,8 @@ type (
 		msgch                <-chan *redis.Message // channel to receive map updates
 		chans                []chan EventKind      // channels to send notifications
 		done                 chan struct{}         // channel to signal shutdown
+		closectx             context.Context       // context canceled by Close
+		closer               context.CancelFunc    // cancels closectx
 		wait                 sync.WaitGroup        // wait for read goroutine to exit
 		logger               pulse.Logger          // logger
 		sub                  *redis.PubSub         // subscription to map updates
@@ -97,12 +100,21 @@ func Join(ctx context.Context, name string, rdb *redis.Client, opts ...MapOption
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
+	if rdb == nil {
+		return nil, fmt.Errorf("pulse map: %s Redis client cannot be nil", name)
+	}
 	o := parseOptions(opts...)
+	if o.Logger == nil {
+		o.Logger = pulse.NoopLogger()
+	}
+	closectx, closer := context.WithCancel(context.Background())
 	sm := &Map{
 		Name:                 name,
 		chankey:              fmt.Sprintf("map:%s:updates", name),
 		hashkey:              fmt.Sprintf("map:%s:content", name),
 		done:                 make(chan struct{}),
+		closectx:             closectx,
+		closer:               closer,
 		logger:               o.Logger.WithPrefix("map", name),
 		rdb:                  rdb,
 		content:              make(map[string]string),
@@ -508,6 +520,18 @@ func (sm *Map) Reset(ctx context.Context) error {
 // only if the "color" key has value "blue" and the "size" key has value "large",
 // and return true if the map was cleared.
 func (sm *Map) TestAndReset(ctx context.Context, keys, tests []string) (bool, error) {
+	if len(keys) != len(tests) {
+		return false, fmt.Errorf("pulse map: %s TestAndReset requires len(keys) == len(tests)", sm.Name)
+	}
+	for _, k := range keys {
+		if len(k) == 0 {
+			return false, fmt.Errorf("pulse map: %s key cannot be empty in %q", sm.Name, "testAndReset")
+		}
+		if strings.Contains(k, "=") {
+			return false, fmt.Errorf("pulse map: %s key %q cannot contain '=' in %q", sm.Name, k, "testAndReset")
+		}
+	}
+
 	args := make([]any, 1+len(keys)+len(tests))
 	args[0] = "*"
 	for i, k := range keys {
@@ -533,6 +557,10 @@ func (sm *Map) Close() {
 	}
 	sm.closing = true
 	sm.lock.Unlock()
+
+	if sm.closer != nil {
+		sm.closer()
+	}
 
 	// Signal run() to stop and wait for it to complete
 	close(sm.done)
@@ -578,6 +606,7 @@ func (sm *Map) init(ctx context.Context) error {
 	sm.sub = sm.rdb.Subscribe(ctx, sm.chankey)
 	_, err := sm.sub.Receive(ctx) // Fail fast if we can't subscribe.
 	if err != nil {
+		_ = sm.sub.Close()
 		return fmt.Errorf("pulse map: %s failed to join: %w", sm.Name, err)
 	}
 	sm.msgch = sm.sub.Channel()
@@ -589,6 +618,8 @@ func (sm *Map) init(ctx context.Context) error {
 	// local copy with the same data.
 	cmd := sm.rdb.HGetAll(ctx, sm.hashkey)
 	if err := cmd.Err(); err != nil {
+		_ = sm.sub.Unsubscribe(ctx, sm.chankey)
+		_ = sm.sub.Close()
 		return fmt.Errorf("pulse map: %s failed to read initial content: %w", sm.Name, err)
 	}
 	sm.content = cmd.Val()
@@ -599,6 +630,7 @@ func (sm *Map) init(ctx context.Context) error {
 // run updates the local copy of the replicated map whenever a remote update is
 // received and sends notifications when needed.
 func (sm *Map) run() {
+	defer sm.wait.Done()
 	for {
 		select {
 		case msg, ok := <-sm.msgch:
@@ -672,8 +704,6 @@ func (sm *Map) run() {
 						if waiter.key == notification.key && waiter.value == notification.value {
 							select {
 							case waiter.ch <- *notification:
-							case <-sm.done:
-								return
 							case <-waiter.ctx.Done():
 								// Waiter was cancelled or timed out
 								continue
@@ -691,13 +721,16 @@ func (sm *Map) run() {
 			for _, c := range sm.chans {
 				close(c)
 			}
-			if err := sm.sub.Unsubscribe(context.Background(), sm.chankey); err != nil {
-				sm.logger.Error(fmt.Errorf("failed to unsubscribe: %w", err))
+			if sm.sub != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if err := sm.sub.Unsubscribe(ctx, sm.chankey); err != nil {
+					sm.logger.Error(fmt.Errorf("failed to unsubscribe: %w", err))
+				}
+				cancel()
+				if err := sm.sub.Close(); err != nil {
+					sm.logger.Error(fmt.Errorf("failed to close subscription: %w", err))
+				}
 			}
-			if err := sm.sub.Close(); err != nil {
-				sm.logger.Error(fmt.Errorf("failed to close subscription: %w", err))
-			}
-			sm.wait.Done()
 			return
 		}
 	}
@@ -719,7 +752,7 @@ func (sm *Map) runLuaScript(ctx context.Context, name string, script *redis.Scri
 	if strings.Contains(key, "=") {
 		return nil, fmt.Errorf("pulse map: %s key %q cannot contain '=' in %q", sm.Name, key, name)
 	}
-	res, err := script.EvalSha(ctx, sm.rdb, []string{sm.hashkey, sm.chankey}, args...).Result()
+	res, err := script.Run(ctx, sm.rdb, []string{sm.hashkey, sm.chankey}, args...).Result()
 	if err != nil && err != redis.Nil {
 		return nil, fmt.Errorf("pulse map: %s failed to run %q for key %s: %w", sm.Name, name, key, err)
 	}
@@ -733,23 +766,53 @@ func (sm *Map) reconnect() {
 	for {
 		count++
 		sm.logger.Info("reconnect", "attempt", count)
+		if sm.closectx.Err() != nil {
+			return
+		}
+		sm.lock.RLock()
+		closing := sm.closing
+		sm.lock.RUnlock()
+		if closing {
+			return
+		}
+
+		sub := sm.rdb.Subscribe(sm.closectx, sm.chankey)
+		_, err := sub.Receive(sm.closectx)
+		if err != nil {
+			_ = sub.Close()
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			sm.logger.Error(fmt.Errorf("failed to reconnect: %w", err), "attempt", count)
+			sleep := time.Duration(rand.Float64()*5+1) * time.Second
+			timer := time.NewTimer(sleep)
+			select {
+			case <-timer.C:
+			case <-sm.closectx.Done():
+				timer.Stop()
+				return
+			}
+			continue
+		}
+
+		msgch := sub.Channel()
+
 		sm.lock.Lock()
 		if sm.closing {
 			sm.lock.Unlock()
+			_ = sub.Close()
 			return
 		}
-		sm.sub = sm.rdb.Subscribe(context.Background(), sm.chankey)
-		_, err := sm.sub.Receive(context.Background())
-		if err != nil {
-			sm.lock.Unlock()
-			sm.logger.Error(fmt.Errorf("failed to reconnect: %w", err), "attempt", count)
-			time.Sleep(time.Duration(rand.Float64()*5+1) * time.Second)
-			continue
-		}
-		sm.msgch = sm.sub.Channel()
+		oldSub := sm.sub
+		sm.sub = sub
+		sm.msgch = msgch
 		sm.lock.Unlock()
+		if oldSub != nil {
+			_ = oldSub.Close()
+		}
+
 		sm.logger.Info("reconnected")
-		break
+		return
 	}
 }
 
