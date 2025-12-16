@@ -4,4 +4,4 @@ services:
     container_name: "pulse-redis"
     command: redis-server --save "" --loglevel warning --requirepass ${REDIS_PASSWORD}
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6379}:6379"

@@ -944,7 +944,7 @@ func TestStaleWorkerCleanupAfterJobRequeue(t *testing.T) {
 	}, max, delay, "Stale worker was not properly cleaned up")
 }
 
-func TestRemoveWorkerCleansJobPayloads(t *testing.T) {
+func TestRemoveWorkerFromMapsDoesNotDeleteJobPayloads(t *testing.T) {
 	testName := strings.Replace(t.Name(), "/", "_", -1)
 	ctx := ptesting.NewTestContext(t)
 	rdb := ptesting.NewRedisClient(t)
@@ -981,21 +981,19 @@ func TestRemoveWorkerCleansJobPayloads(t *testing.T) {
 	// Remove the worker maps
 	node.removeWorkerFromMaps(ctx, worker.ID)
 
-	// Verify job payloads are removed
-	assert.Eventually(t, func() bool {
-		for _, job := range jobs {
-			if _, ok := node.JobPayload(job.key); ok {
-				return false
-			}
-		}
-		return true
-	}, max, delay, "Job payloads were not cleaned up after worker removal")
+	// Verify job payloads are NOT removed (payloads are job-scoped and must remain
+	// recoverable during distributed cleanup).
+	for _, job := range jobs {
+		payload, ok := node.JobPayload(job.key)
+		assert.True(t, ok, "Expected payload to remain for job %s", job.key)
+		assert.Equal(t, job.payload, payload, "Incorrect payload for job %s", job.key)
+	}
 
 	// Shutdown node
 	assert.NoError(t, node.Shutdown(ctx), "Failed to shutdown node")
 }
 
-func TestCleanupOrphanedJobPayloads(t *testing.T) {
+func TestRequeueOrphanedPayloads(t *testing.T) {
 	type jobInfo struct {
 		key     string
 		payload []byte
@@ -1064,18 +1062,19 @@ func TestCleanupOrphanedJobPayloads(t *testing.T) {
 				return len(jobs) == len(tt.setupJobs)-len(tt.deletedJobs)
 			}, max, delay, "Job keys were not deleted")
 
-			// Run cleanup
-			node.cleanupOrphanedJobPayloads(ctx)
+			// Requeue orphaned payloads.
+			// First call records the first-seen timestamp; second call after grace requeues.
+			node.requeueOrphanedPayloads(ctx)
+			time.Sleep(2*testWorkerTTL + 20*time.Millisecond)
+			node.requeueOrphanedPayloads(ctx)
 
-			// Verify payloads
+			// Verify the previously deleted job keys reappear in the job map.
 			assert.Eventually(t, func() bool {
-				for _, key := range tt.deletedJobs {
-					if _, ok := node.JobPayload(key); ok {
-						return false
-					}
-				}
-				return true
-			}, max, delay, fmt.Sprintf("Payload cleanup did not complete as expected, expected %d payloads, got %d", len(tt.setupJobs)-len(tt.deletedJobs), len(node.jobPayloadMap.Map())))
+				jobs, _ := node.jobMap.GetValues(worker.ID)
+				// The requeued jobs may end up on this worker or another (if present);
+				// in this test there is only one worker, so they should all reappear here.
+				return len(jobs) == len(tt.setupJobs)
+			}, max, delay, fmt.Sprintf("Orphaned payload requeue did not restore job keys; expected %d jobs in jobMap", len(tt.setupJobs)))
 
 			assert.NoError(t, node.Shutdown(ctx))
 		})
