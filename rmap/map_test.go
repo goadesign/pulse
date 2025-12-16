@@ -288,6 +288,134 @@ func TestWriteEmptyString(t *testing.T) {
 	cleanup(t, m)
 }
 
+func TestSetEx(t *testing.T) {
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
+	ctx := context.Background()
+	m, err := Join(ctx, "test", rdb)
+	require.NoError(t, err)
+	defer cleanup(t, m)
+
+	assert.NoError(t, m.Reset(ctx))
+
+	prev, existed, err := m.SetEx(ctx, "k", "v1")
+	assert.NoError(t, err)
+	assert.Equal(t, "", prev)
+	assert.False(t, existed)
+	assert.Eventually(t, func() bool { return m.Map()["k"] == "v1" }, wf, tck)
+
+	prev, existed, err = m.SetEx(ctx, "k", "v2")
+	assert.NoError(t, err)
+	assert.Equal(t, "v1", prev)
+	assert.True(t, existed)
+	assert.Eventually(t, func() bool { return m.Map()["k"] == "v2" }, wf, tck)
+
+	_, err = m.Set(ctx, "empty", "")
+	require.NoError(t, err)
+	assert.Eventually(t, func() bool {
+		v, ok := m.Get("empty")
+		return ok && v == ""
+	}, wf, tck)
+
+	prev, existed, err = m.SetEx(ctx, "empty", "nonempty")
+	assert.NoError(t, err)
+	assert.Equal(t, "", prev)
+	assert.True(t, existed)
+	assert.Eventually(t, func() bool { return m.Map()["empty"] == "nonempty" }, wf, tck)
+}
+
+func TestDeleteEx(t *testing.T) {
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
+	ctx := context.Background()
+	m, err := Join(ctx, "test", rdb)
+	require.NoError(t, err)
+	defer cleanup(t, m)
+
+	assert.NoError(t, m.Reset(ctx))
+
+	prev, existed, err := m.DeleteEx(ctx, "missing")
+	assert.NoError(t, err)
+	assert.Equal(t, "", prev)
+	assert.False(t, existed)
+
+	_, err = m.Set(ctx, "k", "v")
+	require.NoError(t, err)
+	assert.Eventually(t, func() bool { return m.Map()["k"] == "v" }, wf, tck)
+
+	prev, existed, err = m.DeleteEx(ctx, "k")
+	assert.NoError(t, err)
+	assert.Equal(t, "v", prev)
+	assert.True(t, existed)
+	assert.Eventually(t, func() bool { _, ok := m.Map()["k"]; return !ok }, wf, tck)
+}
+
+func TestTestAndSetEx(t *testing.T) {
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
+	ctx := context.Background()
+	m, err := Join(ctx, "test", rdb)
+	require.NoError(t, err)
+	defer cleanup(t, m)
+
+	assert.NoError(t, m.Reset(ctx))
+
+	_, err = m.Set(ctx, "k", "v1")
+	require.NoError(t, err)
+	assert.Eventually(t, func() bool { return m.Map()["k"] == "v1" }, wf, tck)
+
+	prev, existed, updated, err := m.TestAndSetEx(ctx, "k", "v1", "v2")
+	assert.NoError(t, err)
+	assert.Equal(t, "v1", prev)
+	assert.True(t, existed)
+	assert.True(t, updated)
+	assert.Eventually(t, func() bool { return m.Map()["k"] == "v2" }, wf, tck)
+
+	prev, existed, updated, err = m.TestAndSetEx(ctx, "k", "v1", "v3")
+	assert.NoError(t, err)
+	assert.Equal(t, "v2", prev)
+	assert.True(t, existed)
+	assert.False(t, updated)
+	assert.Equal(t, "v2", m.Map()["k"])
+
+	prev, existed, updated, err = m.TestAndSetEx(ctx, "missing", "anything", "v")
+	assert.NoError(t, err)
+	assert.Equal(t, "", prev)
+	assert.False(t, existed)
+	assert.False(t, updated)
+}
+
+func TestTestAndDeleteEx(t *testing.T) {
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
+	ctx := context.Background()
+	m, err := Join(ctx, "test", rdb)
+	require.NoError(t, err)
+	defer cleanup(t, m)
+
+	assert.NoError(t, m.Reset(ctx))
+
+	_, err = m.Set(ctx, "k", "v")
+	require.NoError(t, err)
+	assert.Eventually(t, func() bool { return m.Map()["k"] == "v" }, wf, tck)
+
+	prev, existed, deleted, err := m.TestAndDeleteEx(ctx, "k", "nope")
+	assert.NoError(t, err)
+	assert.Equal(t, "v", prev)
+	assert.True(t, existed)
+	assert.False(t, deleted)
+	assert.Equal(t, "v", m.Map()["k"])
+
+	prev, existed, deleted, err = m.TestAndDeleteEx(ctx, "k", "v")
+	assert.NoError(t, err)
+	assert.Equal(t, "v", prev)
+	assert.True(t, existed)
+	assert.True(t, deleted)
+	assert.Eventually(t, func() bool { _, ok := m.Map()["k"]; return !ok }, wf, tck)
+
+	prev, existed, deleted, err = m.TestAndDeleteEx(ctx, "missing", "anything")
+	assert.NoError(t, err)
+	assert.Equal(t, "", prev)
+	assert.False(t, existed)
+	assert.False(t, deleted)
+}
+
 func TestAppendUniqueValues(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
 	ctx := context.Background()
@@ -301,26 +429,26 @@ func TestAppendUniqueValues(t *testing.T) {
 	res, err := m.AppendUniqueValues(ctx, key, "a", "b", "c")
 	assert.NoError(t, err)
 	assert.Equal(t, []string{"a", "b", "c"}, res)
-	assert.Eventually(t, func() bool { return m.Map()[key] == "a,b,c" }, wf, tck)
+	assert.Eventually(t, func() bool { return m.Map()[key] == `["a","b","c"]` }, wf, tck)
 
 	// Test appending unique values
 	res, err = m.AppendUniqueValues(ctx, key, "d", "e", "a")
 	assert.NoError(t, err)
 	assert.Equal(t, []string{"a", "b", "c", "d", "e"}, res)
-	assert.Eventually(t, func() bool { return m.Map()[key] == "a,b,c,d,e" }, wf, tck)
+	assert.Eventually(t, func() bool { return m.Map()[key] == `["a","b","c","d","e"]` }, wf, tck)
 
 	// Test appending only duplicate values
 	res, err = m.AppendUniqueValues(ctx, key, "a", "b", "c")
 	assert.NoError(t, err)
 	assert.Equal(t, []string{"a", "b", "c", "d", "e"}, res)
-	assert.Eventually(t, func() bool { return m.Map()[key] == "a,b,c,d,e" }, wf, tck)
+	assert.Eventually(t, func() bool { return m.Map()[key] == `["a","b","c","d","e"]` }, wf, tck)
 
 	// Test appending to a non-existent key
 	const newKey = "newUniqueArray"
 	res, err = m.AppendUniqueValues(ctx, newKey, "x", "y", "z")
 	assert.NoError(t, err)
 	assert.Equal(t, []string{"x", "y", "z"}, res)
-	assert.Eventually(t, func() bool { return m.Map()[newKey] == "x,y,z" }, wf, tck)
+	assert.Eventually(t, func() bool { return m.Map()[newKey] == `["x","y","z"]` }, wf, tck)
 
 	// Test error cases
 	res, err = m.AppendUniqueValues(ctx, "", "value")
@@ -463,18 +591,18 @@ func TestArrays(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, []string{"bar"}, res)
 	assert.Eventually(t, func() bool { return len(m.Map()) == 1 }, wf, tck)
-	assert.Equal(t, val1, m.Map()[key])
+	assert.Equal(t, `["bar"]`, m.Map()[key])
 	res, err = m.AppendValues(ctx, key, val2)
 	assert.NoError(t, err)
 	assert.Equal(t, []string{"bar", "baz"}, res)
-	assert.Eventually(t, func() bool { return len(strings.Split(m.Map()[key], ",")) == 2 }, wf, tck)
-	assert.Equal(t, val1+","+val2, m.Map()[key])
+	assert.Eventually(t, func() bool { return m.Map()[key] == `["bar","baz"]` }, wf, tck)
+	assert.Equal(t, `["bar","baz"]`, m.Map()[key])
 	res, removed, err := m.RemoveValues(ctx, key, val1)
 	assert.NoError(t, err)
 	assert.Equal(t, []string{"baz"}, res)
 	assert.True(t, removed)
-	assert.Eventually(t, func() bool { return len(strings.Split(m.Map()[key], ",")) == 1 }, wf, tck)
-	assert.Equal(t, val2, m.Map()[key])
+	assert.Eventually(t, func() bool { return m.Map()[key] == `["baz"]` }, wf, tck)
+	assert.Equal(t, `["baz"]`, m.Map()[key])
 	res, removed, err = m.RemoveValues(ctx, key, val2)
 	assert.NoError(t, err)
 	assert.Nil(t, res)

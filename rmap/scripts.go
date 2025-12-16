@@ -6,56 +6,81 @@ var (
 	// luaAppend is the Lua script used to append an item to an array key and
 	// return its new value.
 	luaAppend = redis.NewScript(`
-	   local v = redis.call("HGET", KEYS[1], ARGV[1])
+	   local key = ARGV[1]
+	   local v = redis.call("HGET", KEYS[1], key)
 
-	   -- If the value exists, append the new value, otherwise assign ARGV[2] directly
-	   v = (v and v .. "," .. ARGV[2]) or ARGV[2]
+	   if #ARGV == 1 then
+	      return v
+	   end
 
-	   -- Set the updated value in the hash and publish the change
-	   redis.call("HSET", KEYS[1], ARGV[1], v)
-	   local msg = struct.pack("ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(v), v)
+	   local values = {}
+	   if v then
+	      local ok, decoded = pcall(cjson.decode, v)
+	      if ok and type(decoded) == "table" then
+	         values = decoded
+	      else
+	         for s in string.gmatch(v, "[^,]+") do
+	            table.insert(values, s)
+	         end
+	      end
+	   end
+
+	   for i = 2, #ARGV do
+	      table.insert(values, ARGV[i])
+	   end
+
+	   local encoded = cjson.encode(values)
+	   redis.call("HSET", KEYS[1], key, encoded)
+	   local rev = tostring(redis.call("HINCRBY", KEYS[1], "=rev", 1))
+	   local msg = struct.pack("ic0ic0ic0", string.len(key), key, string.len(encoded), encoded, string.len(rev), rev)
 	   redis.call("PUBLISH", KEYS[2], "set:" .. msg)
-
-	   return v
+	   return encoded
 	`)
 
 	// luaAppendUnique is the Lua script used to append an item to a set and return
 	// the result.
 	luaAppendUnique = redis.NewScript(`
-	  local v = redis.call("HGET", KEYS[1], ARGV[1])
-	  local newValues = {}
-	  local changed = false
+	  local key = ARGV[1]
+	  local v = redis.call("HGET", KEYS[1], key)
 
-	  -- Split ARGV[2] into a table of new values
-	  for value in string.gmatch(ARGV[2], "[^,]+") do
-	    table.insert(newValues, value)
+	  if #ARGV == 1 then
+	     return v
 	  end
 
-	  -- If the value exists, process it, else set it directly
+	  local values = {}
 	  if v then
-	    local existingValues = {}
-	    -- Split existing values into a table
-	    for value in string.gmatch(v, "[^,]+") do
-	      existingValues[value] = true
-	    end
-
-	    -- Append unique new values to v
-	    for _, newValue in ipairs(newValues) do
-	      if not existingValues[newValue] then
-	        v = (v == "") and newValue or v .. "," .. newValue
-	        changed = true
-	      end
-	    end
-	  else
-	    v = table.concat(newValues, ",")
-	    changed = true
+	     local ok, decoded = pcall(cjson.decode, v)
+	     if ok and type(decoded) == "table" then
+	        values = decoded
+	     else
+	        for s in string.gmatch(v, "[^,]+") do
+	           table.insert(values, s)
+	        end
+	     end
 	  end
 
-	  -- If changes were made, update the hash and publish the event
+	  local present = {}
+	  for _, item in ipairs(values) do
+	     present[item] = true
+	  end
+
+	  local changed = false
+	  for i = 2, #ARGV do
+	     local item = ARGV[i]
+	     if not present[item] then
+	        table.insert(values, item)
+	        present[item] = true
+	        changed = true
+	     end
+	  end
+
 	  if changed then
-	    redis.call("HSET", KEYS[1], ARGV[1], v)
-	    local msg = struct.pack("ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(v), v)
-	    redis.call("PUBLISH", KEYS[2], "set:" .. msg)
+	     local encoded = cjson.encode(values)
+	     redis.call("HSET", KEYS[1], key, encoded)
+	     local rev = tostring(redis.call("HINCRBY", KEYS[1], "=rev", 1))
+	     local msg = struct.pack("ic0ic0ic0", string.len(key), key, string.len(encoded), encoded, string.len(rev), rev)
+	     redis.call("PUBLISH", KEYS[2], "set:" .. msg)
+	     return encoded
 	  end
 
 	  return v
@@ -66,7 +91,8 @@ var (
 	luaDelete = redis.NewScript(`
 	   local v = redis.call("HGET", KEYS[1], ARGV[1])
 	   redis.call("HDEL", KEYS[1], ARGV[1])
-	   local msg = struct.pack("ic0", string.len(ARGV[1]), ARGV[1])
+	   local rev = tostring(redis.call("HINCRBY", KEYS[1], "=rev", 1))
+	   local msg = struct.pack("ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(rev), rev)
 	   redis.call("PUBLISH", KEYS[2], "del:" .. msg)
 	   return v
 	`)
@@ -75,7 +101,8 @@ var (
 	luaIncr = redis.NewScript(`
 	   redis.call("HINCRBY", KEYS[1], ARGV[1], ARGV[2])
 	   local v = redis.call("HGET", KEYS[1], ARGV[1])
-	   local msg = struct.pack("ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(v), v)
+	   local rev = tostring(redis.call("HINCRBY", KEYS[1], "=rev", 1))
+	   local msg = struct.pack("ic0ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(v), v, string.len(rev), rev)
 	   redis.call("PUBLISH", KEYS[2], "set:" .. msg)
 	   return v
 	`)
@@ -83,49 +110,68 @@ var (
 	// luaRemove is the Lua script used to remove items from an array value and
 	// return the result along with a flag indicating if any value was removed.
 	luaRemove = redis.NewScript(`
-	   local v = redis.call("HGET", KEYS[1], ARGV[1])
-	   local removed = false
+	   local key = ARGV[1]
+	   local v = redis.call("HGET", KEYS[1], key)
 
-	   if v then
-	      -- Create a set of current values
-	      local curr = {}
+	   if not v or #ARGV == 1 then
+	      return {v, 0}
+	   end
+
+	   local values = {}
+	   local ok, decoded = pcall(cjson.decode, v)
+	   if ok and type(decoded) == "table" then
+	      values = decoded
+	   else
 	      for s in string.gmatch(v, "[^,]+") do
-	         curr[s] = true
-	      end
-
-	      -- Remove specified values
-	      for s in string.gmatch(ARGV[2], "[^,]+") do
-	         if curr[s] then
-	            curr[s] = nil
-	            removed = true
-	         end
-	      end
-
-	      -- Collect the remaining values
-	      local newValues = {}
-	      for key, _ in pairs(curr) do
-	         table.insert(newValues, key)
-	      end
-
-	      -- Update the hash or delete the key if empty
-	      if #newValues == 0 then
-	         redis.call("HDEL", KEYS[1], ARGV[1])
-	         local msg = struct.pack("ic0", string.len(ARGV[1]), ARGV[1])
-	         redis.call("PUBLISH", KEYS[2], "del:" .. msg)
-	         v = ""
-	      else
-	         v = table.concat(newValues, ",")
-	         redis.call("HSET", KEYS[1], ARGV[1], v)
-	         local msg = struct.pack("ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(v), v)
-	         redis.call("PUBLISH", KEYS[2], "set:" .. msg)
+	         table.insert(values, s)
 	      end
 	   end
 
-	   return {v, removed}
+	   local toRemove = {}
+	   for i = 2, #ARGV do
+	      toRemove[ARGV[i]] = true
+	   end
+
+	   local removed = 0
+	   local remaining = {}
+	   for _, item in ipairs(values) do
+	      if toRemove[item] then
+	         removed = 1
+	      else
+	         table.insert(remaining, item)
+	      end
+	   end
+
+	   if removed == 0 then
+	      return {v, 0}
+	   end
+
+	   if #remaining == 0 then
+	      redis.call("HDEL", KEYS[1], key)
+	      local rev = tostring(redis.call("HINCRBY", KEYS[1], "=rev", 1))
+	      local msg = struct.pack("ic0ic0", string.len(key), key, string.len(rev), rev)
+	      redis.call("PUBLISH", KEYS[2], "del:" .. msg)
+	      return {"", 1}
+	   end
+
+	   local encoded = cjson.encode(remaining)
+	   redis.call("HSET", KEYS[1], key, encoded)
+	   local rev = tostring(redis.call("HINCRBY", KEYS[1], "=rev", 1))
+	   local msg = struct.pack("ic0ic0ic0", string.len(key), key, string.len(encoded), encoded, string.len(rev), rev)
+	   redis.call("PUBLISH", KEYS[2], "set:" .. msg)
+	   return {encoded, 1}
 	`)
 
 	// luaReset is the Lua script used to reset the map.
 	luaReset = redis.NewScript(`
+	   local rev = redis.call("HINCRBY", KEYS[1], "=rev", 1)
+	   redis.call("DEL", KEYS[1])
+	   redis.call("HSET", KEYS[1], "=rev", rev)
+	   redis.call("PUBLISH", KEYS[2], "reset:" .. tostring(rev))
+	`)
+
+	// luaDestroy is the Lua script used to delete the map entirely.
+	luaDestroy = redis.NewScript(`
 	   redis.call("DEL", KEYS[1])
 	   redis.call("PUBLISH", KEYS[2], "reset:*")
 	`)
@@ -136,7 +182,8 @@ var (
 	luaSet = redis.NewScript(`
 	   local v = redis.call("HGET", KEYS[1], ARGV[1])
 	   redis.call("HSET", KEYS[1], ARGV[1], ARGV[2])
-	   local msg = struct.pack("ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(ARGV[2]), ARGV[2])
+	   local rev = tostring(redis.call("HINCRBY", KEYS[1], "=rev", 1))
+	   local msg = struct.pack("ic0ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(ARGV[2]), ARGV[2], string.len(rev), rev)
 	   redis.call("PUBLISH", KEYS[2], "set:" .. msg)
 	   return v
 	`)
@@ -146,7 +193,8 @@ var (
 	   local v = redis.call("HGET", KEYS[1], ARGV[1])
 	   if v == ARGV[2] then
 	      redis.call("HDEL", KEYS[1], ARGV[1])
-	      local msg = struct.pack("ic0", string.len(ARGV[1]), ARGV[1])
+	      local rev = tostring(redis.call("HINCRBY", KEYS[1], "=rev", 1))
+	      local msg = struct.pack("ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(rev), rev)
 	      redis.call("PUBLISH", KEYS[2], "del:" .. msg)
 	   end
 	   return v
@@ -163,9 +211,10 @@ var (
 	          return 0
 	      end
 	  end
-	  
+	  local rev = redis.call("HINCRBY", hash, "=rev", 1)
 	  redis.call("DEL", hash)
-	  redis.call("PUBLISH", KEYS[2], "reset:*")
+	  redis.call("HSET", hash, "=rev", rev)
+	  redis.call("PUBLISH", KEYS[2], "reset:" .. tostring(rev))
 	  return 1
 	`)
 
@@ -174,7 +223,8 @@ var (
 	   local v = redis.call("HGET", KEYS[1], ARGV[1])
 	   if v == ARGV[2] then
 	      redis.call("HSET", KEYS[1], ARGV[1], ARGV[3])
-	      local msg = struct.pack("ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(ARGV[3]), ARGV[3])
+	      local rev = tostring(redis.call("HINCRBY", KEYS[1], "=rev", 1))
+	      local msg = struct.pack("ic0ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(ARGV[3]), ARGV[3], string.len(rev), rev)
 	      redis.call("PUBLISH", KEYS[2], "set:" .. msg)
 	   end
 	   return v
@@ -185,7 +235,8 @@ var (
         local v = redis.call("HGET", KEYS[1], ARGV[1])
         if not v then
             redis.call("HSET", KEYS[1], ARGV[1], ARGV[2])
-            local msg = struct.pack("ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(ARGV[2]), ARGV[2])
+            local rev = tostring(redis.call("HINCRBY", KEYS[1], "=rev", 1))
+            local msg = struct.pack("ic0ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(ARGV[2]), ARGV[2], string.len(rev), rev)
             redis.call("PUBLISH", KEYS[2], "set:" .. msg)
             return 1  -- Successfully set the value
         end

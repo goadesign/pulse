@@ -3,6 +3,7 @@ package rmap
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -44,9 +45,11 @@ type (
 		testAndDelScript     *redis.Script
 		testAndResetScript   *redis.Script
 		resetScript          *redis.Script
+		destroyScript        *redis.Script
 
 		lock    sync.RWMutex
 		content map[string]string
+		rev     uint64
 		closing bool // true if Close was called
 		closed  bool // true if Close returned - used by tests
 
@@ -72,6 +75,8 @@ type (
 		cancel func()          // cleanup function
 	}
 )
+
+const revField = "=rev"
 
 const (
 	// EventChange is the event emitted when a key is added or changed.
@@ -129,6 +134,7 @@ func Join(ctx context.Context, name string, rdb *redis.Client, opts ...MapOption
 		testAndDelScript:     luaTestAndDel,
 		testAndResetScript:   luaTestAndReset,
 		resetScript:          luaReset,
+		destroyScript:        luaDestroy,
 	}
 	if err := sm.init(ctx); err != nil {
 		return nil, err
@@ -215,15 +221,15 @@ func (sm *Map) Get(key string) (string, bool) {
 	return res, ok
 }
 
-// GetValues returns the comma separated values for the given key.
+// GetValues returns the list values for the given key.
 // This is a convenience method intended to be used in conjunction with
-// AppendValues and RemoveValues.
+// AppendValues and RemoveValues. List values are stored as JSON arrays.
 func (sm *Map) GetValues(key string) ([]string, bool) {
 	val, ok := sm.Get(key)
 	if !ok {
 		return nil, false
 	}
-	return strings.Split(val, ","), true
+	return parseValues(val), true
 }
 
 // Set sets the value for the given key and returns the previous value.
@@ -244,6 +250,19 @@ func (sm *Map) Set(ctx context.Context, key, value string) (string, error) {
 		return "", nil
 	}
 	return prev.(string), nil
+}
+
+// SetEx sets the value for the given key and returns the previous value along
+// with a flag indicating whether the key previously existed.
+func (sm *Map) SetEx(ctx context.Context, key, value string) (string, bool, error) {
+	prev, err := sm.runLuaScript(ctx, "set", sm.setScript, key, value)
+	if err != nil {
+		return "", false, err
+	}
+	if prev == nil {
+		return "", false, nil
+	}
+	return prev.(string), true, nil
 }
 
 // SetAndWait is a convenience method that calls Set and waits for the update to be
@@ -356,6 +375,23 @@ func (sm *Map) TestAndSet(ctx context.Context, key, test, value string) (string,
 	return prev.(string), nil
 }
 
+// TestAndSetEx sets the value for the given key if the current value matches
+// the given test value. It returns the previous value, whether the key existed
+// and whether the value was updated.
+func (sm *Map) TestAndSetEx(ctx context.Context, key, test, value string) (prev string, existed bool, updated bool, err error) {
+	res, err := sm.runLuaScript(ctx, "testAndSet", sm.testAndSetScript, key, test, value)
+	if err != nil {
+		return "", false, false, err
+	}
+	if res == nil {
+		return "", false, false, nil
+	}
+	prev = res.(string)
+	existed = true
+	updated = prev == test
+	return prev, existed, updated, nil
+}
+
 // Inc increments the value for the given key and returns the result.
 // The value must represent an integer.
 // An error is returned if:
@@ -380,7 +416,7 @@ func (sm *Map) Inc(ctx context.Context, key string, delta int) (int, error) {
 }
 
 // AppendValues appends the given items to the value for the given key and
-// returns the result. The array of items is stored as a comma-separated list.
+// returns the result. The array of items is stored as a JSON array.
 // An error is returned if:
 // - The key is empty
 // - The key contains an equal sign
@@ -390,20 +426,24 @@ func (sm *Map) Inc(ctx context.Context, key string, delta int) (int, error) {
 // AppendValues(ctx, "fruits", "apple", "banana") would append "apple" and "banana"
 // to the existing list of fruits and return the updated list.
 func (sm *Map) AppendValues(ctx context.Context, key string, items ...string) ([]string, error) {
-	sitems := strings.Join(items, ",")
-	res, err := sm.runLuaScript(ctx, "append", sm.appendScript, key, sitems)
+	args := make([]any, 1+len(items))
+	args[0] = key
+	for i, item := range items {
+		args[i+1] = item
+	}
+	res, err := sm.runLuaScript(ctx, "append", sm.appendScript, args...)
 	if err != nil {
 		return nil, err
 	}
 	if res == nil {
 		return nil, nil
 	}
-	return strings.Split(res.(string), ","), nil
+	return parseValues(res.(string)), nil
 }
 
 // AppendUniqueValues appends the given items to the value for the given key if
 // they are not already present and returns the result. The array of items is
-// stored as a comma-separated list.
+// stored as a JSON array.
 // An error is returned if:
 // - The key is empty
 // - The key contains an equal sign
@@ -413,21 +453,25 @@ func (sm *Map) AppendValues(ctx context.Context, key string, items ...string) ([
 // AppendUniqueValues(ctx, "fruits", "apple", "banana") would append only unique values
 // to the existing list of fruits and return the updated list.
 func (sm *Map) AppendUniqueValues(ctx context.Context, key string, items ...string) ([]string, error) {
-	sitems := strings.Join(items, ",")
-	res, err := sm.runLuaScript(ctx, "appendUnique", sm.appendUniqueScript, key, sitems)
+	args := make([]any, 1+len(items))
+	args[0] = key
+	for i, item := range items {
+		args[i+1] = item
+	}
+	res, err := sm.runLuaScript(ctx, "appendUnique", sm.appendUniqueScript, args...)
 	if err != nil {
 		return nil, err
 	}
 	if res == nil {
 		return nil, nil
 	}
-	return strings.Split(res.(string), ","), nil
+	return parseValues(res.(string)), nil
 }
 
 // RemoveValues removes the given items from the value for the given key and
 // returns the remaining values after removal. The function behaves as follows:
 //
-//  1. The value for the key is expected to be a comma-separated list of items.
+//  1. The value for the key is expected to be a JSON array of items.
 //  2. It removes all occurrences of the specified items from this list.
 //  3. If the removal results in an empty list, the key is automatically deleted.
 //  4. Returns the remaining items as a slice of strings, a boolean indicating
@@ -440,12 +484,16 @@ func (sm *Map) AppendUniqueValues(ctx context.Context, key string, items ...stri
 // - There's an issue with the Redis operation
 //
 // Example:
-// Given a key "fruits" with value "apple,banana,cherry,apple"
+// Given a key "fruits" with value ["apple","banana","cherry","apple"]
 // RemoveValues(ctx, "fruits", "apple", "cherry") would return (["banana"], true, nil)
-// and update the value in Redis to "banana"
+// and update the value in Redis to ["banana"]
 func (sm *Map) RemoveValues(ctx context.Context, key string, items ...string) ([]string, bool, error) {
-	sitems := strings.Join(items, ",")
-	res, err := sm.runLuaScript(ctx, "remove", sm.removeScript, key, sitems)
+	args := make([]any, 1+len(items))
+	args[0] = key
+	for i, item := range items {
+		args[i+1] = item
+	}
+	res, err := sm.runLuaScript(ctx, "remove", sm.removeScript, args...)
 	if err != nil {
 		return nil, false, err
 	}
@@ -454,11 +502,11 @@ func (sm *Map) RemoveValues(ctx context.Context, key string, items ...string) ([
 		return nil, false, nil // Key didn't exist
 	}
 	remaining := result[0].(string)
-	if remaining == "" {
+	removed := result[1] != nil && result[1].(int64) == 1
+	if removed && remaining == "" {
 		return nil, true, nil // All items were removed, key was deleted
 	}
-	removed := result[1] != nil && result[1].(int64) == 1
-	return strings.Split(remaining, ","), removed, nil
+	return parseValues(remaining), removed, nil
 }
 
 // Delete deletes the value for the given key and returns the previous value.
@@ -478,6 +526,19 @@ func (sm *Map) Delete(ctx context.Context, key string) (string, error) {
 		return "", nil
 	}
 	return prev.(string), nil
+}
+
+// DeleteEx deletes the value for the given key and returns the previous value
+// along with a flag indicating whether the key existed.
+func (sm *Map) DeleteEx(ctx context.Context, key string) (string, bool, error) {
+	prev, err := sm.runLuaScript(ctx, "delete", sm.delScript, key)
+	if err != nil {
+		return "", false, err
+	}
+	if prev == nil {
+		return "", false, nil
+	}
+	return prev.(string), true, nil
 }
 
 // TestAndDelete tests that the value for the given key matches the test value
@@ -501,10 +562,33 @@ func (sm *Map) TestAndDelete(ctx context.Context, key, test string) (string, err
 	return prev.(string), nil
 }
 
+// TestAndDeleteEx deletes the given key if its current value matches the given
+// test value. It returns the previous value, whether the key existed and
+// whether the key was deleted.
+func (sm *Map) TestAndDeleteEx(ctx context.Context, key, test string) (prev string, existed bool, deleted bool, err error) {
+	res, err := sm.runLuaScript(ctx, "testAndDelete", sm.testAndDelScript, key, test)
+	if err != nil {
+		return "", false, false, err
+	}
+	if res == nil {
+		return "", false, false, nil
+	}
+	prev = res.(string)
+	existed = true
+	deleted = prev == test
+	return prev, existed, deleted, nil
+}
+
 // Reset clears the map content. Reset is the only method that can be called
 // after the map is closed.
 func (sm *Map) Reset(ctx context.Context) error {
 	_, err := sm.runLuaScript(ctx, "reset", sm.resetScript, "*")
+	return err
+}
+
+// Destroy deletes the map content from Redis and notifies subscribers.
+func (sm *Map) Destroy(ctx context.Context) error {
+	_, err := sm.runLuaScript(ctx, "destroy", sm.destroyScript, "*")
 	return err
 }
 
@@ -591,6 +675,7 @@ func (sm *Map) init(ctx context.Context) error {
 		sm.incrScript,
 		sm.removeScript,
 		sm.resetScript,
+		sm.destroyScript,
 		sm.setScript,
 		sm.testAndDelScript,
 		sm.testAndResetScript,
@@ -623,6 +708,7 @@ func (sm *Map) init(ctx context.Context) error {
 		return fmt.Errorf("pulse map: %s failed to read initial content: %w", sm.Name, err)
 	}
 	sm.content = cmd.Val()
+	sm.rev = extractRevision(sm.content)
 
 	return nil
 }
@@ -651,15 +737,32 @@ func (sm *Map) run() {
 			var notification *setNotification
 			switch op {
 			case "reset":
+				if rev, ok := parseRevisionString(string(data)); ok && rev <= sm.rev {
+					sm.lock.Unlock()
+					continue
+				} else if ok {
+					sm.rev = rev
+				}
 				sm.content = make(map[string]string)
 				sm.logger.Debug("reset")
 				kind = EventReset
 			case "del":
-				key, _, err := unpackString(data)
+				key, rest, err := unpackString(data)
 				if err != nil {
 					sm.logger.Error(fmt.Errorf("invalid del payload"), "payload", msg.Payload, "error", err)
 					sm.lock.Unlock()
 					continue
+				}
+				if key == revField {
+					sm.lock.Unlock()
+					continue
+				}
+				if rev, ok := unpackRevision(rest); ok {
+					if rev <= sm.rev {
+						sm.lock.Unlock()
+						continue
+					}
+					sm.rev = rev
 				}
 				delete(sm.content, key)
 				sm.logger.Debug("deleted", "key", key)
@@ -671,11 +774,22 @@ func (sm *Map) run() {
 					sm.lock.Unlock()
 					continue
 				}
-				val, _, err := unpackString(rest)
+				if key == revField {
+					sm.lock.Unlock()
+					continue
+				}
+				val, rest, err := unpackString(rest)
 				if err != nil {
 					sm.logger.Error(fmt.Errorf("invalid set value"), "payload", msg.Payload, "error", err)
 					sm.lock.Unlock()
 					continue
+				}
+				if rev, ok := unpackRevision(rest); ok {
+					if rev <= sm.rev {
+						sm.lock.Unlock()
+						continue
+					}
+					sm.rev = rev
 				}
 				sm.content[key] = val
 				notification = &setNotification{key: key, value: val}
@@ -740,7 +854,7 @@ func (sm *Map) run() {
 // It is the caller's responsibility to make sure the map is locked.
 func (sm *Map) runLuaScript(ctx context.Context, name string, script *redis.Script, args ...any) (any, error) {
 	sm.lock.RLock()
-	if sm.closing && name != "reset" {
+	if sm.closing && name != "reset" && name != "destroy" {
 		sm.lock.RUnlock()
 		return "", fmt.Errorf("pulse map: %s is stopped", sm.Name)
 	}
@@ -797,23 +911,168 @@ func (sm *Map) reconnect() {
 
 		msgch := sub.Channel()
 
+		cmd := sm.rdb.HGetAll(sm.closectx, sm.hashkey)
+		if err := cmd.Err(); err != nil {
+			_ = sub.Close()
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			sm.logger.Error(fmt.Errorf("failed to resync: %w", err), "attempt", count)
+			sleep := time.Duration(rand.Float64()*5+1) * time.Second
+			timer := time.NewTimer(sleep)
+			select {
+			case <-timer.C:
+			case <-sm.closectx.Done():
+				timer.Stop()
+				return
+			}
+			continue
+		}
+
 		sm.lock.Lock()
 		if sm.closing {
 			sm.lock.Unlock()
 			_ = sub.Close()
 			return
 		}
+
+		// Resync local state from Redis, then apply any messages that were queued
+		// while reading the snapshot under the same lock so readers never observe
+		// intermediate state regressions. Revisioned messages at or below the
+		// snapshot revision are ignored.
+		sm.content = cmd.Val()
+		sm.rev = extractRevision(sm.content)
+		drainErr := false
+		for {
+			select {
+			case msg, ok := <-msgch:
+				if !ok {
+					drainErr = true
+					goto drained
+				}
+				parts := strings.SplitN(msg.Payload, ":", 2)
+				if len(parts) != 2 {
+					sm.logger.Error(fmt.Errorf("invalid payload"), "payload", msg.Payload)
+					continue
+				}
+				op, data := parts[0], []byte(parts[1])
+				switch op {
+				case "reset":
+					if rev, ok := parseRevisionString(string(data)); ok && rev <= sm.rev {
+						continue
+					} else if ok {
+						sm.rev = rev
+					}
+					sm.content = make(map[string]string)
+					sm.logger.Debug("reset")
+				case "del":
+					key, rest, err := unpackString(data)
+					if err != nil {
+						sm.logger.Error(fmt.Errorf("invalid del payload"), "payload", msg.Payload, "error", err)
+						continue
+					}
+					if key == revField {
+						continue
+					}
+					if rev, ok := unpackRevision(rest); ok {
+						if rev <= sm.rev {
+							continue
+						}
+						sm.rev = rev
+					}
+					delete(sm.content, key)
+					sm.logger.Debug("deleted", "key", key)
+				case "set":
+					key, rest, err := unpackString(data)
+					if err != nil {
+						sm.logger.Error(fmt.Errorf("invalid set key"), "payload", msg.Payload, "error", err)
+						continue
+					}
+					if key == revField {
+						continue
+					}
+					val, rest, err := unpackString(rest)
+					if err != nil {
+						sm.logger.Error(fmt.Errorf("invalid set value"), "payload", msg.Payload, "error", err)
+						continue
+					}
+					if rev, ok := unpackRevision(rest); ok {
+						if rev <= sm.rev {
+							continue
+						}
+						sm.rev = rev
+					}
+					sm.content[key] = val
+					sm.logger.Debug("set", "key", key, "val", val)
+				}
+			default:
+				goto drained
+			}
+		}
+
+	drained:
+		if drainErr {
+			sm.lock.Unlock()
+			_ = sub.Close()
+			sleep := time.Duration(rand.Float64()*5+1) * time.Second
+			timer := time.NewTimer(sleep)
+			select {
+			case <-timer.C:
+			case <-sm.closectx.Done():
+				timer.Stop()
+				return
+			}
+			continue
+		}
+
 		oldSub := sm.sub
 		sm.sub = sub
 		sm.msgch = msgch
+		for _, c := range sm.chans {
+			select {
+			case c <- EventChange:
+			default:
+			}
+		}
 		sm.lock.Unlock()
 		if oldSub != nil {
 			_ = oldSub.Close()
 		}
 
+		sm.satisfyWaiters()
+
 		sm.logger.Info("reconnected")
 		return
 	}
+}
+
+func (sm *Map) satisfyWaiters() {
+	sm.waiters.Range(func(key, value any) bool {
+		k, ok := key.(string)
+		if !ok {
+			return true
+		}
+		sm.lock.RLock()
+		v, ok := sm.content[k]
+		sm.lock.RUnlock()
+		if !ok {
+			return true
+		}
+		waiters, ok := value.([]*setWaiter)
+		if !ok {
+			return true
+		}
+		for _, waiter := range waiters {
+			if waiter.key == k && waiter.value == v {
+				select {
+				case waiter.ch <- setNotification{key: k, value: v}:
+				case <-waiter.ctx.Done():
+				default:
+				}
+			}
+		}
+		return true
+	})
 }
 
 // redisKeyRegex is a regular expression that matches valid Redis keys.
@@ -835,4 +1094,53 @@ func unpackString(data []byte) (string, []byte, error) {
 		return "", nil, fmt.Errorf("buffer too short for string")
 	}
 	return string(data[:length]), data[length:], nil
+}
+
+func parseValues(value string) []string {
+	trimmed := strings.TrimSpace(value)
+	if strings.HasPrefix(trimmed, "[") {
+		var decoded []string
+		if err := json.Unmarshal([]byte(trimmed), &decoded); err == nil {
+			return decoded
+		}
+	}
+	return strings.Split(value, ",")
+}
+
+func parseRevisionString(s string) (uint64, bool) {
+	rev, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return rev, true
+}
+
+func extractRevision(content map[string]string) uint64 {
+	if content == nil {
+		return 0
+	}
+	s, ok := content[revField]
+	if !ok {
+		return 0
+	}
+	delete(content, revField)
+	if s == "" {
+		return 0
+	}
+	rev, ok := parseRevisionString(s)
+	if !ok {
+		return 0
+	}
+	return rev
+}
+
+func unpackRevision(data []byte) (uint64, bool) {
+	if len(data) < 4 {
+		return 0, false
+	}
+	s, _, err := unpackString(data)
+	if err != nil {
+		return 0, false
+	}
+	return parseRevisionString(s)
 }
