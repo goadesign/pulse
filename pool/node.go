@@ -9,7 +9,6 @@ import (
 	"io"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -457,9 +456,12 @@ func (node *Node) StopJob(ctx context.Context, key string) error {
 // JobKeys returns the list of keys of the jobs running in the pool.
 func (node *Node) JobKeys() []string {
 	var jobKeys []string
-	jobByNodes := node.jobMap.Map()
-	for _, jobs := range jobByNodes {
-		jobKeys = append(jobKeys, strings.Split(jobs, ",")...)
+	for workerID := range node.jobMap.Map() {
+		keys, ok := node.jobMap.GetValues(workerID)
+		if !ok {
+			continue
+		}
+		jobKeys = append(jobKeys, keys...)
 	}
 	return jobKeys
 }
@@ -990,8 +992,12 @@ func (node *Node) cleanupInactiveWorkers(ctx context.Context) {
 func (node *Node) requeueOrphanedPayloads(ctx context.Context) {
 	// Build a set of all job keys referenced by the job map.
 	existingJobs := make(map[string]struct{})
-	for _, jobs := range node.jobMap.Map() {
-		for _, key := range strings.Split(jobs, ",") {
+	for workerID := range node.jobMap.Map() {
+		keys, ok := node.jobMap.GetValues(workerID)
+		if !ok {
+			continue
+		}
+		for _, key := range keys {
 			if key == "" {
 				continue
 			}
@@ -1366,8 +1372,8 @@ func (node *Node) requeueAllJobs(ctx context.Context) error {
 func (node *Node) cleanupPool(ctx context.Context) {
 	for _, m := range node.maps() {
 		if m != nil {
-			if err := m.Reset(ctx); err != nil {
-				node.logger.Error(fmt.Errorf("cleanupPool: failed to reset map: %w", err))
+			if err := m.Destroy(ctx); err != nil {
+				node.logger.Error(fmt.Errorf("cleanupPool: failed to destroy map: %w", err))
 			}
 		}
 	}
