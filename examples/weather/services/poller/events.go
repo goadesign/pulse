@@ -3,6 +3,7 @@ package poller
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 
 	genpoller "goa.design/pulse/examples/weather/services/poller/gen/poller"
 )
@@ -37,8 +38,7 @@ func unmarshalLocation(data []byte) (*genpoller.Location, error) {
 		return nil, err
 	}
 	stateBytes := make([]byte, stateLen)
-	_, err = buf.Read(stateBytes)
-	if err != nil {
+	if _, err = io.ReadFull(buf, stateBytes); err != nil {
 		return nil, err
 	}
 	err = binary.Read(buf, binary.LittleEndian, &cityLen)
@@ -46,8 +46,7 @@ func unmarshalLocation(data []byte) (*genpoller.Location, error) {
 		return nil, err
 	}
 	cityBytes := make([]byte, cityLen)
-	_, err = buf.Read(cityBytes)
-	if err != nil {
+	if _, err = io.ReadFull(buf, cityBytes); err != nil {
 		return nil, err
 	}
 	var lat, long float64
@@ -92,8 +91,7 @@ func unmarshalForecastEvent(data []byte) (*genpoller.Forecast, error) {
 		return nil, err
 	}
 	locBytes := make([]byte, locLen)
-	_, err = buf.Read(locBytes)
-	if err != nil {
+	if _, err = io.ReadFull(buf, locBytes); err != nil {
 		return nil, err
 	}
 	loc, err := unmarshalLocation(locBytes)
@@ -112,8 +110,7 @@ func unmarshalForecastEvent(data []byte) (*genpoller.Forecast, error) {
 			return nil, err
 		}
 		periodBytes := make([]byte, periodLen)
-		_, err = buf.Read(periodBytes)
-		if err != nil {
+		if _, err = io.ReadFull(buf, periodBytes); err != nil {
 			return nil, err
 		}
 		period, err := unmarshalPeriod(periodBytes)
@@ -153,7 +150,7 @@ func unmarshalPeriod(data []byte) (*genpoller.Period, error) {
 		return nil, err
 	}
 	nameBytes := make([]byte, nameLen)
-	if _, err := buf.Read(nameBytes); err != nil {
+	if _, err := io.ReadFull(buf, nameBytes); err != nil {
 		return nil, err
 	}
 
@@ -162,7 +159,7 @@ func unmarshalPeriod(data []byte) (*genpoller.Period, error) {
 		return nil, err
 	}
 	startTimeBytes := make([]byte, startTimeLen)
-	if _, err := buf.Read(startTimeBytes); err != nil {
+	if _, err := io.ReadFull(buf, startTimeBytes); err != nil {
 		return nil, err
 	}
 
@@ -171,7 +168,7 @@ func unmarshalPeriod(data []byte) (*genpoller.Period, error) {
 		return nil, err
 	}
 	endTimeBytes := make([]byte, endTimeLen)
-	if _, err := buf.Read(endTimeBytes); err != nil {
+	if _, err := io.ReadFull(buf, endTimeBytes); err != nil {
 		return nil, err
 	}
 
@@ -185,7 +182,7 @@ func unmarshalPeriod(data []byte) (*genpoller.Period, error) {
 		return nil, err
 	}
 	tempUnitBytes := make([]byte, tempUnitLen)
-	if _, err := buf.Read(tempUnitBytes); err != nil {
+	if _, err := io.ReadFull(buf, tempUnitBytes); err != nil {
 		return nil, err
 	}
 
@@ -194,7 +191,7 @@ func unmarshalPeriod(data []byte) (*genpoller.Period, error) {
 		return nil, err
 	}
 	summaryBytes := make([]byte, summaryLen)
-	if _, err := buf.Read(summaryBytes); err != nil {
+	if _, err := io.ReadFull(buf, summaryBytes); err != nil {
 		return nil, err
 	}
 

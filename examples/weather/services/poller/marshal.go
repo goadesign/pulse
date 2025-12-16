@@ -3,6 +3,7 @@ package poller
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 )
 
 // marshalCityAndState marshals a city and state into a byte slice using binary encoding.
@@ -26,7 +27,7 @@ func unmarshalCityAndState(data []byte) (city, state string, err error) {
 		return
 	}
 	stateBytes := make([]byte, stateLen)
-	_, err = buf.Read(stateBytes)
+	_, err = io.ReadFull(buf, stateBytes)
 	if err != nil {
 		return
 	}
@@ -35,7 +36,7 @@ func unmarshalCityAndState(data []byte) (city, state string, err error) {
 		return
 	}
 	cityBytes := make([]byte, cityLen)
-	_, err = buf.Read(cityBytes)
+	_, err = io.ReadFull(buf, cityBytes)
 	if err != nil {
 		return
 	}
