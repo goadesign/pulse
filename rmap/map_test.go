@@ -18,20 +18,24 @@ import (
 )
 
 var (
-	redisPwd = "redispassword"
-	wf       = time.Second
-	tck      = time.Millisecond
+	redisPwd  = "redispassword"
+	redisAddr = "localhost:6379"
+	wf        = time.Second
+	tck       = time.Millisecond
 )
 
 func init() {
 	if p := os.Getenv("REDIS_PASSWORD"); p != "" {
 		redisPwd = p
 	}
+	if a := os.Getenv("REDIS_ADDR"); a != "" {
+		redisAddr = a
+	}
 }
 
 func TestMapLocal(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
+		Addr:     redisAddr,
 		Password: redisPwd,
 	})
 	var buf Buffer
@@ -139,7 +143,7 @@ func TestMapLocal(t *testing.T) {
 
 func TestSetAndWait(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
+		Addr:     redisAddr,
 		Password: redisPwd,
 	})
 	var buf Buffer
@@ -200,7 +204,7 @@ func TestSetAndWait(t *testing.T) {
 
 func TestReadAfterClose(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
+		Addr:     redisAddr,
 		Password: redisPwd,
 	})
 	var buf Buffer
@@ -265,7 +269,7 @@ func TestReadAfterClose(t *testing.T) {
 }
 
 func TestWriteEmptyString(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
 	ctx := context.Background()
 	m, err := Join(ctx, "test", rdb)
 	require.NoError(t, err)
@@ -285,7 +289,7 @@ func TestWriteEmptyString(t *testing.T) {
 }
 
 func TestAppendUniqueValues(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
 	ctx := context.Background()
 	m, err := Join(ctx, "test", rdb)
 	require.NoError(t, err)
@@ -329,7 +333,7 @@ func TestAppendUniqueValues(t *testing.T) {
 }
 
 func TestTestAndDelete(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
 	ctx := context.Background()
 	m, err := Join(ctx, "test", rdb)
 	require.NoError(t, err)
@@ -367,7 +371,7 @@ func TestTestAndDelete(t *testing.T) {
 }
 
 func TestTestAndSet(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
 	ctx := context.Background()
 	m, err := Join(ctx, "test", rdb)
 	require.NoError(t, err)
@@ -392,7 +396,7 @@ func TestTestAndSet(t *testing.T) {
 }
 
 func TestTestAndReset(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
 	ctx := context.Background()
 	m, err := Join(ctx, "test", rdb)
 	require.NoError(t, err)
@@ -448,7 +452,7 @@ func TestTestAndReset(t *testing.T) {
 }
 
 func TestArrays(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
 	ctx := context.Background()
 	m, err := Join(ctx, "test", rdb)
 	require.NoError(t, err)
@@ -484,7 +488,7 @@ func TestArrays(t *testing.T) {
 }
 
 func TestIncrement(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
 	ctx := context.Background()
 	m, err := Join(ctx, "test", rdb)
 	require.NoError(t, err)
@@ -510,7 +514,7 @@ func TestIncrement(t *testing.T) {
 }
 
 func TestLogs(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
 	var buf Buffer
 	ctx := context.Background()
 	ctx = log.Context(ctx, log.WithOutput(&buf), log.WithDebug(), log.WithFormat(log.FormatText))
@@ -562,7 +566,7 @@ func TestJoinErrors(t *testing.T) {
 }
 
 func TestSetErrors(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -580,7 +584,7 @@ func TestSetErrors(t *testing.T) {
 }
 
 func TestAppendValuesErrors(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
 	ctx := context.Background()
 
 	m, err := Join(ctx, "test", rdb)
@@ -596,7 +600,7 @@ func TestAppendValuesErrors(t *testing.T) {
 }
 
 func TestRemoveValuesErrors(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
 	ctx := context.Background()
 
 	m, err := Join(ctx, "test", rdb)
@@ -614,7 +618,7 @@ func TestRemoveValuesErrors(t *testing.T) {
 }
 
 func TestReconnect(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
 	ctx := context.Background()
 	var buf Buffer
 	ctx = log.Context(ctx, log.WithOutput(&buf))
