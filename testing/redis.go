@@ -16,6 +16,8 @@ import (
 var (
 	// redisPwd is the default test redis password, overridden by REDIS_PASSWORD env var
 	redisPwd = "redispassword"
+	// redisAddr is the default test redis address, overridden by REDIS_ADDR env var
+	redisAddr = "localhost:6379"
 	// streamRegexp is a regular expression that matches valid stream keys
 	streamRegexp = regexp.MustCompile(`^pulse:stream:[^:]+:node:.*`)
 )
@@ -24,11 +26,14 @@ func init() {
 	if p := os.Getenv("REDIS_PASSWORD"); p != "" {
 		redisPwd = p
 	}
+	if addr := os.Getenv("REDIS_ADDR"); addr != "" {
+		redisAddr = addr
+	}
 }
 
 func NewRedisClient(t *testing.T) *redis.Client {
 	t.Helper()
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: redisPwd})
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
 	require.NoError(t, rdb.Ping(context.Background()).Err())
 	return rdb
 }
