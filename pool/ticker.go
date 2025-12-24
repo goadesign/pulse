@@ -71,12 +71,35 @@ func (node *Node) NewTicker(ctx context.Context, name string, d time.Duration, o
 	return t, nil
 }
 
+// Close stops the ticker locally.
+//
+// Close does not delete the shared ticker-map entry. Use Close when a node wants
+// to stop processing ticks without affecting other nodes that may be
+// participating in the same distributed ticker.
+//
+// Close does not close the tick channel to avoid racing with concurrent
+// receivers (matching time.Ticker semantics).
+func (t *Ticker) Close() {
+	t.lock.Lock()
+	if t.timer != nil {
+		t.timer.Stop()
+	}
+	if t.mapch != nil {
+		t.tickerMap.Unsubscribe(t.mapch)
+	}
+	t.mapch = nil
+	t.lock.Unlock()
+	t.wg.Wait()
+}
+
 // Stop turns off a ticker. After Stop, no more ticks will be sent. Stop does
 // not close the channel, to prevent a concurrent goroutine reading from the
 // channel from seeing an erroneous "tick".
 func (t *Ticker) Stop() {
 	t.lock.Lock()
-	t.timer.Stop()
+	if t.timer != nil {
+		t.timer.Stop()
+	}
 	if _, err := t.tickerMap.Delete(context.Background(), t.name); err != nil {
 		t.logger.Error(err, "msg", "failed to delete ticker")
 	}
