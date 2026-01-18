@@ -55,6 +55,19 @@ flowchart LR
     linkStyle 4 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
 ```
 
+## Stream retention (TTL)
+
+By default, streams have no retention beyond `MaxLen` trimming and must be
+deleted explicitly. Pulse can also set a TTL on the Redis key backing a stream:
+
+- `options.WithStreamTTL(ttl)` sets an **absolute TTL** (set once when the key
+  is created and never extended).
+- `options.WithStreamSlidingTTL(ttl)` sets a **sliding TTL** (refreshed on every
+  published event).
+
+The TTL is applied when the Redis stream key is first created, which happens on
+the first publish (`XADD`) or when creating a sink (`XGROUP CREATE ... MKSTREAM`).
+
 ## Event Sinks
 
 Event sinks enable concurrent processing of a sequence of events for better
