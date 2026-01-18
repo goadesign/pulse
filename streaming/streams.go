@@ -186,6 +186,34 @@ func (s *Stream) Destroy(ctx context.Context) error {
 		s.logger.Error(err)
 		return err
 	}
+	// Destroy per-stream sink metadata map used by Pulse sinks to track consumers.
+	//
+	// Pulse sinks use an rmap keyed by "stream:<streamName>:sinks". The rmap stores
+	// its state in:
+	// - map:<name>:content (hash)
+	// - map:<name>:updates (pubsub channel)
+	//
+	// When a stream is explicitly destroyed, any sink metadata for that stream is
+	// also garbage. Cleaning it up here prevents leaks for short-lived streams
+	// (e.g., per-call result streams) that are destroyed explicitly.
+	//
+	// Note: we intentionally do not delete per-sink keepalive maps
+	// (sink:<sinkName>:keepalive) since those are shared across streams.
+	mapName := fmt.Sprintf("stream:%s:sinks", s.Name)
+	mapHashKey := fmt.Sprintf("map:%s:content", mapName)
+	mapChanKey := fmt.Sprintf("map:%s:updates", mapName)
+	if err := s.rdb.Del(ctx, mapHashKey).Err(); err != nil {
+		err := fmt.Errorf("failed to destroy stream sink map: %w", err)
+		s.logger.Error(err)
+		return err
+	}
+	// Mirror rmap's destroy semantics so any in-flight subscribers can notice the
+	// map is gone.
+	if err := s.rdb.Publish(ctx, mapChanKey, "reset:*").Err(); err != nil {
+		err := fmt.Errorf("failed to publish sink map reset: %w", err)
+		s.logger.Error(err)
+		return err
+	}
 	s.logger.Info("stream deleted")
 	return nil
 }

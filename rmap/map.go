@@ -25,6 +25,8 @@ type (
 		Name                 string
 		chankey              string                // Redis pubsub channel name
 		hashkey              string                // Redis hash key
+		ttl                  time.Duration         // TTL applied to hashkey (optional)
+		ttlSliding           bool                  // refresh TTL on every write when true
 		msgch                <-chan *redis.Message // channel to receive map updates
 		chans                []chan EventKind      // channels to send notifications
 		done                 chan struct{}         // channel to signal shutdown
@@ -112,11 +114,16 @@ func Join(ctx context.Context, name string, rdb *redis.Client, opts ...MapOption
 	if o.Logger == nil {
 		o.Logger = pulse.NoopLogger()
 	}
+	if o.TTL < 0 {
+		return nil, fmt.Errorf("pulse map: %s ttl must be >= 0", name)
+	}
 	closectx, closer := context.WithCancel(context.Background())
 	sm := &Map{
 		Name:                 name,
 		chankey:              fmt.Sprintf("map:%s:updates", name),
 		hashkey:              fmt.Sprintf("map:%s:content", name),
+		ttl:                  o.TTL,
+		ttlSliding:           o.TTLSliding,
 		done:                 make(chan struct{}),
 		closectx:             closectx,
 		closer:               closer,
@@ -870,8 +877,22 @@ func (sm *Map) runLuaScript(ctx context.Context, name string, script *redis.Scri
 	if err != nil && err != redis.Nil {
 		return nil, fmt.Errorf("pulse map: %s failed to run %q for key %s: %w", sm.Name, name, key, err)
 	}
+	if err := sm.applyTTL(ctx); err != nil {
+		return nil, fmt.Errorf("pulse map: %s failed to apply TTL: %w", sm.Name, err)
+	}
 
 	return res, nil
+}
+
+func (sm *Map) applyTTL(ctx context.Context) error {
+	if sm.ttl <= 0 {
+		return nil
+	}
+	if sm.ttlSliding {
+		return sm.rdb.Expire(ctx, sm.hashkey, sm.ttl).Err()
+	}
+	_, err := sm.rdb.ExpireNX(ctx, sm.hashkey, sm.ttl).Result()
+	return err
 }
 
 // reconnect attempts to reconnect to the Redis server forever.

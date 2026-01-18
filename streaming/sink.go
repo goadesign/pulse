@@ -127,7 +127,7 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...options.S
 	}
 
 	logger := stream.rootLogger.WithPrefix("sink", name)
-	cm, err := rmap.Join(ctx, consumersMapName(stream), stream.rdb, rmap.WithLogger(logger))
+	cm, err := rmap.Join(ctx, consumersMapName(stream), stream.rdb, consumersMapOptions(stream, logger)...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to join replicated map for sink %s: %w", name, err)
 	}
@@ -242,7 +242,7 @@ func (s *Sink) AddStream(ctx context.Context, stream *Stream, opts ...options.Ad
 		startID = options.LastEventID
 	}
 
-	cm, err := rmap.Join(ctx, consumersMapName(stream), stream.rdb, rmap.WithLogger(stream.logger))
+	cm, err := rmap.Join(ctx, consumersMapName(stream), stream.rdb, consumersMapOptions(stream, stream.logger)...)
 	if err != nil {
 		return fmt.Errorf("failed to join consumer replicated map for stream %s: %w", stream.Name, err)
 	}
@@ -596,6 +596,20 @@ func isBusyGroupErr(err error) bool {
 // consumersMapName is the name of the replicated map that backs a sink.
 func consumersMapName(stream *Stream) string {
 	return fmt.Sprintf("stream:%s:sinks", stream.Name)
+}
+
+func consumersMapOptions(stream *Stream, logger pulse.Logger) []rmap.MapOption {
+	opts := []rmap.MapOption{
+		rmap.WithLogger(logger),
+	}
+	if stream.ttl > 0 {
+		if stream.ttlSliding {
+			opts = append(opts, rmap.WithSlidingTTL(stream.ttl))
+		} else {
+			opts = append(opts, rmap.WithTTL(stream.ttl))
+		}
+	}
+	return opts
 }
 
 // sinkKeepAliveMapName is the name of the replicated map that backs a sink keep-alives.
