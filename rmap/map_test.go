@@ -141,6 +141,74 @@ func TestMapLocal(t *testing.T) {
 	cleanup(t, m)
 }
 
+func TestMapTTLAbsolute(t *testing.T) {
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     redisAddr,
+		Password: redisPwd,
+	})
+	ctx := context.Background()
+
+	m, err := Join(ctx, "ttl-absolute", rdb, WithTTL(2*time.Second))
+	if err != nil {
+		if strings.Contains(err.Error(), "WRONGPASS") {
+			t.Fatal("Unexpected Redis password error (did you set REDIS_PASSWORD?)")
+		} else if strings.Contains(err.Error(), "connection refused") {
+			t.Fatal("Unexpected Redis connection error (is Redis running?)")
+		}
+	}
+	require.NoError(t, m.Reset(ctx))
+
+	_, err = m.Set(ctx, "k", "v")
+	require.NoError(t, err)
+
+	time.Sleep(200 * time.Millisecond)
+	before, err := rdb.PTTL(ctx, "map:ttl-absolute:content").Result()
+	require.NoError(t, err)
+	require.Greater(t, before, time.Duration(0))
+
+	_, err = m.Set(ctx, "k2", "v2")
+	require.NoError(t, err)
+	after, err := rdb.PTTL(ctx, "map:ttl-absolute:content").Result()
+	require.NoError(t, err)
+
+	// Absolute TTL: writes must not refresh the expiry.
+	require.LessOrEqual(t, after, before)
+}
+
+func TestMapTTLSliding(t *testing.T) {
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     redisAddr,
+		Password: redisPwd,
+	})
+	ctx := context.Background()
+
+	m, err := Join(ctx, "ttl-sliding", rdb, WithSlidingTTL(2*time.Second))
+	if err != nil {
+		if strings.Contains(err.Error(), "WRONGPASS") {
+			t.Fatal("Unexpected Redis password error (did you set REDIS_PASSWORD?)")
+		} else if strings.Contains(err.Error(), "connection refused") {
+			t.Fatal("Unexpected Redis connection error (is Redis running?)")
+		}
+	}
+	require.NoError(t, m.Reset(ctx))
+
+	_, err = m.Set(ctx, "k", "v")
+	require.NoError(t, err)
+
+	time.Sleep(200 * time.Millisecond)
+	before, err := rdb.PTTL(ctx, "map:ttl-sliding:content").Result()
+	require.NoError(t, err)
+	require.Greater(t, before, time.Duration(0))
+
+	_, err = m.Set(ctx, "k2", "v2")
+	require.NoError(t, err)
+	after, err := rdb.PTTL(ctx, "map:ttl-sliding:content").Result()
+	require.NoError(t, err)
+
+	// Sliding TTL: writes should refresh expiry back toward ttl.
+	require.Greater(t, after, before)
+}
+
 func TestSetAndWait(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     redisAddr,

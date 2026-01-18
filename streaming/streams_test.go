@@ -121,6 +121,29 @@ func TestStreamTTLSliding(t *testing.T) {
 	assert.NoError(t, s.Destroy(ctx))
 }
 
+func TestStreamDestroyDeletesSinkMap(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx := ptesting.NewTestContext(t)
+
+	s, err := NewStream("testStreamDestroyDeletesSinkMap", rdb)
+	assert.NoError(t, err)
+
+	sink, err := s.NewSink(ctx, "gateway")
+	assert.NoError(t, err)
+	sink.Close(ctx)
+
+	mapKey := "map:stream:testStreamDestroyDeletesSinkMap:sinks:content"
+	exists, err := rdb.Exists(ctx, mapKey).Result()
+	assert.NoError(t, err)
+	assert.EqualValues(t, 1, exists)
+
+	assert.NoError(t, s.Destroy(ctx))
+	exists, err = rdb.Exists(ctx, mapKey).Result()
+	assert.NoError(t, err)
+	assert.EqualValues(t, 0, exists)
+}
+
 func TestRemove(t *testing.T) {
 	rdb := ptesting.NewRedisClient(t)
 	defer ptesting.CleanupRedis(t, rdb, false, "")

@@ -27,6 +27,15 @@ map should later be closed to free up resources.
 The `Join` function creates a new replicated map or joins an existing one.  The
 `Close` function closes the subscription channels and the subscription to Redis.
 
+### Retention (TTL)
+
+By default, replicated maps do not expire. Pulse can optionally set a TTL on the
+Redis hash backing a map:
+
+- `rmap.WithTTL(ttl)` sets an **absolute TTL** (set once when the hash is first
+  created and never extended).
+- `rmap.WithSlidingTTL(ttl)` sets a **sliding TTL** (refreshed on every write).
+
 ### Writing to the Map
 
 * The `Set` method sets the value for a given key and returns the previous value. 
