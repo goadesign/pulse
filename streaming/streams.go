@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"time"
 
 	redis "github.com/redis/go-redis/v9"
 	"goa.design/pulse/pulse"
@@ -21,6 +22,10 @@ type (
 		Name string
 		// MaxLen is the maximum number of events in the stream.
 		MaxLen int
+		// ttl configures an expiry for the Redis key backing the stream.
+		ttl time.Duration
+		// ttlSliding controls whether ttl is refreshed on every Add call.
+		ttlSliding bool
 		// logger is the logger used by the stream.
 		logger pulse.Logger
 		// rootLogger is the prefix-free logger used to create sink loggers.
@@ -50,6 +55,9 @@ func NewStream(name string, rdb *redis.Client, opts ...options.Stream) (*Stream,
 		return nil, fmt.Errorf("pulse stream: not a valid name %q", name)
 	}
 	o := options.ParseStreamOptions(opts...)
+	if o.TTL < 0 {
+		return nil, fmt.Errorf("pulse stream: ttl must be >= 0")
+	}
 	var logger pulse.Logger
 	if o.Logger != nil {
 		logger = o.Logger.WithPrefix("stream", name)
@@ -59,6 +67,8 @@ func NewStream(name string, rdb *redis.Client, opts ...options.Stream) (*Stream,
 	s := &Stream{
 		Name:       name,
 		MaxLen:     o.MaxLen,
+		ttl:        o.TTL,
+		ttlSliding: o.TTLSliding,
 		logger:     logger,
 		rootLogger: o.Logger,
 		key:        streamKeyPrefix + name,
@@ -135,8 +145,24 @@ func (s *Stream) Add(ctx context.Context, name string, payload []byte, opts ...o
 		s.logger.Error(err, "event", name)
 		return "", err
 	}
+	if err := s.applyTTL(ctx); err != nil {
+		err = fmt.Errorf("failed to apply stream TTL: %w", err)
+		s.logger.Error(err, "event", name)
+		return "", err
+	}
 	s.logger.Info("add", "event", name, "id", res)
 	return res, nil
+}
+
+func (s *Stream) applyTTL(ctx context.Context) error {
+	if s.ttl <= 0 {
+		return nil
+	}
+	if s.ttlSliding {
+		return s.rdb.Expire(ctx, s.key, s.ttl).Err()
+	}
+	_, err := s.rdb.ExpireNX(ctx, s.key, s.ttl).Result()
+	return err
 }
 
 // Remove removes the events with the given IDs from the stream.

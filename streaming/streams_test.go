@@ -2,6 +2,7 @@ package streaming
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 
@@ -55,6 +56,67 @@ func TestAdd(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "foo", v[0].Values[nameKey])
 	assert.Equal(t, "bar", v[0].Values[payloadKey])
+
+	assert.NoError(t, s.Destroy(ctx))
+}
+
+func TestStreamTTLAbsolute(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx := ptesting.NewTestContext(t)
+
+	const ttl = 2 * time.Second
+	s, err := NewStream("testStreamTTLAbsolute", rdb, options.WithStreamTTL(ttl))
+	assert.NoError(t, err)
+
+	_, err = s.Add(ctx, "foo", []byte("bar"))
+	assert.NoError(t, err)
+
+	time.Sleep(250 * time.Millisecond)
+	before, err := rdb.PTTL(ctx, s.key).Result()
+	assert.NoError(t, err)
+	assert.Greater(t, before, time.Duration(0))
+	assert.LessOrEqual(t, before, ttl)
+	assert.Less(t, before, ttl-(100*time.Millisecond))
+
+	_, err = s.Add(ctx, "foo2", []byte("bar2"))
+	assert.NoError(t, err)
+	after, err := rdb.PTTL(ctx, s.key).Result()
+	assert.NoError(t, err)
+
+	// Absolute TTL: adding more events must not refresh the expiry.
+	assert.LessOrEqual(t, after, before)
+	assert.Less(t, after, ttl-(100*time.Millisecond))
+
+	assert.NoError(t, s.Destroy(ctx))
+}
+
+func TestStreamTTLSliding(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx := ptesting.NewTestContext(t)
+
+	const ttl = 2 * time.Second
+	s, err := NewStream("testStreamTTLSliding", rdb, options.WithStreamSlidingTTL(ttl))
+	assert.NoError(t, err)
+
+	_, err = s.Add(ctx, "foo", []byte("bar"))
+	assert.NoError(t, err)
+
+	time.Sleep(250 * time.Millisecond)
+	before, err := rdb.PTTL(ctx, s.key).Result()
+	assert.NoError(t, err)
+	assert.Greater(t, before, time.Duration(0))
+	assert.LessOrEqual(t, before, ttl)
+	assert.Less(t, before, ttl-(100*time.Millisecond))
+
+	_, err = s.Add(ctx, "foo2", []byte("bar2"))
+	assert.NoError(t, err)
+	after, err := rdb.PTTL(ctx, s.key).Result()
+	assert.NoError(t, err)
+
+	// Sliding TTL: adding events refreshes the expiry back toward ttl.
+	assert.Greater(t, after, ttl-(500*time.Millisecond))
 
 	assert.NoError(t, s.Destroy(ctx))
 }

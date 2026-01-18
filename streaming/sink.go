@@ -139,6 +139,9 @@ func newSink(ctx context.Context, name string, stream *Stream, opts ...options.S
 	if err := stream.rdb.XGroupCreateMkStream(ctx, stream.key, name, o.LastEventID).Err(); err != nil && !isBusyGroupErr(err) {
 		return nil, fmt.Errorf("failed to create Redis consumer group %s for stream %s: %w", name, stream.Name, err)
 	}
+	if err := stream.applyTTL(ctx); err != nil {
+		return nil, fmt.Errorf("failed to apply stream TTL: %w", err)
+	}
 
 	sink := &Sink{
 		Name:                  name,

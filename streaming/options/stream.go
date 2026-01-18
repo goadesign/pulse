@@ -1,6 +1,8 @@
 package options
 
 import (
+	"time"
+
 	"goa.design/pulse/pulse"
 )
 
@@ -11,6 +13,13 @@ type (
 	StreamOptions struct {
 		MaxLen int
 		Logger pulse.Logger
+
+		// TTL configures a retention window for the Redis key backing the stream.
+		// When zero, no TTL is applied.
+		TTL time.Duration
+		// TTLSliding controls whether the TTL is refreshed on every published event.
+		// When false, the TTL is applied once (absolute TTL) and never extended.
+		TTLSliding bool
 	}
 )
 
@@ -25,6 +34,24 @@ func WithStreamMaxLen(len int) Stream {
 func WithStreamLogger(logger pulse.Logger) Stream {
 	return func(o *StreamOptions) {
 		o.Logger = logger
+	}
+}
+
+// WithStreamTTL sets an absolute TTL on the Redis key backing the stream.
+// The TTL is set once (when the key is created) and never extended.
+func WithStreamTTL(ttl time.Duration) Stream {
+	return func(o *StreamOptions) {
+		o.TTL = ttl
+		o.TTLSliding = false
+	}
+}
+
+// WithStreamSlidingTTL sets a sliding TTL on the Redis key backing the stream.
+// The TTL is refreshed on every published event.
+func WithStreamSlidingTTL(ttl time.Duration) Stream {
+	return func(o *StreamOptions) {
+		o.TTL = ttl
+		o.TTLSliding = true
 	}
 }
 

@@ -22,6 +22,7 @@ func TestStreamOptions(t *testing.T) {
 			want: StreamOptions{
 				MaxLen: 1000,
 				Logger: pulse.NoopLogger(),
+				TTL:    0,
 			},
 		},
 		{
@@ -30,6 +31,7 @@ func TestStreamOptions(t *testing.T) {
 			want: StreamOptions{
 				MaxLen: 10,
 				Logger: pulse.NoopLogger(),
+				TTL:    0,
 			},
 		},
 		{
@@ -38,6 +40,27 @@ func TestStreamOptions(t *testing.T) {
 			want: StreamOptions{
 				MaxLen: 1000,
 				Logger: pulse.StdLogger(log.Default()),
+				TTL:    0,
+			},
+		},
+		{
+			name: "ttl absolute",
+			opts: []Stream{WithStreamTTL(10 * time.Second)},
+			want: StreamOptions{
+				MaxLen:     1000,
+				Logger:     pulse.NoopLogger(),
+				TTL:        10 * time.Second,
+				TTLSliding: false,
+			},
+		},
+		{
+			name: "ttl sliding",
+			opts: []Stream{WithStreamSlidingTTL(10 * time.Second)},
+			want: StreamOptions{
+				MaxLen:     1000,
+				Logger:     pulse.NoopLogger(),
+				TTL:        10 * time.Second,
+				TTLSliding: true,
 			},
 		},
 	}
