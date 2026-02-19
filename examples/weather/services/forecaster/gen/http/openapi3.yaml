@@ -140,6 +140,7 @@ components:
                           summary: Clear
                           temperature: 70
                           temperatureUnit: F
+            description: Weather forecast
             example:
                 location:
                     city: Santa Barbara

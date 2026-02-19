@@ -2,6 +2,7 @@ package testing
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"regexp"
 	"strings"
@@ -46,25 +47,34 @@ func CleanupRedis(t *testing.T, rdb *redis.Client, checkClean bool, testName str
 	t.Helper()
 	ctx := context.Background()
 	if checkClean {
-		keys, err := rdb.Keys(ctx, "*").Result()
-		require.NoError(t, err)
-		var filtered []string
-		for _, k := range keys {
-			if strings.HasSuffix(k, ":sinks:content") {
-				// Sinks content is cleaned up asynchronously, so ignore it
-				continue
-			}
-			if streamRegexp.MatchString(k) {
-				// Node streams are cleaned up asynchronously, so ignore them
-				continue
-			}
-			if strings.Contains(k, testName) {
-				filtered = append(filtered, k)
-			}
-		}
+		var (
+			filtered []string
+			keysErr  error
+		)
 		assert.Eventually(t, func() bool {
+			var keys []string
+			keys, keysErr = rdb.Keys(ctx, "*").Result()
+			if keysErr != nil {
+				filtered = []string{fmt.Sprintf("keys error: %v", keysErr)}
+				return false
+			}
+			filtered = filtered[:0]
+			for _, k := range keys {
+				if strings.HasSuffix(k, ":sinks:content") {
+					// Sinks content is cleaned up asynchronously, so ignore it
+					continue
+				}
+				if streamRegexp.MatchString(k) {
+					// Node streams are cleaned up asynchronously, so ignore them
+					continue
+				}
+				if strings.Contains(k, testName) {
+					filtered = append(filtered, k)
+				}
+			}
 			return len(filtered) == 0
-		}, time.Second, time.Millisecond*10, "found keys: %v", filtered)
+		}, 5*time.Second, time.Millisecond*10, "found keys: %v", filtered)
+		require.NoError(t, keysErr)
 	}
 	assert.NoError(t, rdb.FlushDB(ctx).Err())
 }

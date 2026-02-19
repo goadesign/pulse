@@ -551,6 +551,7 @@ func TestTwoNodeJobDispatchAndAck(t *testing.T) {
 	}, max, delay, "Pending events were not cleared on node1 within expected time")
 
 	// Clean up
+	require.NoError(t, node2.Shutdown(ctx), "Failed to shutdown node2")
 	require.NoError(t, node1.Shutdown(ctx), "Failed to shutdown node1")
 }
 

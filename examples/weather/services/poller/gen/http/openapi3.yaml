@@ -898,13 +898,33 @@ paths:
                                         - 125
 components:
     schemas:
+        CityAndState:
+            type: object
+            properties:
+                city:
+                    type: string
+                    description: City
+                    example: Santa Barbara
+                state:
+                    type: string
+                    description: State
+                    example: CA
+                    minLength: 2
+                    maxLength: 2
+            description: Location city and state.
+            example:
+                city: Santa Barbara
+                state: CA
+            required:
+                - city
+                - state
         Error:
             type: object
             properties:
                 fault:
                     type: boolean
                     description: Is the error a server-side fault?
-                    example: true
+                    example: false
                 id:
                     type: string
                     description: ID is a unique identifier for this particular occurrence of the problem.
@@ -920,7 +940,7 @@ components:
                 temporary:
                     type: boolean
                     description: Is the error temporary?
-                    example: true
+                    example: false
                 timeout:
                     type: boolean
                     description: Is the error a timeout?
@@ -931,7 +951,7 @@ components:
                 id: 123abc
                 message: parameter 'p' must be an integer
                 name: bad_request
-                temporary: false
+                temporary: true
                 timeout: false
             required:
                 - name
@@ -969,12 +989,7 @@ components:
                           summary: Clear
                           temperature: 70
                           temperatureUnit: F
-                        - endTime: "2020-01-01T00:00:00Z"
-                          name: Morning
-                          startTime: "2020-01-01T00:00:00Z"
-                          summary: Clear
-                          temperature: 70
-                          temperatureUnit: F
+            description: Weather forecast
             example:
                 location:
                     city: Santa Barbara
@@ -982,6 +997,12 @@ components:
                     long: -119.7049146
                     state: CA
                 periods:
+                    - endTime: "2020-01-01T00:00:00Z"
+                      name: Morning
+                      startTime: "2020-01-01T00:00:00Z"
+                      summary: Clear
+                      temperature: 70
+                      temperatureUnit: F
                     - endTime: "2020-01-01T00:00:00Z"
                       name: Morning
                       startTime: "2020-01-01T00:00:00Z"
@@ -1437,89 +1458,6 @@ components:
                                 - 97
                                 - 34
                                 - 125
-                        - created_at: "2020-09-01T12:00:00Z"
-                          id: "1"
-                          jobs:
-                            - created_at: "2020-09-01T12:00:00Z"
-                              key: "1"
-                              payload:
-                                - 123
-                                - 34
-                                - 115
-                                - 116
-                                - 97
-                                - 116
-                                - 101
-                                - 34
-                                - 58
-                                - 34
-                                - 67
-                                - 65
-                                - 34
-                                - 44
-                                - 34
-                                - 99
-                                - 105
-                                - 116
-                                - 121
-                                - 34
-                                - 58
-                                - 34
-                                - 83
-                                - 97
-                                - 110
-                                - 116
-                                - 97
-                                - 32
-                                - 66
-                                - 97
-                                - 114
-                                - 98
-                                - 97
-                                - 114
-                                - 97
-                                - 34
-                                - 125
-                            - created_at: "2020-09-01T12:00:00Z"
-                              key: "1"
-                              payload:
-                                - 123
-                                - 34
-                                - 115
-                                - 116
-                                - 97
-                                - 116
-                                - 101
-                                - 34
-                                - 58
-                                - 34
-                                - 67
-                                - 65
-                                - 34
-                                - 44
-                                - 34
-                                - 99
-                                - 105
-                                - 116
-                                - 121
-                                - 34
-                                - 58
-                                - 34
-                                - 83
-                                - 97
-                                - 110
-                                - 116
-                                - 97
-                                - 32
-                                - 66
-                                - 97
-                                - 114
-                                - 98
-                                - 97
-                                - 114
-                                - 97
-                                - 34
-                                - 125
                             - created_at: "2020-09-01T12:00:00Z"
                               key: "1"
                               payload:
@@ -1683,6 +1621,46 @@ components:
                                 - 97
                                 - 34
                                 - 125
+                            - created_at: "2020-09-01T12:00:00Z"
+                              key: "1"
+                              payload:
+                                - 123
+                                - 34
+                                - 115
+                                - 116
+                                - 97
+                                - 116
+                                - 101
+                                - 34
+                                - 58
+                                - 34
+                                - 67
+                                - 65
+                                - 34
+                                - 44
+                                - 34
+                                - 99
+                                - 105
+                                - 116
+                                - 121
+                                - 34
+                                - 58
+                                - 34
+                                - 83
+                                - 97
+                                - 110
+                                - 116
+                                - 97
+                                - 32
+                                - 66
+                                - 97
+                                - 114
+                                - 98
+                                - 97
+                                - 114
+                                - 97
+                                - 34
+                                - 125
                         - created_at: "2020-09-01T12:00:00Z"
                           id: "1"
                           jobs:
@@ -1806,8 +1784,89 @@ components:
                                 - 97
                                 - 34
                                 - 125
+                            - created_at: "2020-09-01T12:00:00Z"
+                              key: "1"
+                              payload:
+                                - 123
+                                - 34
+                                - 115
+                                - 116
+                                - 97
+                                - 116
+                                - 101
+                                - 34
+                                - 58
+                                - 34
+                                - 67
+                                - 65
+                                - 34
+                                - 44
+                                - 34
+                                - 99
+                                - 105
+                                - 116
+                                - 121
+                                - 34
+                                - 58
+                                - 34
+                                - 83
+                                - 97
+                                - 110
+                                - 116
+                                - 97
+                                - 32
+                                - 66
+                                - 97
+                                - 114
+                                - 98
+                                - 97
+                                - 114
+                                - 97
+                                - 34
+                                - 125
+            description: Poller status
             example:
                 jobs:
+                    - created_at: "2020-09-01T12:00:00Z"
+                      key: "1"
+                      payload:
+                        - 123
+                        - 34
+                        - 115
+                        - 116
+                        - 97
+                        - 116
+                        - 101
+                        - 34
+                        - 58
+                        - 34
+                        - 67
+                        - 65
+                        - 34
+                        - 44
+                        - 34
+                        - 99
+                        - 105
+                        - 116
+                        - 121
+                        - 34
+                        - 58
+                        - 34
+                        - 83
+                        - 97
+                        - 110
+                        - 116
+                        - 97
+                        - 32
+                        - 66
+                        - 97
+                        - 114
+                        - 98
+                        - 97
+                        - 114
+                        - 97
+                        - 34
+                        - 125
                     - created_at: "2020-09-01T12:00:00Z"
                       key: "1"
                       payload:
@@ -2052,9 +2111,89 @@ components:
                             - 97
                             - 34
                             - 125
+                        - created_at: "2020-09-01T12:00:00Z"
+                          key: "1"
+                          payload:
+                            - 123
+                            - 34
+                            - 115
+                            - 116
+                            - 97
+                            - 116
+                            - 101
+                            - 34
+                            - 58
+                            - 34
+                            - 67
+                            - 65
+                            - 34
+                            - 44
+                            - 34
+                            - 99
+                            - 105
+                            - 116
+                            - 121
+                            - 34
+                            - 58
+                            - 34
+                            - 83
+                            - 97
+                            - 110
+                            - 116
+                            - 97
+                            - 32
+                            - 66
+                            - 97
+                            - 114
+                            - 98
+                            - 97
+                            - 114
+                            - 97
+                            - 34
+                            - 125
                     - created_at: "2020-09-01T12:00:00Z"
                       id: "1"
                       jobs:
+                        - created_at: "2020-09-01T12:00:00Z"
+                          key: "1"
+                          payload:
+                            - 123
+                            - 34
+                            - 115
+                            - 116
+                            - 97
+                            - 116
+                            - 101
+                            - 34
+                            - 58
+                            - 34
+                            - 67
+                            - 65
+                            - 34
+                            - 44
+                            - 34
+                            - 99
+                            - 105
+                            - 116
+                            - 121
+                            - 34
+                            - 58
+                            - 34
+                            - 83
+                            - 97
+                            - 110
+                            - 116
+                            - 97
+                            - 32
+                            - 66
+                            - 97
+                            - 114
+                            - 98
+                            - 97
+                            - 114
+                            - 97
+                            - 34
+                            - 125
                         - created_at: "2020-09-01T12:00:00Z"
                           key: "1"
                           payload:
@@ -2275,6 +2414,7 @@ components:
                             - 97
                             - 34
                             - 125
+            description: Poller worker
             example:
                 created_at: "2020-09-01T12:00:00Z"
                 id: "1"

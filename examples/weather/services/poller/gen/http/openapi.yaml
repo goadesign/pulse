@@ -54,7 +54,7 @@ paths:
                 "200":
                     description: OK response.
                     schema:
-                        $ref: '#/definitions/PollerStatusResponseBody'
+                        $ref: '#/definitions/PollerStatus'
                         required:
                             - workers
                             - jobs
@@ -84,7 +84,7 @@ paths:
                 "101":
                     description: Switching Protocols response.
                     schema:
-                        $ref: '#/definitions/PollerSubscribeResponseBody'
+                        $ref: '#/definitions/Forecast'
                         required:
                             - location
                             - periods
@@ -101,7 +101,7 @@ paths:
                 "200":
                     description: OK response.
                     schema:
-                        $ref: '#/definitions/PollerAddWorkerResponseBody'
+                        $ref: '#/definitions/Worker'
                         required:
                             - id
                             - jobs
@@ -124,8 +124,54 @@ paths:
             schemes:
                 - http
 definitions:
-    JobResponseBody:
-        title: JobResponseBody
+    Forecast:
+        title: Forecast
+        type: object
+        properties:
+            location:
+                $ref: '#/definitions/Location'
+            periods:
+                type: array
+                items:
+                    $ref: '#/definitions/Period'
+                description: Weather forecast periods
+                example:
+                    - endTime: "2020-01-01T00:00:00Z"
+                      name: Morning
+                      startTime: "2020-01-01T00:00:00Z"
+                      summary: Clear
+                      temperature: 70
+                      temperatureUnit: F
+                    - endTime: "2020-01-01T00:00:00Z"
+                      name: Morning
+                      startTime: "2020-01-01T00:00:00Z"
+                      summary: Clear
+                      temperature: 70
+                      temperatureUnit: F
+        example:
+            location:
+                city: Santa Barbara
+                lat: 34.4237458
+                long: -119.7049146
+                state: CA
+            periods:
+                - endTime: "2020-01-01T00:00:00Z"
+                  name: Morning
+                  startTime: "2020-01-01T00:00:00Z"
+                  summary: Clear
+                  temperature: 70
+                  temperatureUnit: F
+                - endTime: "2020-01-01T00:00:00Z"
+                  name: Morning
+                  startTime: "2020-01-01T00:00:00Z"
+                  summary: Clear
+                  temperature: 70
+                  temperatureUnit: F
+        required:
+            - location
+            - periods
+    Job:
+        title: Job
         type: object
         properties:
             created_at:
@@ -224,8 +270,8 @@ definitions:
             - key
             - payload
             - created_at
-    LocationResponseBody:
-        title: LocationResponseBody
+    Location:
+        title: Location
         type: object
         properties:
             city:
@@ -257,8 +303,8 @@ definitions:
             - long
             - city
             - state
-    PeriodResponseBody:
-        title: PeriodResponseBody
+    Period:
+        title: Period
         type: object
         properties:
             endTime:
@@ -346,192 +392,6 @@ definitions:
             - temporary
             - timeout
             - fault
-    PollerAddWorkerResponseBody:
-        title: PollerAddWorkerResponseBody
-        type: object
-        properties:
-            created_at:
-                type: string
-                description: Creation timestamp
-                example: "2020-09-01T12:00:00Z"
-            id:
-                type: string
-                description: Worker ID
-                example: "1"
-            jobs:
-                type: array
-                items:
-                    $ref: '#/definitions/JobResponseBody'
-                description: Worker poll jobs
-                example:
-                    - created_at: "2020-09-01T12:00:00Z"
-                      key: "1"
-                      payload:
-                        - 123
-                        - 34
-                        - 115
-                        - 116
-                        - 97
-                        - 116
-                        - 101
-                        - 34
-                        - 58
-                        - 34
-                        - 67
-                        - 65
-                        - 34
-                        - 44
-                        - 34
-                        - 99
-                        - 105
-                        - 116
-                        - 121
-                        - 34
-                        - 58
-                        - 34
-                        - 83
-                        - 97
-                        - 110
-                        - 116
-                        - 97
-                        - 32
-                        - 66
-                        - 97
-                        - 114
-                        - 98
-                        - 97
-                        - 114
-                        - 97
-                        - 34
-                        - 125
-                    - created_at: "2020-09-01T12:00:00Z"
-                      key: "1"
-                      payload:
-                        - 123
-                        - 34
-                        - 115
-                        - 116
-                        - 97
-                        - 116
-                        - 101
-                        - 34
-                        - 58
-                        - 34
-                        - 67
-                        - 65
-                        - 34
-                        - 44
-                        - 34
-                        - 99
-                        - 105
-                        - 116
-                        - 121
-                        - 34
-                        - 58
-                        - 34
-                        - 83
-                        - 97
-                        - 110
-                        - 116
-                        - 97
-                        - 32
-                        - 66
-                        - 97
-                        - 114
-                        - 98
-                        - 97
-                        - 114
-                        - 97
-                        - 34
-                        - 125
-        example:
-            created_at: "2020-09-01T12:00:00Z"
-            id: "1"
-            jobs:
-                - created_at: "2020-09-01T12:00:00Z"
-                  key: "1"
-                  payload:
-                    - 123
-                    - 34
-                    - 115
-                    - 116
-                    - 97
-                    - 116
-                    - 101
-                    - 34
-                    - 58
-                    - 34
-                    - 67
-                    - 65
-                    - 34
-                    - 44
-                    - 34
-                    - 99
-                    - 105
-                    - 116
-                    - 121
-                    - 34
-                    - 58
-                    - 34
-                    - 83
-                    - 97
-                    - 110
-                    - 116
-                    - 97
-                    - 32
-                    - 66
-                    - 97
-                    - 114
-                    - 98
-                    - 97
-                    - 114
-                    - 97
-                    - 34
-                    - 125
-                - created_at: "2020-09-01T12:00:00Z"
-                  key: "1"
-                  payload:
-                    - 123
-                    - 34
-                    - 115
-                    - 116
-                    - 97
-                    - 116
-                    - 101
-                    - 34
-                    - 58
-                    - 34
-                    - 67
-                    - 65
-                    - 34
-                    - 44
-                    - 34
-                    - 99
-                    - 105
-                    - 116
-                    - 121
-                    - 34
-                    - 58
-                    - 34
-                    - 83
-                    - 97
-                    - 110
-                    - 116
-                    - 97
-                    - 32
-                    - 66
-                    - 97
-                    - 114
-                    - 98
-                    - 97
-                    - 114
-                    - 97
-                    - 34
-                    - 125
-        required:
-            - id
-            - jobs
-            - created_at
     PollerRemoveWorkerTooFewResponseBody:
         title: 'Mediatype identifier: application/vnd.goa.error; view=default'
         type: object
@@ -575,14 +435,14 @@ definitions:
             - temporary
             - timeout
             - fault
-    PollerStatusResponseBody:
-        title: PollerStatusResponseBody
+    PollerStatus:
+        title: PollerStatus
         type: object
         properties:
             jobs:
                 type: array
                 items:
-                    $ref: '#/definitions/JobResponseBody'
+                    $ref: '#/definitions/Job'
                 description: Location poll jobs
                 example:
                     - created_at: "2020-09-01T12:00:00Z"
@@ -748,7 +608,7 @@ definitions:
             workers:
                 type: array
                 items:
-                    $ref: '#/definitions/WorkerResponseBody'
+                    $ref: '#/definitions/Worker'
                 description: Poller workers
                 example:
                     - created_at: "2020-09-01T12:00:00Z"
@@ -1406,180 +1266,11 @@ definitions:
                         - 97
                         - 34
                         - 125
-                - created_at: "2020-09-01T12:00:00Z"
-                  id: "1"
-                  jobs:
-                    - created_at: "2020-09-01T12:00:00Z"
-                      key: "1"
-                      payload:
-                        - 123
-                        - 34
-                        - 115
-                        - 116
-                        - 97
-                        - 116
-                        - 101
-                        - 34
-                        - 58
-                        - 34
-                        - 67
-                        - 65
-                        - 34
-                        - 44
-                        - 34
-                        - 99
-                        - 105
-                        - 116
-                        - 121
-                        - 34
-                        - 58
-                        - 34
-                        - 83
-                        - 97
-                        - 110
-                        - 116
-                        - 97
-                        - 32
-                        - 66
-                        - 97
-                        - 114
-                        - 98
-                        - 97
-                        - 114
-                        - 97
-                        - 34
-                        - 125
-                    - created_at: "2020-09-01T12:00:00Z"
-                      key: "1"
-                      payload:
-                        - 123
-                        - 34
-                        - 115
-                        - 116
-                        - 97
-                        - 116
-                        - 101
-                        - 34
-                        - 58
-                        - 34
-                        - 67
-                        - 65
-                        - 34
-                        - 44
-                        - 34
-                        - 99
-                        - 105
-                        - 116
-                        - 121
-                        - 34
-                        - 58
-                        - 34
-                        - 83
-                        - 97
-                        - 110
-                        - 116
-                        - 97
-                        - 32
-                        - 66
-                        - 97
-                        - 114
-                        - 98
-                        - 97
-                        - 114
-                        - 97
-                        - 34
-                        - 125
-                    - created_at: "2020-09-01T12:00:00Z"
-                      key: "1"
-                      payload:
-                        - 123
-                        - 34
-                        - 115
-                        - 116
-                        - 97
-                        - 116
-                        - 101
-                        - 34
-                        - 58
-                        - 34
-                        - 67
-                        - 65
-                        - 34
-                        - 44
-                        - 34
-                        - 99
-                        - 105
-                        - 116
-                        - 121
-                        - 34
-                        - 58
-                        - 34
-                        - 83
-                        - 97
-                        - 110
-                        - 116
-                        - 97
-                        - 32
-                        - 66
-                        - 97
-                        - 114
-                        - 98
-                        - 97
-                        - 114
-                        - 97
-                        - 34
-                        - 125
         required:
             - workers
             - jobs
-    PollerSubscribeResponseBody:
-        title: PollerSubscribeResponseBody
-        type: object
-        properties:
-            location:
-                $ref: '#/definitions/LocationResponseBody'
-            periods:
-                type: array
-                items:
-                    $ref: '#/definitions/PeriodResponseBody'
-                description: Weather forecast periods
-                example:
-                    - endTime: "2020-01-01T00:00:00Z"
-                      name: Morning
-                      startTime: "2020-01-01T00:00:00Z"
-                      summary: Clear
-                      temperature: 70
-                      temperatureUnit: F
-                    - endTime: "2020-01-01T00:00:00Z"
-                      name: Morning
-                      startTime: "2020-01-01T00:00:00Z"
-                      summary: Clear
-                      temperature: 70
-                      temperatureUnit: F
-        example:
-            location:
-                city: Santa Barbara
-                lat: 34.4237458
-                long: -119.7049146
-                state: CA
-            periods:
-                - endTime: "2020-01-01T00:00:00Z"
-                  name: Morning
-                  startTime: "2020-01-01T00:00:00Z"
-                  summary: Clear
-                  temperature: 70
-                  temperatureUnit: F
-                - endTime: "2020-01-01T00:00:00Z"
-                  name: Morning
-                  startTime: "2020-01-01T00:00:00Z"
-                  summary: Clear
-                  temperature: 70
-                  temperatureUnit: F
-        required:
-            - location
-            - periods
-    WorkerResponseBody:
-        title: WorkerResponseBody
+    Worker:
+        title: Worker
         type: object
         properties:
             created_at:
@@ -1593,7 +1284,7 @@ definitions:
             jobs:
                 type: array
                 items:
-                    $ref: '#/definitions/JobResponseBody'
+                    $ref: '#/definitions/Job'
                 description: Worker poll jobs
                 example:
                     - created_at: "2020-09-01T12:00:00Z"
@@ -1676,91 +1367,10 @@ definitions:
                         - 97
                         - 34
                         - 125
-        description: Poller worker
         example:
             created_at: "2020-09-01T12:00:00Z"
             id: "1"
             jobs:
-                - created_at: "2020-09-01T12:00:00Z"
-                  key: "1"
-                  payload:
-                    - 123
-                    - 34
-                    - 115
-                    - 116
-                    - 97
-                    - 116
-                    - 101
-                    - 34
-                    - 58
-                    - 34
-                    - 67
-                    - 65
-                    - 34
-                    - 44
-                    - 34
-                    - 99
-                    - 105
-                    - 116
-                    - 121
-                    - 34
-                    - 58
-                    - 34
-                    - 83
-                    - 97
-                    - 110
-                    - 116
-                    - 97
-                    - 32
-                    - 66
-                    - 97
-                    - 114
-                    - 98
-                    - 97
-                    - 114
-                    - 97
-                    - 34
-                    - 125
-                - created_at: "2020-09-01T12:00:00Z"
-                  key: "1"
-                  payload:
-                    - 123
-                    - 34
-                    - 115
-                    - 116
-                    - 97
-                    - 116
-                    - 101
-                    - 34
-                    - 58
-                    - 34
-                    - 67
-                    - 65
-                    - 34
-                    - 44
-                    - 34
-                    - 99
-                    - 105
-                    - 116
-                    - 121
-                    - 34
-                    - 58
-                    - 34
-                    - 83
-                    - 97
-                    - 110
-                    - 116
-                    - 97
-                    - 32
-                    - 66
-                    - 97
-                    - 114
-                    - 98
-                    - 97
-                    - 114
-                    - 97
-                    - 34
-                    - 125
                 - created_at: "2020-09-01T12:00:00Z"
                   key: "1"
                   payload:

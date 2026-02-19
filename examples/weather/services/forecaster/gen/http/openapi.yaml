@@ -38,7 +38,7 @@ paths:
                 "200":
                     description: OK response.
                     schema:
-                        $ref: '#/definitions/ForecasterForecastResponseBody'
+                        $ref: '#/definitions/Forecast'
                         required:
                             - location
                             - periods
@@ -49,16 +49,16 @@ paths:
             schemes:
                 - http
 definitions:
-    ForecasterForecastResponseBody:
-        title: ForecasterForecastResponseBody
+    Forecast:
+        title: Forecast
         type: object
         properties:
             location:
-                $ref: '#/definitions/LocationResponseBody'
+                $ref: '#/definitions/Location'
             periods:
                 type: array
                 items:
-                    $ref: '#/definitions/PeriodResponseBody'
+                    $ref: '#/definitions/Period'
                 description: Weather forecast periods
                 example:
                     - endTime: "2020-01-01T00:00:00Z"
@@ -150,8 +150,8 @@ definitions:
             - temporary
             - timeout
             - fault
-    LocationResponseBody:
-        title: LocationResponseBody
+    Location:
+        title: Location
         type: object
         properties:
             city:
@@ -183,8 +183,8 @@ definitions:
             - long
             - city
             - state
-    PeriodResponseBody:
-        title: PeriodResponseBody
+    Period:
+        title: Period
         type: object
         properties:
             endTime:
