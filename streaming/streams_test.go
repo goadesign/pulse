@@ -1,6 +1,7 @@
 package streaming
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
@@ -121,7 +122,7 @@ func TestStreamTTLSliding(t *testing.T) {
 	assert.NoError(t, s.Destroy(ctx))
 }
 
-func TestStreamDestroyDeletesSinkMap(t *testing.T) {
+func TestStreamDestroyUsesRMapDestroyProtocol(t *testing.T) {
 	rdb := ptesting.NewRedisClient(t)
 	defer ptesting.CleanupRedis(t, rdb, false, "")
 	ctx := ptesting.NewTestContext(t)
@@ -139,9 +140,12 @@ func TestStreamDestroyDeletesSinkMap(t *testing.T) {
 	assert.EqualValues(t, 1, exists)
 
 	assert.NoError(t, s.Destroy(ctx))
-	exists, err = rdb.Exists(ctx, mapKey).Result()
+	content, err := rdb.HGetAll(ctx, mapKey).Result()
 	assert.NoError(t, err)
-	assert.EqualValues(t, 0, exists)
+	assert.Len(t, content, 2)
+	assert.Equal(t, "destroy", content["=kind"])
+	_, err = strconv.ParseUint(content["=rev"], 10, 64)
+	assert.NoError(t, err)
 }
 
 func TestRemove(t *testing.T) {
