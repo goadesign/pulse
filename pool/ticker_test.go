@@ -9,6 +9,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"goa.design/clue/log"
+	"goa.design/pulse/pulse"
+	"goa.design/pulse/rmap"
 
 	ptesting "goa.design/pulse/testing"
 )
@@ -95,6 +97,53 @@ func TestReplaceTickerTimer(t *testing.T) {
 
 	// Cleanup
 	assert.NoError(t, node.Shutdown(ctx))
+}
+
+func TestHandleTickRetriesAfterMapWriteError(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, t.Name())
+	ctx := log.Context(ptesting.NewTestContext(t), log.WithOutput(io.Discard))
+	testName := strings.Replace(t.Name(), "/", "_", -1)
+
+	tickerMap, err := rmap.Join(ctx, "ticker-map-"+testName, rdb)
+	require.NoError(t, err)
+
+	tickDuration := 10 * time.Millisecond
+	next := serialize(time.Now().Add(tickDuration), tickDuration)
+	_, err = tickerMap.Set(ctx, testName, next)
+	require.NoError(t, err)
+
+	c := make(chan time.Time, 1)
+	ticker := &Ticker{
+		C:         c,
+		c:         c,
+		name:      testName,
+		tickerMap: tickerMap,
+		next:      next,
+		timer:     time.NewTimer(time.Hour),
+		logger:    pulse.NoopLogger(),
+	}
+	t.Cleanup(func() {
+		ticker.timer.Stop()
+	})
+
+	tickerMap.Close()
+
+	start := time.Now()
+	ticker.handleTick()
+
+	select {
+	case firedAt := <-ticker.timer.C:
+		assert.WithinDuration(t, start.Add(tickDuration), firedAt, 50*time.Millisecond)
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("ticker did not schedule a retry after a map write error")
+	}
+
+	select {
+	case <-ticker.C:
+		t.Fatal("ticker should not emit a tick when advancing the map fails")
+	default:
+	}
 }
 
 // verifyTickerStopped checks if a ticker has stopped by waiting for a duration longer than its tick interval

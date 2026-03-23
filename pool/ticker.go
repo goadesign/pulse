@@ -29,6 +29,13 @@ type (
 	}
 )
 
+const (
+	// tickerRetryMaxInterval caps how long a local ticker waits before retrying
+	// a failed Redis advance. A transient Redis outage must not leave the
+	// distributed ticker permanently idle until some unrelated map event arrives.
+	tickerRetryMaxInterval = time.Second
+)
+
 // NewTicker returns a new Ticker that behaves similarly to time.Ticker, but
 // instead delivers the current time on the channel to only one of the nodes
 // that invoked NewTicker with the same name.
@@ -166,7 +173,7 @@ func (t *Ticker) handleTick() {
 	next := serialize(ts, d)
 	prev, err := t.tickerMap.TestAndSet(context.Background(), t.name, t.next, next)
 	if err != nil {
-		t.logger.Error(err, "msg", "failed to update next tick")
+		t.handleAdvanceFailureLocked(err, d)
 		return
 	}
 	if prev != t.next {
@@ -186,7 +193,20 @@ func (t *Ticker) handleTick() {
 // initTimer sets the timer to fire at the next tick.
 func (t *Ticker) initTimer() {
 	next, _ := deserialize(t.next)
-	d := time.Until(next)
+	t.resetTimerLocked(time.Until(next))
+}
+
+// handleAdvanceFailureLocked logs a transient Redis advance failure and rearms
+// the timer so the ticker retries instead of staying permanently idle. The
+// caller must hold t.lock.
+func (t *Ticker) handleAdvanceFailureLocked(err error, interval time.Duration) {
+	t.logger.Error(err, "msg", "failed to update next tick")
+	t.resetTimerLocked(min(interval, tickerRetryMaxInterval))
+}
+
+// resetTimerLocked arms the local timer to fire after d. The caller must hold
+// t.lock.
+func (t *Ticker) resetTimerLocked(d time.Duration) {
 	if d < 0 {
 		d = 0
 	}
