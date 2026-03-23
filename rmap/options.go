@@ -1,3 +1,5 @@
+// Package rmap options keep map construction small and explicit so the runtime
+// behavior stays easy to reason about at every call site.
 package rmap
 
 import (

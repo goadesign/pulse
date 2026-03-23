@@ -49,8 +49,9 @@ Redis hash backing a map:
 
 [![Replicated Map Append](../snippets/rmap-append.png)](../examples/rmap/basics/main.go#L60-L72)
 
-Values are stored as strings. The `AppendValues` method converts the values to a
-comma separated string before storing them. 
+Values are stored as strings. The list helpers store list values as JSON arrays
+so appends, uniqueness checks, and removals can round-trip without losing item
+boundaries.
 
 * The `Inc` method increments a counter by a given amount and returns the new value.
 

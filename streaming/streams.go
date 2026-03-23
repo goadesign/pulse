@@ -8,6 +8,7 @@ import (
 
 	redis "github.com/redis/go-redis/v9"
 	"goa.design/pulse/pulse"
+	"goa.design/pulse/rmap"
 	"goa.design/pulse/streaming/options"
 )
 
@@ -186,36 +187,34 @@ func (s *Stream) Destroy(ctx context.Context) error {
 		s.logger.Error(err)
 		return err
 	}
-	// Destroy per-stream sink metadata map used by Pulse sinks to track consumers.
-	//
-	// Pulse sinks use an rmap keyed by "stream:<streamName>:sinks". The rmap stores
-	// its state in:
-	// - map:<name>:content (hash)
-	// - map:<name>:updates (pubsub channel)
-	//
-	// When a stream is explicitly destroyed, any sink metadata for that stream is
-	// also garbage. Cleaning it up here prevents leaks for short-lived streams
-	// (e.g., per-call result streams) that are destroyed explicitly.
-	//
-	// Note: we intentionally do not delete per-sink keepalive maps
-	// (sink:<sinkName>:keepalive) since those are shared across streams.
-	mapName := fmt.Sprintf("stream:%s:sinks", s.Name)
-	mapHashKey := fmt.Sprintf("map:%s:content", mapName)
-	mapChanKey := fmt.Sprintf("map:%s:updates", mapName)
-	if err := s.rdb.Del(ctx, mapHashKey).Err(); err != nil {
+	if err := s.destroyConsumersMap(ctx); err != nil {
 		err := fmt.Errorf("failed to destroy stream sink map: %w", err)
-		s.logger.Error(err)
-		return err
-	}
-	// Mirror rmap's destroy semantics so any in-flight subscribers can notice the
-	// map is gone.
-	if err := s.rdb.Publish(ctx, mapChanKey, "reset:*").Err(); err != nil {
-		err := fmt.Errorf("failed to publish sink map reset: %w", err)
 		s.logger.Error(err)
 		return err
 	}
 	s.logger.Info("stream deleted")
 	return nil
+}
+
+// destroyConsumersMap removes the per-stream sink membership map through the
+// rmap destroy protocol so reconnecting replicas observe the same revisioned
+// destroy semantics as every other replicated map.
+func (s *Stream) destroyConsumersMap(ctx context.Context) error {
+	mapName := consumersMapName(s)
+	mapKey := fmt.Sprintf("map:%s:content", mapName)
+	exists, err := s.rdb.Exists(ctx, mapKey).Result()
+	if err != nil {
+		return err
+	}
+	if exists == 0 {
+		return nil
+	}
+	consumers, err := rmap.Join(ctx, mapName, s.rdb, consumersMapOptions(s, s.rootLogger)...)
+	if err != nil {
+		return err
+	}
+	defer consumers.Close()
+	return consumers.Destroy(ctx)
 }
 
 // redisKeyRegex is a regular expression that matches valid Redis keys.

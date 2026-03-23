@@ -1,3 +1,5 @@
+// Package rmap maintains a Redis-backed replicated map whose local state is
+// ordered by monotonic revisions and updated through pubsub notifications.
 package rmap
 
 import (
@@ -56,29 +58,39 @@ type (
 		closed  bool // true if Close returned - used by tests
 
 		wlock   sync.Mutex
-		waiters sync.Map // map of key to []*setWaiter
+		waiters map[uint64][]*setWaiter // keyed by committed revision
 	}
 
 	// EventKind is the type of map event.
 	EventKind int
 
-	// setNotification is the type of internal notification sent when a key is set.
-	setNotification struct {
-		key   string
-		value string
+	// mapChange captures the event kind and revision applied to the local replica.
+	mapChange struct {
+		kind EventKind
+		rev  uint64
 	}
 
-	// setWaiter represents a waiting SetAndWait operation
+	// setResult is the previous value and committed revision returned by Set.
+	setResult struct {
+		prev    string
+		existed bool
+		rev     uint64
+	}
+
+	// setWaiter tracks a SetAndWait call until the local replica observes at
+	// least the committed revision returned by the write.
 	setWaiter struct {
-		ch     chan setNotification
-		key    string
-		value  string
+		ch     chan struct{}
+		rev    uint64
 		ctx    context.Context // context for cancellation
 		cancel func()          // cleanup function
 	}
 )
 
-const revField = "=rev"
+const (
+	revField  = "=rev"
+	kindField = "=kind"
+)
 
 const (
 	// EventChange is the event emitted when a key is added or changed.
@@ -130,6 +142,7 @@ func Join(ctx context.Context, name string, rdb *redis.Client, opts ...MapOption
 		logger:               o.Logger.WithPrefix("map", name),
 		rdb:                  rdb,
 		content:              make(map[string]string),
+		waiters:              make(map[uint64][]*setWaiter),
 		setScript:            luaSet,
 		testAndSetScript:     luaTestAndSet,
 		setIfNotExistsScript: luaSetIfNotExists,
@@ -249,33 +262,27 @@ func (sm *Map) GetValues(key string) ([]string, bool) {
 // Set(ctx, "color", "blue") would set the "color" key to "blue"
 // and return the previous value, if any.
 func (sm *Map) Set(ctx context.Context, key, value string) (string, error) {
-	prev, err := sm.runLuaScript(ctx, "set", sm.setScript, key, value)
+	res, err := sm.runSetScript(ctx, key, value)
 	if err != nil {
 		return "", err
 	}
-	if prev == nil {
-		return "", nil
-	}
-	return prev.(string), nil
+	return res.prev, nil
 }
 
 // SetEx sets the value for the given key and returns the previous value along
 // with a flag indicating whether the key previously existed.
 func (sm *Map) SetEx(ctx context.Context, key, value string) (string, bool, error) {
-	prev, err := sm.runLuaScript(ctx, "set", sm.setScript, key, value)
+	res, err := sm.runSetScript(ctx, key, value)
 	if err != nil {
 		return "", false, err
 	}
-	if prev == nil {
-		return "", false, nil
-	}
-	return prev.(string), true, nil
+	return res.prev, res.existed, nil
 }
 
-// SetAndWait is a convenience method that calls Set and waits for the update to be
-// applied and the notification to be sent. Multiple concurrent calls with the same
-// key and value are allowed - each call will receive its own notification when the
-// update is applied.
+// SetAndWait is a convenience method that calls Set and waits until the local
+// replica has observed the committed revision. Multiple concurrent calls with
+// the same key and value are allowed because each waiter is tied to its own
+// committed write rather than the final key/value pair.
 //
 // The method will return an error if:
 // - The key is empty
@@ -284,56 +291,25 @@ func (sm *Map) SetEx(ctx context.Context, key, value string) (string, bool, erro
 // - The map is stopped
 // - There's an issue with the Redis operation
 func (sm *Map) SetAndWait(ctx context.Context, key, value string) (string, error) {
-	notifyCh := make(chan setNotification, 1)
+	res, err := sm.runSetScript(ctx, key, value)
+	if err != nil {
+		return "", err
+	}
 
-	// Create cancellable context for cleanup
+	notifyCh := make(chan struct{}, 1)
 	waitCtx, cancel := context.WithCancel(ctx)
 	waiter := &setWaiter{
 		ch:     notifyCh,
-		key:    key,
-		value:  value,
+		rev:    res.rev,
 		ctx:    waitCtx,
 		cancel: cancel,
 	}
-
 	defer func() {
-		// Cancel first so notifiers prefer to drop any late sends.
 		cancel()
-
-		// Remove waiter under lock
-		sm.wlock.Lock()
-		if v, ok := sm.waiters.Load(key); ok {
-			waiters := v.([]*setWaiter)
-			newWaiters := make([]*setWaiter, 0, len(waiters))
-			for _, w := range waiters {
-				if w != waiter {
-					newWaiters = append(newWaiters, w)
-				}
-			}
-			if len(newWaiters) > 0 {
-				sm.waiters.Store(key, newWaiters)
-			} else {
-				sm.waiters.Delete(key)
-			}
-		}
-		sm.wlock.Unlock()
+		sm.removeWaiter(waiter)
 	}()
-
-	// Prepare new waiters list under lock
-	sm.wlock.Lock()
-	if v, ok := sm.waiters.Load(key); ok {
-		waiters := v.([]*setWaiter)
-		newWaiters := append(append([]*setWaiter(nil), waiters...), waiter) // Note: need to copy to avoid data race
-		sm.waiters.Store(key, newWaiters)
-	} else {
-		sm.waiters.Store(key, []*setWaiter{waiter})
-	}
-	sm.wlock.Unlock()
-
-	// Call Set - if it fails, the deferred cleanup will remove our waiter
-	prev, err := sm.Set(ctx, key, value)
-	if err != nil {
-		return "", err
+	if sm.registerWaiter(waiter) {
+		return res.prev, nil
 	}
 
 	// Wait for notification or context cancellation
@@ -342,12 +318,8 @@ func (sm *Map) SetAndWait(ctx context.Context, key, value string) (string, error
 		return "", ctx.Err()
 	case <-sm.done:
 		return "", fmt.Errorf("pulse map: %s is stopped", sm.Name)
-	case ev := <-notifyCh:
-		if ev.key == key && ev.value == value {
-			return prev, nil
-		}
-		// This shouldn't happen as we only send matching notifications
-		return "", fmt.Errorf("pulse map: received unexpected notification key=%s value=%s", ev.key, ev.value)
+	case <-notifyCh:
+		return res.prev, nil
 	}
 }
 
@@ -586,14 +558,15 @@ func (sm *Map) TestAndDeleteEx(ctx context.Context, key, test string) (prev stri
 	return prev, existed, deleted, nil
 }
 
-// Reset clears the map content. Reset is the only method that can be called
-// after the map is closed.
+// Reset clears the map content. Reset remains available after Close because it
+// mutates Redis state even though the local replica is already frozen.
 func (sm *Map) Reset(ctx context.Context) error {
 	_, err := sm.runLuaScript(ctx, "reset", sm.resetScript, "*")
 	return err
 }
 
-// Destroy deletes the map content from Redis and notifies subscribers.
+// Destroy clears the map content from Redis and notifies subscribers while
+// preserving the internal revision ordering used by live replicas.
 func (sm *Map) Destroy(ctx context.Context) error {
 	_, err := sm.runLuaScript(ctx, "destroy", sm.destroyScript, "*")
 	return err
@@ -659,13 +632,12 @@ func (sm *Map) Close() {
 
 	// Clean up all waiters
 	sm.wlock.Lock()
-	sm.waiters.Range(func(key, value interface{}) bool {
-		waiters := value.([]*setWaiter)
+	for rev, waiters := range sm.waiters {
 		for _, w := range waiters {
 			w.cancel()
 		}
-		return true
-	})
+		delete(sm.waiters, rev)
+	}
 	sm.wlock.Unlock()
 	sm.lock.Lock()
 	sm.closed = true
@@ -715,7 +687,7 @@ func (sm *Map) init(ctx context.Context) error {
 		return fmt.Errorf("pulse map: %s failed to read initial content: %w", sm.Name, err)
 	}
 	sm.content = cmd.Val()
-	sm.rev = extractRevision(sm.content)
+	sm.rev, _ = extractState(sm.content)
 
 	return nil
 }
@@ -740,100 +712,18 @@ func (sm *Map) run() {
 			}
 			op, data := parts[0], []byte(parts[1])
 			sm.lock.Lock()
-			kind := EventChange
-			var notification *setNotification
-			switch op {
-			case "reset":
-				if rev, ok := parseRevisionString(string(data)); ok && rev <= sm.rev {
-					sm.lock.Unlock()
-					continue
-				} else if ok {
-					sm.rev = rev
-				}
-				sm.content = make(map[string]string)
-				sm.logger.Debug("reset")
-				kind = EventReset
-			case "del":
-				key, rest, err := unpackString(data)
-				if err != nil {
-					sm.logger.Error(fmt.Errorf("invalid del payload"), "payload", msg.Payload, "error", err)
-					sm.lock.Unlock()
-					continue
-				}
-				if key == revField {
-					sm.lock.Unlock()
-					continue
-				}
-				if rev, ok := unpackRevision(rest); ok {
-					if rev <= sm.rev {
-						sm.lock.Unlock()
-						continue
-					}
-					sm.rev = rev
-				}
-				delete(sm.content, key)
-				sm.logger.Debug("deleted", "key", key)
-				kind = EventDelete
-			case "set":
-				key, rest, err := unpackString(data)
-				if err != nil {
-					sm.logger.Error(fmt.Errorf("invalid set key"), "payload", msg.Payload, "error", err)
-					sm.lock.Unlock()
-					continue
-				}
-				if key == revField {
-					sm.lock.Unlock()
-					continue
-				}
-				val, rest, err := unpackString(rest)
-				if err != nil {
-					sm.logger.Error(fmt.Errorf("invalid set value"), "payload", msg.Payload, "error", err)
-					sm.lock.Unlock()
-					continue
-				}
-				if rev, ok := unpackRevision(rest); ok {
-					if rev <= sm.rev {
-						sm.lock.Unlock()
-						continue
-					}
-					sm.rev = rev
-				}
-				sm.content[key] = val
-				notification = &setNotification{key: key, value: val}
-				sm.logger.Debug("set", "key", key, "val", val)
+			change, applied, err := sm.applyMessageLocked(op, data)
+			if err != nil {
+				sm.logger.Error(err, "payload", msg.Payload)
+				sm.lock.Unlock()
+				continue
 			}
-
-			for _, c := range sm.chans {
-				select {
-				case c <- kind:
-				default:
-				}
+			if applied {
+				sm.notifySubscribers(change.kind)
 			}
 			sm.lock.Unlock()
-
-			// For set operations, notify waiters after releasing lock
-			if notification != nil {
-				// Load waiters for this key
-				if w, ok := sm.waiters.Load(notification.key); ok {
-					// Take lock only while reading waiters list
-					sm.wlock.Lock()
-					waiters := w.([]*setWaiter)
-					sm.wlock.Unlock()
-
-					// Notify matching waiters - no lock needed as each waiter has its own channel
-					for _, waiter := range waiters {
-						if waiter.key == notification.key && waiter.value == notification.value {
-							select {
-							case waiter.ch <- *notification:
-							case <-waiter.ctx.Done():
-								// Waiter was cancelled or timed out
-								continue
-							default:
-								// Non-blocking to avoid stalling the map loop if the waiter is no longer receiving.
-							}
-						}
-					}
-				}
+			if applied {
+				sm.notifyWaitersUpTo(change.rev)
 			}
 
 		case <-sm.done:
@@ -857,8 +747,9 @@ func (sm *Map) run() {
 	}
 }
 
-// runLuaScript runs the given Lua script, the first argument must be the key.
-// It is the caller's responsibility to make sure the map is locked.
+// runLuaScript validates the user key and executes the given Lua script. Reset
+// and Destroy remain available after Close because they mutate Redis state even
+// when the local replica is already frozen.
 func (sm *Map) runLuaScript(ctx context.Context, name string, script *redis.Script, args ...any) (any, error) {
 	sm.lock.RLock()
 	if sm.closing && name != "reset" && name != "destroy" {
@@ -961,8 +852,13 @@ func (sm *Map) reconnect() {
 		// while reading the snapshot under the same lock so readers never observe
 		// intermediate state regressions. Revisioned messages at or below the
 		// snapshot revision are ignored.
+		oldRev := sm.rev
 		sm.content = cmd.Val()
-		sm.rev = extractRevision(sm.content)
+		recoveredKind := EventChange
+		sm.rev, recoveredKind = extractState(sm.content)
+		if sm.rev <= oldRev {
+			recoveredKind = EventChange
+		}
 		drainErr := false
 		for {
 			select {
@@ -977,54 +873,13 @@ func (sm *Map) reconnect() {
 					continue
 				}
 				op, data := parts[0], []byte(parts[1])
-				switch op {
-				case "reset":
-					if rev, ok := parseRevisionString(string(data)); ok && rev <= sm.rev {
-						continue
-					} else if ok {
-						sm.rev = rev
-					}
-					sm.content = make(map[string]string)
-					sm.logger.Debug("reset")
-				case "del":
-					key, rest, err := unpackString(data)
-					if err != nil {
-						sm.logger.Error(fmt.Errorf("invalid del payload"), "payload", msg.Payload, "error", err)
-						continue
-					}
-					if key == revField {
-						continue
-					}
-					if rev, ok := unpackRevision(rest); ok {
-						if rev <= sm.rev {
-							continue
-						}
-						sm.rev = rev
-					}
-					delete(sm.content, key)
-					sm.logger.Debug("deleted", "key", key)
-				case "set":
-					key, rest, err := unpackString(data)
-					if err != nil {
-						sm.logger.Error(fmt.Errorf("invalid set key"), "payload", msg.Payload, "error", err)
-						continue
-					}
-					if key == revField {
-						continue
-					}
-					val, rest, err := unpackString(rest)
-					if err != nil {
-						sm.logger.Error(fmt.Errorf("invalid set value"), "payload", msg.Payload, "error", err)
-						continue
-					}
-					if rev, ok := unpackRevision(rest); ok {
-						if rev <= sm.rev {
-							continue
-						}
-						sm.rev = rev
-					}
-					sm.content[key] = val
-					sm.logger.Debug("set", "key", key, "val", val)
+				change, applied, err := sm.applyMessageLocked(op, data)
+				if err != nil {
+					sm.logger.Error(err, "payload", msg.Payload)
+					continue
+				}
+				if applied {
+					recoveredKind = strongerEventKind(recoveredKind, change.kind)
 				}
 			default:
 				goto drained
@@ -1049,51 +904,17 @@ func (sm *Map) reconnect() {
 		oldSub := sm.sub
 		sm.sub = sub
 		sm.msgch = msgch
-		for _, c := range sm.chans {
-			select {
-			case c <- EventChange:
-			default:
-			}
-		}
+		sm.notifySubscribers(recoveredKind)
 		sm.lock.Unlock()
 		if oldSub != nil {
 			_ = oldSub.Close()
 		}
 
-		sm.satisfyWaiters()
+		sm.notifyWaitersUpTo(sm.rev)
 
 		sm.logger.Info("reconnected")
 		return
 	}
-}
-
-func (sm *Map) satisfyWaiters() {
-	sm.waiters.Range(func(key, value any) bool {
-		k, ok := key.(string)
-		if !ok {
-			return true
-		}
-		sm.lock.RLock()
-		v, ok := sm.content[k]
-		sm.lock.RUnlock()
-		if !ok {
-			return true
-		}
-		waiters, ok := value.([]*setWaiter)
-		if !ok {
-			return true
-		}
-		for _, waiter := range waiters {
-			if waiter.key == k && waiter.value == v {
-				select {
-				case waiter.ch <- setNotification{key: k, value: v}:
-				case <-waiter.ctx.Done():
-				default:
-				}
-			}
-		}
-		return true
-	})
 }
 
 // redisKeyRegex is a regular expression that matches valid Redis keys.
@@ -1136,23 +957,28 @@ func parseRevisionString(s string) (uint64, bool) {
 	return rev, true
 }
 
-func extractRevision(content map[string]string) uint64 {
+func extractState(content map[string]string) (uint64, EventKind) {
 	if content == nil {
-		return 0
+		return 0, EventChange
+	}
+	kind := EventChange
+	if s, ok := content[kindField]; ok {
+		kind = parseStoredKind(s)
+		delete(content, kindField)
 	}
 	s, ok := content[revField]
 	if !ok {
-		return 0
+		return 0, kind
 	}
 	delete(content, revField)
 	if s == "" {
-		return 0
+		return 0, kind
 	}
 	rev, ok := parseRevisionString(s)
 	if !ok {
-		return 0
+		return 0, kind
 	}
-	return rev
+	return rev, kind
 }
 
 func unpackRevision(data []byte) (uint64, bool) {
@@ -1164,4 +990,209 @@ func unpackRevision(data []byte) (uint64, bool) {
 		return 0, false
 	}
 	return parseRevisionString(s)
+}
+
+// runSetScript executes the Set Lua script and returns the previous value plus
+// the committed revision observed by Redis.
+func (sm *Map) runSetScript(ctx context.Context, key, value string) (setResult, error) {
+	raw, err := sm.runLuaScript(ctx, "set", sm.setScript, key, value)
+	if err != nil {
+		return setResult{}, err
+	}
+	values, ok := raw.([]any)
+	if !ok || len(values) != 3 {
+		return setResult{}, fmt.Errorf("pulse map: %s returned invalid set result %T", sm.Name, raw)
+	}
+	existed, ok := values[0].(int64)
+	if !ok {
+		return setResult{}, fmt.Errorf("pulse map: %s returned invalid set existence flag %T", sm.Name, values[0])
+	}
+	prev, ok := values[1].(string)
+	if !ok {
+		return setResult{}, fmt.Errorf("pulse map: %s returned invalid set previous value %T", sm.Name, values[1])
+	}
+	revString, ok := values[2].(string)
+	if !ok {
+		return setResult{}, fmt.Errorf("pulse map: %s returned invalid set revision %T", sm.Name, values[2])
+	}
+	rev, ok := parseRevisionString(revString)
+	if !ok {
+		return setResult{}, fmt.Errorf("pulse map: %s returned invalid set revision %q", sm.Name, revString)
+	}
+	return setResult{prev: prev, existed: existed == 1, rev: rev}, nil
+}
+
+// registerWaiter installs a waiter unless the local replica has already caught
+// up to the committed revision it targets.
+func (sm *Map) registerWaiter(waiter *setWaiter) bool {
+	sm.wlock.Lock()
+	defer sm.wlock.Unlock()
+	sm.lock.RLock()
+	defer sm.lock.RUnlock()
+	if sm.rev >= waiter.rev {
+		return true
+	}
+	sm.waiters[waiter.rev] = append(sm.waiters[waiter.rev], waiter)
+	return false
+}
+
+// removeWaiter unregisters a waiter after SetAndWait returns or is canceled.
+func (sm *Map) removeWaiter(waiter *setWaiter) {
+	sm.wlock.Lock()
+	defer sm.wlock.Unlock()
+	waiters, ok := sm.waiters[waiter.rev]
+	if !ok {
+		return
+	}
+	filtered := waiters[:0]
+	for _, current := range waiters {
+		if current != waiter {
+			filtered = append(filtered, current)
+		}
+	}
+	if len(filtered) == 0 {
+		delete(sm.waiters, waiter.rev)
+		return
+	}
+	sm.waiters[waiter.rev] = filtered
+}
+
+// notifyWaitersUpTo releases every waiter whose committed revision is now
+// visible in the local replica.
+func (sm *Map) notifyWaitersUpTo(rev uint64) {
+	sm.wlock.Lock()
+	var ready []*setWaiter
+	for waiterRev, waiters := range sm.waiters {
+		if waiterRev > rev {
+			continue
+		}
+		ready = append(ready, waiters...)
+		delete(sm.waiters, waiterRev)
+	}
+	sm.wlock.Unlock()
+	for _, waiter := range ready {
+		select {
+		case waiter.ch <- struct{}{}:
+		case <-waiter.ctx.Done():
+		default:
+		}
+	}
+}
+
+// notifySubscribers sends a best-effort notification to every subscriber while
+// the map lock is held, so the subscriber list stays stable during iteration.
+func (sm *Map) notifySubscribers(kind EventKind) {
+	for _, c := range sm.chans {
+		select {
+		case c <- kind:
+		default:
+		}
+	}
+}
+
+// applyMessageLocked applies one pubsub message to the local replica. The map
+// lock must be held and the returned revision is the highest revision observed
+// after the update is applied.
+func (sm *Map) applyMessageLocked(op string, data []byte) (mapChange, bool, error) {
+	switch op {
+	case "destroy":
+		rev, ok := parseRevisionString(string(data))
+		if !ok {
+			return mapChange{}, false, fmt.Errorf("invalid destroy payload")
+		}
+		if rev <= sm.rev {
+			return mapChange{}, false, nil
+		}
+		sm.rev = rev
+		sm.content = make(map[string]string)
+		sm.logger.Debug("destroy")
+		return mapChange{kind: EventReset, rev: rev}, true, nil
+	case "reset":
+		rev, ok := parseRevisionString(string(data))
+		if !ok {
+			return mapChange{}, false, fmt.Errorf("invalid reset payload")
+		}
+		if rev <= sm.rev {
+			return mapChange{}, false, nil
+		}
+		sm.rev = rev
+		sm.content = make(map[string]string)
+		sm.logger.Debug("reset")
+		return mapChange{kind: EventReset, rev: rev}, true, nil
+	case "del":
+		key, rest, err := unpackString(data)
+		if err != nil {
+			return mapChange{}, false, fmt.Errorf("invalid del payload: %w", err)
+		}
+		if key == revField || key == kindField {
+			return mapChange{}, false, nil
+		}
+		rev, ok := unpackRevision(rest)
+		if !ok {
+			return mapChange{}, false, fmt.Errorf("invalid del revision")
+		}
+		if rev <= sm.rev {
+			return mapChange{}, false, nil
+		}
+		sm.rev = rev
+		delete(sm.content, key)
+		sm.logger.Debug("deleted", "key", key)
+		return mapChange{kind: EventDelete, rev: rev}, true, nil
+	case "set":
+		key, rest, err := unpackString(data)
+		if err != nil {
+			return mapChange{}, false, fmt.Errorf("invalid set key: %w", err)
+		}
+		if key == revField || key == kindField {
+			return mapChange{}, false, nil
+		}
+		val, rest, err := unpackString(rest)
+		if err != nil {
+			return mapChange{}, false, fmt.Errorf("invalid set value: %w", err)
+		}
+		rev, ok := unpackRevision(rest)
+		if !ok {
+			return mapChange{}, false, fmt.Errorf("invalid set revision")
+		}
+		if rev <= sm.rev {
+			return mapChange{}, false, nil
+		}
+		sm.rev = rev
+		sm.content[key] = val
+		sm.logger.Debug("set", "key", key, "val", val)
+		return mapChange{kind: EventChange, rev: rev}, true, nil
+	default:
+		return mapChange{}, false, fmt.Errorf("invalid payload")
+	}
+}
+
+func parseStoredKind(kind string) EventKind {
+	switch kind {
+	case "del":
+		return EventDelete
+	case "destroy", "reset":
+		return EventReset
+	default:
+		return EventChange
+	}
+}
+
+func strongerEventKind(current, next EventKind) EventKind {
+	if eventPriority(next) > eventPriority(current) {
+		return next
+	}
+	return current
+}
+
+func eventPriority(kind EventKind) int {
+	switch kind {
+	case EventReset:
+		return 3
+	case EventDelete:
+		return 2
+	case EventChange:
+		return 1
+	default:
+		return 0
+	}
 }

@@ -64,6 +64,11 @@ func CleanupRedis(t *testing.T, rdb *redis.Client, checkClean bool, testName str
 					// Sinks content is cleaned up asynchronously, so ignore it
 					continue
 				}
+				if isDestroyTombstone(ctx, rdb, k) {
+					// Destroy tombstones are intentional rmap protocol state used so
+					// reconnecting replicas can order the next generation correctly.
+					continue
+				}
 				if streamRegexp.MatchString(k) {
 					// Node streams are cleaned up asynchronously, so ignore them
 					continue
@@ -77,4 +82,22 @@ func CleanupRedis(t *testing.T, rdb *redis.Client, checkClean bool, testName str
 		require.NoError(t, keysErr)
 	}
 	assert.NoError(t, rdb.FlushDB(ctx).Err())
+}
+
+func isDestroyTombstone(ctx context.Context, rdb *redis.Client, key string) bool {
+	if !strings.HasPrefix(key, "map:") || !strings.HasSuffix(key, ":content") {
+		return false
+	}
+	content, err := rdb.HGetAll(ctx, key).Result()
+	if err != nil {
+		return false
+	}
+	if len(content) != 2 {
+		return false
+	}
+	if content["=kind"] != "destroy" {
+		return false
+	}
+	_, ok := content["=rev"]
+	return ok
 }
