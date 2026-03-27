@@ -15,7 +15,7 @@ require (
 	goa.design/clue v1.2.4
 	goa.design/goa/v3 v3.25.3
 	goa.design/model v1.14.2
-	google.golang.org/grpc v1.79.1
+	google.golang.org/grpc v1.79.3
 )
 
 require (
