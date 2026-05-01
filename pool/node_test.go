@@ -319,6 +319,142 @@ func TestDispatchJobRaceCondition(t *testing.T) {
 		assert.True(t, errors.Is(err, ErrJobExists), "Expected ErrJobExists, got: %v", err)
 	})
 
+	t.Run("claim rejects active pending job from redis", func(t *testing.T) {
+		jobKey := "active-redis-pending-job"
+		pendingHash := rmapContentKey(jobPendingMapName(testName))
+		pendingUntil := strconv.FormatInt(time.Now().Add(time.Hour).UnixNano(), 10)
+		require.NoError(t, rdb.HSet(ctx, pendingHash, jobKey, pendingUntil).Err())
+		_, localExists := node2.jobPendingMap.Get(jobKey)
+		require.False(t, localExists)
+
+		pendingTS, err := node2.claimDispatch(ctx, jobKey)
+		require.Empty(t, pendingTS)
+		require.True(t, errors.Is(err, ErrJobExists), "Expected ErrJobExists, got: %v", err)
+
+		stored, err := rdb.HGet(ctx, pendingHash, jobKey).Result()
+		require.NoError(t, err)
+		require.Equal(t, pendingUntil, stored)
+	})
+
+	t.Run("claim replaces stale pending job and publishes it", func(t *testing.T) {
+		jobKey := "stale-redis-pending-job"
+		pendingHash := rmapContentKey(jobPendingMapName(testName))
+		staleUntil := strconv.FormatInt(time.Now().Add(-time.Hour).UnixNano(), 10)
+		require.NoError(t, rdb.HSet(ctx, pendingHash, jobKey, staleUntil).Err())
+
+		pendingTS, err := node2.claimDispatch(ctx, jobKey)
+		require.NoError(t, err)
+		require.NotEmpty(t, pendingTS)
+
+		stored, err := rdb.HGet(ctx, pendingHash, jobKey).Result()
+		require.NoError(t, err)
+		require.Equal(t, pendingTS, stored)
+		require.Eventually(t, func() bool {
+			local, exists := node2.jobPendingMap.Get(jobKey)
+			return exists && local == pendingTS
+		}, max, delay)
+		node2.releaseDispatchPending(jobKey, pendingTS)
+	})
+
+	t.Run("claim rejects malformed pending job", func(t *testing.T) {
+		jobKey := "malformed-redis-pending-job"
+		pendingHash := rmapContentKey(jobPendingMapName(testName))
+		const malformedPending = "not-a-timestamp"
+		require.NoError(t, rdb.HSet(ctx, pendingHash, jobKey, malformedPending).Err())
+
+		pendingTS, err := node2.claimDispatch(ctx, jobKey)
+		require.Empty(t, pendingTS)
+		require.Error(t, err)
+		require.False(t, errors.Is(err, ErrJobExists))
+
+		stored, err := rdb.HGet(ctx, pendingHash, jobKey).Result()
+		require.NoError(t, err)
+		require.Equal(t, malformedPending, stored)
+	})
+
+	t.Run("release only removes owned pending guard", func(t *testing.T) {
+		jobKey := "owned-pending-release-job"
+		pendingHash := rmapContentKey(jobPendingMapName(testName))
+		pendingTS, err := node2.claimDispatch(ctx, jobKey)
+		require.NoError(t, err)
+		require.NotEmpty(t, pendingTS)
+		require.Eventually(t, func() bool {
+			local, exists := node2.jobPendingMap.Get(jobKey)
+			return exists && local == pendingTS
+		}, max, delay)
+
+		node2.releaseDispatchPending(jobKey, "not-"+pendingTS)
+		stored, err := rdb.HGet(ctx, pendingHash, jobKey).Result()
+		require.NoError(t, err)
+		require.Equal(t, pendingTS, stored)
+
+		node2.releaseDispatchPending(jobKey, pendingTS)
+		pendingExists, err := rdb.HExists(ctx, pendingHash, jobKey).Result()
+		require.NoError(t, err)
+		require.False(t, pendingExists)
+		require.Eventually(t, func() bool {
+			_, exists := node2.jobPendingMap.Get(jobKey)
+			return !exists
+		}, max, delay)
+	})
+
+	t.Run("concurrent atomic claims admit one dispatcher", func(t *testing.T) {
+		jobKey := "concurrent-claim-job"
+		errCh := make(chan error, 20)
+		pendingCh := make(chan string, 20)
+		var wg sync.WaitGroup
+		for i := 0; i < 20; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				pendingTS, err := node2.claimDispatch(ctx, jobKey)
+				if err == nil {
+					pendingCh <- pendingTS
+				}
+				errCh <- err
+			}()
+		}
+		wg.Wait()
+		close(errCh)
+		close(pendingCh)
+
+		successCount := 0
+		errorCount := 0
+		for err := range errCh {
+			if err == nil {
+				successCount++
+				continue
+			}
+			if errors.Is(err, ErrJobExists) {
+				errorCount++
+				continue
+			}
+			t.Errorf("unexpected error: %v", err)
+		}
+		require.Equal(t, 1, successCount)
+		require.Equal(t, 19, errorCount)
+		node2.releaseDispatchPending(jobKey, <-pendingCh)
+	})
+
+	t.Run("dispatch checks redis when local payload replica is stale", func(t *testing.T) {
+		jobKey := "stale-local-payload-job"
+		payload := []byte("test payload")
+		payloadHash := rmapContentKey(jobPayloadMapName(testName))
+		pendingHash := rmapContentKey(jobPendingMapName(testName))
+
+		// Simulate the production race: Redis already has the live job payload,
+		// but this node's local rmap replica has not applied that update yet.
+		require.NoError(t, rdb.HSet(ctx, payloadHash, jobKey, string(payload)).Err())
+		_, localExists := node2.jobPayloadMap.Get(jobKey)
+		require.False(t, localExists)
+
+		err := node2.DispatchJob(ctx, jobKey, []byte("new payload"))
+		assert.True(t, errors.Is(err, ErrJobExists), "Expected ErrJobExists, got: %v", err)
+		pendingExists, err := rdb.HExists(ctx, pendingHash, jobKey).Result()
+		require.NoError(t, err)
+		require.False(t, pendingExists)
+	})
+
 	t.Run("dispatch after pending job times out succeeds", func(t *testing.T) {
 		jobKey := "timeout-job"
 		payload := []byte("test payload")
@@ -352,7 +488,7 @@ func TestDispatchJobRaceCondition(t *testing.T) {
 		}, max, delay, "Pending entry should be cleaned up after successful dispatch")
 	})
 
-	t.Run("dispatch with invalid pending timestamp", func(t *testing.T) {
+	t.Run("dispatch rejects invalid pending timestamp", func(t *testing.T) {
 		jobKey := "invalid-timestamp-job"
 		payload := []byte("test payload")
 
@@ -360,9 +496,13 @@ func TestDispatchJobRaceCondition(t *testing.T) {
 		_, err := node1.jobPendingMap.SetAndWait(ctx, jobKey, "invalid-timestamp")
 		require.NoError(t, err, "Failed to set invalid pending timestamp")
 
-		// Dispatch should succeed (invalid timestamps are logged and ignored)
 		err = node1.DispatchJob(ctx, jobKey, payload)
-		assert.NoError(t, err, "Dispatch should succeed with invalid pending timestamp")
+		require.Error(t, err)
+		require.False(t, errors.Is(err, ErrJobExists))
+		require.Contains(t, err.Error(), "malformed pending guard")
+		stored, err := rdb.HGet(ctx, rmapContentKey(jobPendingMapName(testName)), jobKey).Result()
+		require.NoError(t, err)
+		require.Equal(t, "invalid-timestamp", stored)
 	})
 
 	// Keep this test last, it destroys the stream
