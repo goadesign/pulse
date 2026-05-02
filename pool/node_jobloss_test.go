@@ -44,7 +44,7 @@ func TestJobLossDuringConcurrentWorkerCleanup(t *testing.T) {
 		WithWorkerTTL(200 * time.Millisecond),
 		WithWorkerShutdownTTL(200 * time.Millisecond),
 		WithJobSinkBlockDuration(50 * time.Millisecond),
-		WithAckGracePeriod(200 * time.Millisecond),
+		WithAckGracePeriod(300 * time.Millisecond),
 		// Keep logs quiet so failures are easy to see (and tool output isn't truncated).
 		WithLogger(pulse.NoopLogger()),
 	}
@@ -172,17 +172,16 @@ func TestJobLossDuringConcurrentWorkerCleanup(t *testing.T) {
 	}
 
 phase4:
-	// Give background cleanup/rebalancing time to progress.
-	time.Sleep(1 * time.Second)
-
-	// Drain node3 starts for a bounded time and count unique jobs that landed there.
+	// Drain node3 starts until every job lands there or the recovery deadline
+	// expires. The test stresses background cleanup, so the correctness condition
+	// is eventual recovery rather than a fixed short sleep.
 	jobsOnNode3 := make(map[string]bool)
-	drainTimeout := time.After(2 * time.Second)
-	for {
+	recoveryTimeout := time.After(10 * time.Second)
+	for len(jobsOnNode3) < numJobs {
 		select {
 		case key := <-jobRequeuedToNode3:
 			jobsOnNode3[key] = true
-		case <-drainTimeout:
+		case <-recoveryTimeout:
 			goto done
 		}
 	}

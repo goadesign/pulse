@@ -9,6 +9,7 @@ import (
 	"io"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -352,61 +353,23 @@ func (node *Node) PoolWorkers() []*Worker {
 // The method blocks until one of the above conditions is met.
 func (node *Node) DispatchJob(ctx context.Context, key string, payload []byte) error {
 	job := marshalJob(&Job{Key: key, Payload: payload, CreatedAt: time.Now(), NodeID: node.ID})
-	return node.dispatchJob(ctx, key, job, false)
+	return node.dispatchJob(ctx, key, job)
 }
 
-func (node *Node) dispatchJob(ctx context.Context, key string, job []byte, requeue bool) error {
-	// Allow internal requeue operations to proceed while the node is closing.
-	// External callers use DispatchJob which passes requeue=false and should be
-	// rejected once Close begins.
-	if node.IsClosed() && !requeue {
+func (node *Node) dispatchJob(ctx context.Context, key string, job []byte) error {
+	if node.IsClosed() {
 		return fmt.Errorf("DispatchJob: pool %q is closed", node.PoolName)
 	}
 
-	if !requeue {
-		// Check if job already exists in job payloads map
-		if _, exists := node.jobPayloadMap.Get(key); exists {
-			node.logger.Info("DispatchJob: job already exists", "key", key)
-			return fmt.Errorf("%w: job %q", ErrJobExists, key)
-		}
-	}
-
-	// Check if there's a pending dispatch for this job
-	pendingTS, exists := node.jobPendingMap.Get(key)
-	if exists {
-		if node.isWithinTTL(pendingTS, 0) {
-			node.logger.Info("DispatchJob: job already dispatched", "key", key)
-			return fmt.Errorf("%w: job %q is already dispatched", ErrJobExists, key)
-		}
-	}
-
-	// Set pending timestamp using atomic operation
-	pendingUntil := time.Now().Add(2 * node.ackGracePeriod).UnixNano()
-	newTS := strconv.FormatInt(pendingUntil, 10)
-	if exists {
-		current, err := node.jobPendingMap.TestAndSet(ctx, key, pendingTS, newTS)
-		if err != nil {
-			return fmt.Errorf("DispatchJob: failed to set pending timestamp for job %q: %w", key, err)
-		}
-		if current != pendingTS {
-			return fmt.Errorf("%w: job %q is already being dispatched", ErrJobExists, key)
-		}
-	} else {
-		ok, err := node.jobPendingMap.SetIfNotExists(ctx, key, newTS)
-		if err != nil {
-			return fmt.Errorf("DispatchJob: failed to set initial pending timestamp for job %q: %w", key, err)
-		}
-		if !ok {
-			return fmt.Errorf("%w: job %q is already being dispatched", ErrJobExists, key)
-		}
+	pendingTS, err := node.claimDispatch(ctx, key)
+	if err != nil {
+		return err
 	}
 
 	eventID, err := node.poolStream.Add(ctx, evStartJob, job)
 	if err != nil {
 		// Clean up pending entry on failure
-		if _, err := node.jobPendingMap.Delete(ctx, key); err != nil {
-			node.logger.Error(fmt.Errorf("DispatchJob: failed to clean up pending entry for job %q: %w", key, err))
-		}
+		node.releaseDispatchPending(key, pendingTS)
 		return fmt.Errorf("DispatchJob: failed to add job to stream %q: %w", node.poolStream.Name, err)
 	}
 
@@ -428,9 +391,7 @@ func (node *Node) dispatchJob(ctx context.Context, key string, job []byte, reque
 	close(cherr)
 
 	// Clean up pending entry
-	if _, err := node.jobPendingMap.Delete(ctx, key); err != nil {
-		node.logger.Error(fmt.Errorf("DispatchJob: failed to clean up pending entry for job %q: %w", key, err))
-	}
+	node.releaseDispatchPending(key, pendingTS)
 
 	if err != nil {
 		node.logger.Error(fmt.Errorf("DispatchJob: failed to dispatch job: %w", err), "key", key)
@@ -439,6 +400,78 @@ func (node *Node) dispatchJob(ctx context.Context, key string, job []byte, reque
 
 	node.logger.Info("dispatched", "key", key)
 	return nil
+}
+
+// claimDispatch atomically decides whether a job key may be dispatched. Redis is
+// the source of truth for both states that matter to singleton admission: a
+// durable payload means the job is already running, and a pending guard means a
+// worker is currently starting it.
+func (node *Node) claimDispatch(ctx context.Context, key string) (string, error) {
+	if key == "" {
+		return "", fmt.Errorf("DispatchJob: job key cannot be empty")
+	}
+	if strings.Contains(key, "=") {
+		return "", fmt.Errorf("DispatchJob: job key %q cannot contain '='", key)
+	}
+	now := time.Now()
+	pendingUntil := strconv.FormatInt(now.Add(2*node.ackGracePeriod).UnixNano(), 10)
+	raw, err := luaClaimDispatch.Run(ctx, node.rdb, []string{
+		rmapContentKey(jobPayloadMapName(node.PoolName)),
+		rmapContentKey(jobPendingMapName(node.PoolName)),
+		rmapUpdateChannel(jobPendingMapName(node.PoolName)),
+	}, key, strconv.FormatInt(now.UnixNano(), 10), pendingUntil).Result()
+	if err != nil {
+		return "", fmt.Errorf("DispatchJob: failed to claim job %q: %w", key, err)
+	}
+	status, value, err := parseDispatchClaim(raw)
+	if err != nil {
+		return "", fmt.Errorf("DispatchJob: failed to parse claim result for job %q: %w", key, err)
+	}
+	switch status {
+	case dispatchClaimed:
+		return value, nil
+	case dispatchAlreadyPending:
+		node.logger.Info("DispatchJob: job already dispatched", "key", key)
+		return "", fmt.Errorf("%w: job %q is already dispatched", ErrJobExists, key)
+	case dispatchAlreadyRunning:
+		node.logger.Info("DispatchJob: job already exists", "key", key)
+		return "", fmt.Errorf("%w: job %q", ErrJobExists, key)
+	case dispatchMalformedPending:
+		return "", fmt.Errorf("DispatchJob: malformed pending guard for job %q: %q", key, value)
+	default:
+		return "", fmt.Errorf("DispatchJob: unexpected claim status %d for job %q", status, key)
+	}
+}
+
+// releaseDispatchPending clears the pending guard only if this dispatch still
+// owns it. Dispatch callers can time out while another node later claims a
+// stale pending key, so unconditional deletion would erase a newer guard.
+func (node *Node) releaseDispatchPending(key, pendingTS string) {
+	if _, err := luaReleaseDispatch.Run(context.Background(), node.rdb, []string{
+		rmapContentKey(jobPendingMapName(node.PoolName)),
+		rmapUpdateChannel(jobPendingMapName(node.PoolName)),
+	}, key, pendingTS).Result(); err != nil {
+		node.logger.Error(fmt.Errorf("DispatchJob: failed to clean up pending entry for job %q: %w", key, err))
+	}
+}
+
+// parseDispatchClaim decodes the Lua admission result into its status code and
+// payload. The script owns the result schema so malformed data is a programming
+// error, not a recoverable distributed state.
+func parseDispatchClaim(raw any) (int64, string, error) {
+	values, ok := raw.([]any)
+	if !ok || len(values) != 2 {
+		return 0, "", fmt.Errorf("invalid claim result %T", raw)
+	}
+	status, ok := values[0].(int64)
+	if !ok {
+		return 0, "", fmt.Errorf("invalid claim status %T", values[0])
+	}
+	value, ok := values[1].(string)
+	if !ok {
+		return 0, "", fmt.Errorf("invalid claim value %T", values[1])
+	}
+	return status, value, nil
 }
 
 // StopJob stops the job with the given key.
@@ -1127,6 +1160,10 @@ func (node *Node) processInactiveJobs(ctx context.Context) {
 // An entry is considered stale if its timestamp has expired.
 func (node *Node) cleanupStalePendingJobs(ctx context.Context) {
 	for key, pendingTS := range node.jobPendingMap.Map() {
+		if _, err := strconv.ParseInt(pendingTS, 10, 64); err != nil {
+			node.logger.Error(fmt.Errorf("cleanupStalePendingJobs: malformed pending timestamp for job %q: %w", key, err))
+			continue
+		}
 		if node.isWithinTTL(pendingTS, 0) {
 			continue
 		}
@@ -1484,6 +1521,16 @@ func jobPendingMapName(poolName string) string {
 // job payloads by job key.
 func jobPayloadMapName(pool string) string {
 	return fmt.Sprintf("%s:job-payloads", pool)
+}
+
+// rmapContentKey returns the Redis hash key used by an rmap.
+func rmapContentKey(name string) string {
+	return fmt.Sprintf("map:%s:content", name)
+}
+
+// rmapUpdateChannel returns the Redis pubsub channel used by an rmap.
+func rmapUpdateChannel(name string) string {
+	return fmt.Sprintf("map:%s:updates", name)
 }
 
 // tickerMapName returns the name of the replicated map used to store ticker
