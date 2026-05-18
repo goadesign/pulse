@@ -30,6 +30,9 @@ func marshalJob(job *Job) []byte {
 	if err := binary.Write(&buf, binary.LittleEndian, job.CreatedAt.UnixNano()); err != nil {
 		panic(err)
 	}
+	if err := binary.Write(&buf, binary.LittleEndian, job.Requeued); err != nil {
+		panic(err)
+	}
 	return buf.Bytes()
 }
 
@@ -73,6 +76,7 @@ func unmarshalJob(data []byte) *Job {
 		Payload:   payload,
 		CreatedAt: time.Unix(0, createdAtTimestamp).UTC(),
 		NodeID:    nodeID,
+		Requeued:  unmarshalBool(reader),
 	}
 }
 
@@ -120,6 +124,14 @@ func unmarshalJobKeyAndNodeID(data []byte) (string, string) {
 		panic(err)
 	}
 	return string(keyBytes), string(nodeIDBytes)
+}
+
+func unmarshalBool(reader *bytes.Reader) bool {
+	var value bool
+	if err := binary.Read(reader, binary.LittleEndian, &value); err != nil {
+		panic(err)
+	}
+	return value
 }
 
 func marshalNotification(key string, payload []byte) []byte {

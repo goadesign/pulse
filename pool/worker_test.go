@@ -2,6 +2,8 @@ package pool
 
 import (
 	"context"
+	"errors"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -10,6 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"goa.design/pulse/rmap"
 	ptesting "goa.design/pulse/testing"
 )
 
@@ -51,6 +54,116 @@ func TestWorkerRequeueJobs(t *testing.T) {
 	}, time.Second, delay, "job was not requeued")
 
 	// Cleanup
+	assert.NoError(t, node.Shutdown(ctx))
+}
+
+func TestWorkerRebalanceReleasesPreviousJobOwner(t *testing.T) {
+	var (
+		ctx      = ptesting.NewTestContext(t)
+		testName = strings.Replace(t.Name(), "/", "_", -1)
+		rdb      = ptesting.NewRedisClient(t)
+		node     = newTestNode(t, ctx, rdb, testName)
+	)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	node.h = &ptesting.Hasher{IndexFunc: func(_ string, numBuckets int64) int64 {
+		return numBuckets - 1
+	}}
+
+	const jobKey = "rebalance-job"
+	payload := []byte("payload")
+	worker1 := newTestWorker(t, ctx, node)
+	require.NoError(t, node.DispatchJob(ctx, jobKey, payload))
+	require.Eventually(t, func() bool {
+		return len(worker1.Jobs()) == 1
+	}, max, delay)
+	require.Eventually(t, func() bool {
+		return sameStrings(jobOwners(node, jobKey), []string{worker1.ID})
+	}, max, delay)
+
+	worker2 := newTestWorker(t, ctx, node)
+	worker1.rebalance(ctx, []string{worker1.ID, worker2.ID})
+	require.Eventually(t, func() bool {
+		return len(worker1.Jobs()) == 0 && len(worker2.Jobs()) == 1
+	}, max, delay)
+	require.Eventually(t, func() bool {
+		return sameStrings(jobOwners(node, jobKey), []string{worker2.ID})
+	}, max, delay, "job must have exactly one replicated owner after rebalance")
+	gotPayload, ok := node.JobPayload(jobKey)
+	require.True(t, ok)
+	assert.Equal(t, payload, gotPayload)
+
+	assert.NoError(t, node.Shutdown(ctx))
+}
+
+func TestWorkerStartFailurePayloadOwnership(t *testing.T) {
+	var (
+		ctx      = ptesting.NewTestContext(t)
+		testName = strings.Replace(t.Name(), "/", "_", -1)
+		rdb      = ptesting.NewRedisClient(t)
+		node     = newTestNode(t, ctx, rdb, testName)
+	)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+
+	errStart := errors.New("start failed")
+	worker := newTestWorker(t, ctx, node)
+	worker.handler.(*mockHandler).startFunc = func(job *Job) error {
+		return errStart
+	}
+
+	err := worker.startJob(ctx, &Job{
+		Key:       "new-job",
+		Payload:   []byte("new payload"),
+		CreatedAt: time.Now(),
+		NodeID:    node.ID,
+	})
+	assert.ErrorIs(t, err, errStart)
+	_, ok := snapshotValue(t, ctx, node, node.jobPayloadMap, "new-job")
+	assert.False(t, ok)
+	assert.Empty(t, snapshotJobOwners(t, ctx, node, "new-job"))
+
+	err = worker.startJob(ctx, &Job{
+		Key:       "requeued-job",
+		Payload:   []byte("requeued payload"),
+		CreatedAt: time.Now(),
+		NodeID:    node.ID,
+		Requeued:  true,
+	})
+	assert.ErrorIs(t, err, errStart)
+	assert.Empty(t, snapshotJobOwners(t, ctx, node, "requeued-job"))
+	gotPayload, ok := snapshotValue(t, ctx, node, node.jobPayloadMap, "requeued-job")
+	require.True(t, ok)
+	assert.Equal(t, "requeued payload", gotPayload)
+
+	assert.NoError(t, node.Shutdown(ctx))
+}
+
+func TestWorkerControlEventsRequireLocalOwnership(t *testing.T) {
+	var (
+		ctx      = ptesting.NewTestContext(t)
+		testName = strings.Replace(t.Name(), "/", "_", -1)
+		rdb      = ptesting.NewRedisClient(t)
+		node     = newTestNode(t, ctx, rdb, testName)
+	)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+
+	worker := newTestWorker(t, ctx, node)
+	stopCalled := false
+	notifyCalled := false
+	worker.handler.(*mockHandler).stopFunc = func(key string) error {
+		stopCalled = true
+		return nil
+	}
+	worker.handler.(*mockHandler).notifyFunc = func(key string, payload []byte) error {
+		notifyCalled = true
+		return nil
+	}
+
+	assert.ErrorIs(t, worker.stopJob(ctx, "missing-job"), ErrRequeue)
+	assert.False(t, stopCalled)
+
+	assert.ErrorIs(t, worker.notify(ctx, "missing-job", []byte("payload")), ErrRequeue)
+	assert.False(t, notifyCalled)
+
 	assert.NoError(t, node.Shutdown(ctx))
 }
 
@@ -133,4 +246,64 @@ func TestStaleWorkerCleanupAcrossNodes(t *testing.T) {
 	// Cleanup
 	assert.NoError(t, node1.Shutdown(ctx))
 	assert.NoError(t, node2.Shutdown(ctx))
+}
+
+func jobOwners(node *Node, key string) []string {
+	var owners []string
+	for workerID := range node.jobMap.Map() {
+		values, ok := node.jobMap.GetValues(workerID)
+		if !ok {
+			continue
+		}
+		for _, value := range values {
+			if value == key {
+				owners = append(owners, workerID)
+				break
+			}
+		}
+	}
+	sort.Strings(owners)
+	return owners
+}
+
+func snapshotJobOwners(t *testing.T, ctx context.Context, node *Node, key string) []string {
+	t.Helper()
+	snapshot, err := rmap.Join(ctx, node.jobMap.Name, node.rdb)
+	require.NoError(t, err)
+	defer snapshot.Close()
+	var owners []string
+	for workerID := range snapshot.Map() {
+		values, ok := snapshot.GetValues(workerID)
+		if !ok {
+			continue
+		}
+		for _, value := range values {
+			if value == key {
+				owners = append(owners, workerID)
+				break
+			}
+		}
+	}
+	sort.Strings(owners)
+	return owners
+}
+
+func snapshotValue(t *testing.T, ctx context.Context, node *Node, source *rmap.Map, key string) (string, bool) {
+	t.Helper()
+	snapshot, err := rmap.Join(ctx, source.Name, node.rdb)
+	require.NoError(t, err)
+	defer snapshot.Close()
+	return snapshot.Get(key)
+}
+
+func sameStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }
