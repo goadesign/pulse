@@ -137,6 +137,36 @@ func TestWorkerStartFailurePayloadOwnership(t *testing.T) {
 	assert.NoError(t, node.Shutdown(ctx))
 }
 
+func TestWorkerControlEventsRequireLocalOwnership(t *testing.T) {
+	var (
+		ctx      = ptesting.NewTestContext(t)
+		testName = strings.Replace(t.Name(), "/", "_", -1)
+		rdb      = ptesting.NewRedisClient(t)
+		node     = newTestNode(t, ctx, rdb, testName)
+	)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+
+	worker := newTestWorker(t, ctx, node)
+	stopCalled := false
+	notifyCalled := false
+	worker.handler.(*mockHandler).stopFunc = func(key string) error {
+		stopCalled = true
+		return nil
+	}
+	worker.handler.(*mockHandler).notifyFunc = func(key string, payload []byte) error {
+		notifyCalled = true
+		return nil
+	}
+
+	assert.ErrorIs(t, worker.stopJob(ctx, "missing-job"), ErrRequeue)
+	assert.False(t, stopCalled)
+
+	assert.ErrorIs(t, worker.notify(ctx, "missing-job", []byte("payload")), ErrRequeue)
+	assert.False(t, notifyCalled)
+
+	assert.NoError(t, node.Shutdown(ctx))
+}
+
 func TestStaleWorkerCleanupInNode(t *testing.T) {
 	var (
 		ctx      = ptesting.NewTestContext(t)

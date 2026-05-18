@@ -299,6 +299,32 @@ func TestStopJobRoutesToCurrentOwner(t *testing.T) {
 	assert.NoError(t, node.Shutdown(ctx), "Failed to shutdown node")
 }
 
+func TestControlEventRoutingDuringOwnershipGaps(t *testing.T) {
+	testName := strings.Replace(t.Name(), "/", "_", -1)
+	ctx := ptesting.NewTestContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	node := newTestNode(t, ctx, rdb, testName)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+
+	const jobKey = "handoff-job"
+	_, err := node.jobPayloadMap.SetAndWait(ctx, jobKey, "payload")
+	require.NoError(t, err)
+
+	_, err = node.workerForEvent(evStopJob, jobKey)
+	assert.ErrorIs(t, err, errJobAwaitingOwner)
+
+	_, err = node.workerForEvent(evNotify, jobKey)
+	assert.ErrorIs(t, err, errJobAwaitingOwner)
+
+	_, err = node.jobPayloadMap.Delete(ctx, jobKey)
+	require.NoError(t, err)
+
+	_, err = node.workerForEvent(evStopJob, jobKey)
+	assert.ErrorIs(t, err, errJobNotFound)
+
+	assert.NoError(t, node.Shutdown(ctx), "Failed to shutdown node")
+}
+
 func TestDispatchJobRaceCondition(t *testing.T) {
 	testName := strings.Replace(t.Name(), "/", "_", -1)
 	ctx := ptesting.NewTestContext(t)

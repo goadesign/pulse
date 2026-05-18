@@ -88,6 +88,8 @@ type (
 	}
 )
 
+var errJobNotOwned = errors.New("job not owned by worker")
+
 // newWorker creates a new worker.
 func newWorker(ctx context.Context, node *Node, h JobHandler) (*Worker, error) {
 	wid := ulid.Make().String()
@@ -276,6 +278,9 @@ func (w *Worker) startJob(ctx context.Context, job *Job) error {
 // stopJob stops a job.
 func (w *Worker) stopJob(ctx context.Context, key string) error {
 	if err := w.releaseJob(ctx, key); err != nil {
+		if errors.Is(err, errJobNotOwned) {
+			return ErrRequeue
+		}
 		return err
 	}
 	if _, err := w.jobPayloadsMap.Delete(ctx, key); err != nil {
@@ -289,7 +294,7 @@ func (w *Worker) stopJob(ctx context.Context, key string) error {
 // preserving the shared payload for another worker to claim.
 func (w *Worker) releaseJob(ctx context.Context, key string) error {
 	if _, ok := w.jobs.Load(key); !ok {
-		return fmt.Errorf("job %s not found in local worker", key)
+		return fmt.Errorf("%w: %s", errJobNotOwned, key)
 	}
 	if err := w.handler.Stop(key); err != nil {
 		return fmt.Errorf("failed to stop job %q: %w", key, err)
@@ -307,6 +312,9 @@ func (w *Worker) notify(_ context.Context, key string, payload []byte) error {
 	if w.IsStopped() {
 		w.logger.Debug("worker stopped, ignoring notification")
 		return nil
+	}
+	if _, ok := w.jobs.Load(key); !ok {
+		return ErrRequeue
 	}
 	nh, ok := w.handler.(NotificationHandler)
 	if !ok {

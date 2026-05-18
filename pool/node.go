@@ -96,8 +96,13 @@ const (
 // pendingEventTTL is the TTL for pending events.
 var pendingEventTTL = 2 * time.Minute
 
-// ErrJobExists is returned when attempting to dispatch a job with a key that already exists.
-var ErrJobExists = errors.New("job already exists")
+var (
+	// ErrJobExists is returned when attempting to dispatch a job with a key that already exists.
+	ErrJobExists = errors.New("job already exists")
+
+	errJobAwaitingOwner = errors.New("job awaiting active owner")
+	errJobNotFound      = errors.New("job not found")
+)
 
 // AddNode adds a new node to the pool with the given name and returns it. The
 // node can be used to dispatch jobs and add new workers. A node also routes
@@ -698,6 +703,16 @@ func (node *Node) routeWorkerEvent(ev *streaming.Event) error {
 	key := unmarshalJobKey(ev.Payload)
 	wid, err := node.workerForEvent(ev.EventName, key)
 	if err != nil {
+		if errors.Is(err, errJobAwaitingOwner) {
+			node.logger.Debug("routeWorkerEvent: job has no active owner yet", "event", ev.EventName, "id", ev.ID, "key", key)
+			return nil
+		}
+		if errors.Is(err, errJobNotFound) {
+			if ackErr := node.poolSink.Ack(context.Background(), ev); ackErr != nil {
+				node.logger.Error(fmt.Errorf("routeWorkerEvent: failed to ack event for missing job: %w", ackErr), "event", ev.EventName, "id", ev.ID)
+			}
+			return nil
+		}
 		return err
 	}
 
@@ -840,11 +855,28 @@ func (node *Node) workerForEvent(eventName, key string) (string, error) {
 			return "", err
 		}
 		if !ok {
-			return "", fmt.Errorf("routeWorkerEvent: job %q has no active owner", key)
+			exists, err := node.jobPayloadExists(context.Background(), key)
+			if err != nil {
+				return "", err
+			}
+			if exists {
+				return "", fmt.Errorf("%w: %q", errJobAwaitingOwner, key)
+			}
+			return "", fmt.Errorf("%w: %q", errJobNotFound, key)
 		}
 		return owner, nil
 	}
 	return "", fmt.Errorf("routeWorkerEvent: unknown worker event %q", eventName)
+}
+
+// jobPayloadExists reads the durable job record from Redis, which is the source
+// of truth when the local ownership map has no active owner during handoff.
+func (node *Node) jobPayloadExists(ctx context.Context, key string) (bool, error) {
+	exists, err := node.rdb.HExists(ctx, rmapContentKey(jobPayloadMapName(node.PoolName)), key).Result()
+	if err != nil {
+		return false, fmt.Errorf("routeWorkerEvent: failed to check job payload %q: %w", key, err)
+	}
+	return exists, nil
 }
 
 // activeJobOwner returns the single active worker that owns a job key according
