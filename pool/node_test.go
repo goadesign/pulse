@@ -250,6 +250,55 @@ func TestDispatchJobTwoWorkers(t *testing.T) {
 	assert.NoError(t, node.Shutdown(ctx), "Failed to shutdown node")
 }
 
+func TestStopJobRoutesToCurrentOwner(t *testing.T) {
+	testName := strings.Replace(t.Name(), "/", "_", -1)
+	ctx := ptesting.NewTestContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	node := newTestNode(t, ctx, rdb, testName)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+
+	node.h = &ptesting.Hasher{Index: 0}
+	worker1 := newTestWorker(t, ctx, node)
+	worker2 := newTestWorker(t, ctx, node)
+
+	stopped := make(chan struct{})
+	var stoppedOnce sync.Once
+	worker1.handler.(*mockHandler).stopFunc = func(key string) error {
+		stoppedOnce.Do(func() { close(stopped) })
+		return nil
+	}
+	worker2.handler.(*mockHandler).stopFunc = func(key string) error {
+		t.Errorf("stop routed to worker without ownership: %s", key)
+		return nil
+	}
+
+	payload := []byte("payload")
+	require.NoError(t, node.DispatchJob(ctx, testName, payload))
+	require.Eventually(t, func() bool {
+		return len(worker1.Jobs()) == 1
+	}, max, delay)
+	require.Eventually(t, func() bool {
+		return sameStrings(jobOwners(node, testName), []string{worker1.ID})
+	}, max, delay)
+
+	node.h = &ptesting.Hasher{Index: 1}
+	require.NoError(t, node.StopJob(ctx, testName))
+	select {
+	case <-stopped:
+	case <-time.After(max):
+		t.Fatal("job stop was not routed to current owner")
+	}
+	require.Eventually(t, func() bool {
+		return len(worker1.Jobs()) == 0 && len(worker2.Jobs()) == 0
+	}, max, delay)
+	require.Eventually(t, func() bool {
+		_, ok := node.JobPayload(testName)
+		return !ok && len(jobOwners(node, testName)) == 0
+	}, max, delay)
+
+	assert.NoError(t, node.Shutdown(ctx), "Failed to shutdown node")
+}
+
 func TestDispatchJobRaceCondition(t *testing.T) {
 	testName := strings.Replace(t.Name(), "/", "_", -1)
 	ctx := ptesting.NewTestContext(t)

@@ -28,6 +28,15 @@ func TestMarshalJob(t *testing.T) {
 				CreatedAt: time.Date(2022, 1, 1, 0, 0, 0, 0, time.UTC),
 			},
 		},
+		{
+			name: "requeued job",
+			job: Job{
+				Key:       "test-key",
+				Payload:   []byte("test-payload"),
+				CreatedAt: time.Date(2022, 1, 1, 0, 0, 0, 0, time.UTC),
+				Requeued:  true,
+			},
+		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -38,6 +47,7 @@ func TestMarshalJob(t *testing.T) {
 			assert.Equal(t, tc.job.Key, job.Key)
 			assert.Equal(t, tc.job.Payload, job.Payload)
 			assert.Equal(t, tc.job.CreatedAt, job.CreatedAt)
+			assert.Equal(t, tc.job.Requeued, job.Requeued)
 
 			// Compare original and unmarshaled byte slices
 			marshaled2 := marshalJob(job)

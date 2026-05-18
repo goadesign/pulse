@@ -696,11 +696,10 @@ func (node *Node) routeWorkerEvent(ev *streaming.Event) error {
 
 	// Compute the worker ID that will handle the job.
 	key := unmarshalJobKey(ev.Payload)
-	activeWorkers := node.activeWorkers()
-	if len(activeWorkers) == 0 {
-		return fmt.Errorf("routeWorkerEvent: no active worker in pool %q", node.PoolName)
+	wid, err := node.workerForEvent(ev.EventName, key)
+	if err != nil {
+		return err
 	}
-	wid := activeWorkers[node.h.Hash(key, int64(len(activeWorkers)))]
 
 	// Stream the event to the worker corresponding to the key hash.
 	stream, err := node.getWorkerStream(wid)
@@ -822,6 +821,65 @@ func (node *Node) returnDispatchStatus(ev *streaming.Event) {
 		err = errors.New(ack.Error)
 	}
 	val.(chan error) <- err
+}
+
+// workerForEvent returns the worker that should receive a pool event. Start
+// events are routed by the current consistent hash ring; stop and notification
+// events target the worker that currently owns the job.
+func (node *Node) workerForEvent(eventName, key string) (string, error) {
+	if eventName == evStartJob {
+		activeWorkers := node.activeWorkers()
+		if len(activeWorkers) == 0 {
+			return "", fmt.Errorf("routeWorkerEvent: no active worker in pool %q", node.PoolName)
+		}
+		return activeWorkers[node.h.Hash(key, int64(len(activeWorkers)))], nil
+	}
+	if eventName == evStopJob || eventName == evNotify {
+		owner, ok, err := node.activeJobOwner(key)
+		if err != nil {
+			return "", err
+		}
+		if !ok {
+			return "", fmt.Errorf("routeWorkerEvent: job %q has no active owner", key)
+		}
+		return owner, nil
+	}
+	return "", fmt.Errorf("routeWorkerEvent: unknown worker event %q", eventName)
+}
+
+// activeJobOwner returns the single active worker that owns a job key according
+// to the replicated ownership map.
+func (node *Node) activeJobOwner(key string) (string, bool, error) {
+	activeWorkers := node.activeWorkers()
+	active := make(map[string]struct{}, len(activeWorkers))
+	for _, workerID := range activeWorkers {
+		active[workerID] = struct{}{}
+	}
+
+	var owner string
+	for workerID := range node.jobMap.Map() {
+		if _, ok := active[workerID]; !ok {
+			continue
+		}
+		keys, ok := node.jobMap.GetValues(workerID)
+		if !ok {
+			continue
+		}
+		for _, ownedKey := range keys {
+			if ownedKey != key {
+				continue
+			}
+			if owner != "" {
+				return "", false, fmt.Errorf("routeWorkerEvent: job %q has multiple active owners", key)
+			}
+			owner = workerID
+			break
+		}
+	}
+	if owner == "" {
+		return "", false, nil
+	}
+	return owner, true, nil
 }
 
 // watches monitors the workers replicated map and triggers job rebalancing
@@ -1067,7 +1125,7 @@ func (node *Node) requeueOrphanedPayloads(ctx context.Context) {
 			node.orphanedPayloads.Delete(key)
 			continue
 		}
-		job := &Job{Key: key, Payload: payload, CreatedAt: now, NodeID: node.ID}
+		job := &Job{Key: key, Payload: payload, CreatedAt: now, NodeID: node.ID, Requeued: true}
 		if _, err := node.poolStream.Add(ctx, evStartJob, marshalJob(job)); err != nil {
 			node.logger.Error(fmt.Errorf("requeueOrphanedPayloads: failed to requeue orphaned job: %w", err), "key", key)
 			continue
@@ -1117,7 +1175,7 @@ func (node *Node) cleanupWorker(ctx context.Context, workerID string) {
 			processed++
 			continue
 		}
-		job := &Job{Key: key, Payload: payload, CreatedAt: time.Now(), NodeID: node.ID}
+		job := &Job{Key: key, Payload: payload, CreatedAt: time.Now(), NodeID: node.ID, Requeued: true}
 		// Requeue by adding an event back to the pool stream.
 		// We intentionally do not wait for the job to start (which can time out
 		// under heavy churn) - the pool sink will retry routing until it is acked.

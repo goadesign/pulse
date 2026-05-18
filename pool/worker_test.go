@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"strconv"
 	"strings"
@@ -89,6 +90,48 @@ func TestWorkerRebalanceReleasesPreviousJobOwner(t *testing.T) {
 	gotPayload, ok := node.JobPayload(jobKey)
 	require.True(t, ok)
 	assert.Equal(t, payload, gotPayload)
+
+	assert.NoError(t, node.Shutdown(ctx))
+}
+
+func TestWorkerStartFailurePayloadOwnership(t *testing.T) {
+	var (
+		ctx      = ptesting.NewTestContext(t)
+		testName = strings.Replace(t.Name(), "/", "_", -1)
+		rdb      = ptesting.NewRedisClient(t)
+		node     = newTestNode(t, ctx, rdb, testName)
+	)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+
+	errStart := errors.New("start failed")
+	worker := newTestWorker(t, ctx, node)
+	worker.handler.(*mockHandler).startFunc = func(job *Job) error {
+		return errStart
+	}
+
+	err := worker.startJob(ctx, &Job{
+		Key:       "new-job",
+		Payload:   []byte("new payload"),
+		CreatedAt: time.Now(),
+		NodeID:    node.ID,
+	})
+	assert.ErrorIs(t, err, errStart)
+	assert.Empty(t, jobOwners(node, "new-job"))
+	_, ok := node.JobPayload("new-job")
+	assert.False(t, ok)
+
+	err = worker.startJob(ctx, &Job{
+		Key:       "requeued-job",
+		Payload:   []byte("requeued payload"),
+		CreatedAt: time.Now(),
+		NodeID:    node.ID,
+		Requeued:  true,
+	})
+	assert.ErrorIs(t, err, errStart)
+	assert.Empty(t, jobOwners(node, "requeued-job"))
+	gotPayload, ok := node.JobPayload("requeued-job")
+	require.True(t, ok)
+	assert.Equal(t, []byte("requeued payload"), gotPayload)
 
 	assert.NoError(t, node.Shutdown(ctx))
 }

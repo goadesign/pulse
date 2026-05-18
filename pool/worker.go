@@ -56,6 +56,9 @@ type (
 		Payload []byte
 		// CreatedAt is the time the job was created.
 		CreatedAt time.Time
+		// Requeued indicates that this start event moves or recovers an existing
+		// durable job payload rather than admitting a new dispatched job.
+		Requeued bool
 		// Worker is the worker that handles the job.
 		Worker *Worker
 		// NodeID is the ID of the node that created the job.
@@ -247,6 +250,9 @@ func (w *Worker) startJob(ctx context.Context, job *Job) error {
 	}
 	if _, err := w.jobPayloadsMap.Set(ctx, job.Key, string(job.Payload)); err != nil {
 		w.logger.Error(fmt.Errorf("failed to add job payload %q to job payloads map: %w, requeueing", job.Key, err))
+		if _, _, removeErr := w.jobsMap.RemoveValues(ctx, w.ID, job.Key); removeErr != nil {
+			w.logger.Error(fmt.Errorf("start failure handling: failed to remove job %q from jobs map: %w", job.Key, removeErr))
+		}
 		return ErrRequeue
 	}
 	job.Worker = w
@@ -255,8 +261,10 @@ func (w *Worker) startJob(ctx context.Context, job *Job) error {
 		if _, _, err := w.jobsMap.RemoveValues(ctx, w.ID, job.Key); err != nil {
 			w.logger.Error(fmt.Errorf("start failure handling: failed to remove job %q from jobs map: %w", job.Key, err))
 		}
-		if _, err := w.jobPayloadsMap.Delete(ctx, job.Key); err != nil {
-			w.logger.Error(fmt.Errorf("start failure handling: failed to remove job payload %q from job payloads map: %w", job.Key, err))
+		if !job.Requeued {
+			if _, err := w.jobPayloadsMap.Delete(ctx, job.Key); err != nil {
+				w.logger.Error(fmt.Errorf("start failure handling: failed to remove job payload %q from job payloads map: %w", job.Key, err))
+			}
 		}
 		return err
 	}
@@ -369,6 +377,7 @@ func (w *Worker) rebalance(ctx context.Context, activeWorkers []string) {
 		return
 	}
 	for key, job := range rebalanced {
+		job.Requeued = true
 		if err := w.releaseJob(ctx, key); err != nil {
 			w.logger.Error(fmt.Errorf("rebalance: failed to release job: %w", err), "job", key)
 			if _, ok := w.jobs.Load(key); !ok {
@@ -495,6 +504,7 @@ func (w *Worker) attemptRequeue(ctx context.Context, jobsToRequeue map[string]*J
 
 // requeueJob requeues a job.
 func (w *Worker) requeueJob(ctx context.Context, job *Job) error {
+	job.Requeued = true
 	eventID, err := w.node.poolStream.Add(ctx, evStartJob, marshalJob(job))
 	if err != nil {
 		return fmt.Errorf("requeueJob: failed to add job to pool stream: %w", err)
