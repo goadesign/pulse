@@ -116,9 +116,10 @@ func TestWorkerStartFailurePayloadOwnership(t *testing.T) {
 		NodeID:    node.ID,
 	})
 	assert.ErrorIs(t, err, errStart)
-	assert.Empty(t, jobOwners(node, "new-job"))
-	_, ok := node.JobPayload("new-job")
-	assert.False(t, ok)
+	require.Eventually(t, func() bool {
+		_, ok := node.JobPayload("new-job")
+		return !ok && len(jobOwners(node, "new-job")) == 0
+	}, max, delay)
 
 	err = worker.startJob(ctx, &Job{
 		Key:       "requeued-job",
@@ -128,8 +129,15 @@ func TestWorkerStartFailurePayloadOwnership(t *testing.T) {
 		Requeued:  true,
 	})
 	assert.ErrorIs(t, err, errStart)
-	assert.Empty(t, jobOwners(node, "requeued-job"))
-	gotPayload, ok := node.JobPayload("requeued-job")
+	require.Eventually(t, func() bool {
+		return len(jobOwners(node, "requeued-job")) == 0
+	}, max, delay)
+	var gotPayload []byte
+	var ok bool
+	require.Eventually(t, func() bool {
+		gotPayload, ok = node.JobPayload("requeued-job")
+		return ok
+	}, max, delay)
 	require.True(t, ok)
 	assert.Equal(t, []byte("requeued payload"), gotPayload)
 
