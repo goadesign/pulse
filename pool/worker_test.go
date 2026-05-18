@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -51,6 +52,44 @@ func TestWorkerRequeueJobs(t *testing.T) {
 	}, time.Second, delay, "job was not requeued")
 
 	// Cleanup
+	assert.NoError(t, node.Shutdown(ctx))
+}
+
+func TestWorkerRebalanceReleasesPreviousJobOwner(t *testing.T) {
+	var (
+		ctx      = ptesting.NewTestContext(t)
+		testName = strings.Replace(t.Name(), "/", "_", -1)
+		rdb      = ptesting.NewRedisClient(t)
+		node     = newTestNode(t, ctx, rdb, testName)
+	)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	node.h = &ptesting.Hasher{IndexFunc: func(_ string, numBuckets int64) int64 {
+		return numBuckets - 1
+	}}
+
+	const jobKey = "rebalance-job"
+	payload := []byte("payload")
+	worker1 := newTestWorker(t, ctx, node)
+	require.NoError(t, node.DispatchJob(ctx, jobKey, payload))
+	require.Eventually(t, func() bool {
+		return len(worker1.Jobs()) == 1
+	}, max, delay)
+	require.Eventually(t, func() bool {
+		return sameStrings(jobOwners(node, jobKey), []string{worker1.ID})
+	}, max, delay)
+
+	worker2 := newTestWorker(t, ctx, node)
+	worker1.rebalance(ctx, []string{worker1.ID, worker2.ID})
+	require.Eventually(t, func() bool {
+		return len(worker1.Jobs()) == 0 && len(worker2.Jobs()) == 1
+	}, max, delay)
+	require.Eventually(t, func() bool {
+		return sameStrings(jobOwners(node, jobKey), []string{worker2.ID})
+	}, max, delay, "job must have exactly one replicated owner after rebalance")
+	gotPayload, ok := node.JobPayload(jobKey)
+	require.True(t, ok)
+	assert.Equal(t, payload, gotPayload)
+
 	assert.NoError(t, node.Shutdown(ctx))
 }
 
@@ -133,4 +172,34 @@ func TestStaleWorkerCleanupAcrossNodes(t *testing.T) {
 	// Cleanup
 	assert.NoError(t, node1.Shutdown(ctx))
 	assert.NoError(t, node2.Shutdown(ctx))
+}
+
+func jobOwners(node *Node, key string) []string {
+	var owners []string
+	for workerID := range node.jobMap.Map() {
+		values, ok := node.jobMap.GetValues(workerID)
+		if !ok {
+			continue
+		}
+		for _, value := range values {
+			if value == key {
+				owners = append(owners, workerID)
+				break
+			}
+		}
+	}
+	sort.Strings(owners)
+	return owners
+}
+
+func sameStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }
