@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"goa.design/pulse/rmap"
 	ptesting "goa.design/pulse/testing"
 )
 
@@ -116,10 +117,9 @@ func TestWorkerStartFailurePayloadOwnership(t *testing.T) {
 		NodeID:    node.ID,
 	})
 	assert.ErrorIs(t, err, errStart)
-	require.Eventually(t, func() bool {
-		_, ok := node.JobPayload("new-job")
-		return !ok && len(jobOwners(node, "new-job")) == 0
-	}, max, delay)
+	_, ok := snapshotValue(t, ctx, node, node.jobPayloadMap, "new-job")
+	assert.False(t, ok)
+	assert.Empty(t, snapshotJobOwners(t, ctx, node, "new-job"))
 
 	err = worker.startJob(ctx, &Job{
 		Key:       "requeued-job",
@@ -129,17 +129,10 @@ func TestWorkerStartFailurePayloadOwnership(t *testing.T) {
 		Requeued:  true,
 	})
 	assert.ErrorIs(t, err, errStart)
-	require.Eventually(t, func() bool {
-		return len(jobOwners(node, "requeued-job")) == 0
-	}, max, delay)
-	var gotPayload []byte
-	var ok bool
-	require.Eventually(t, func() bool {
-		gotPayload, ok = node.JobPayload("requeued-job")
-		return ok
-	}, max, delay)
+	assert.Empty(t, snapshotJobOwners(t, ctx, node, "requeued-job"))
+	gotPayload, ok := snapshotValue(t, ctx, node, node.jobPayloadMap, "requeued-job")
 	require.True(t, ok)
-	assert.Equal(t, []byte("requeued payload"), gotPayload)
+	assert.Equal(t, "requeued payload", gotPayload)
 
 	assert.NoError(t, node.Shutdown(ctx))
 }
@@ -241,6 +234,36 @@ func jobOwners(node *Node, key string) []string {
 	}
 	sort.Strings(owners)
 	return owners
+}
+
+func snapshotJobOwners(t *testing.T, ctx context.Context, node *Node, key string) []string {
+	t.Helper()
+	snapshot, err := rmap.Join(ctx, node.jobMap.Name, node.rdb)
+	require.NoError(t, err)
+	defer snapshot.Close()
+	var owners []string
+	for workerID := range snapshot.Map() {
+		values, ok := snapshot.GetValues(workerID)
+		if !ok {
+			continue
+		}
+		for _, value := range values {
+			if value == key {
+				owners = append(owners, workerID)
+				break
+			}
+		}
+	}
+	sort.Strings(owners)
+	return owners
+}
+
+func snapshotValue(t *testing.T, ctx context.Context, node *Node, source *rmap.Map, key string) (string, bool) {
+	t.Helper()
+	snapshot, err := rmap.Join(ctx, source.Name, node.rdb)
+	require.NoError(t, err)
+	defer snapshot.Close()
+	return snapshot.Get(key)
 }
 
 func sameStrings(got, want []string) bool {
