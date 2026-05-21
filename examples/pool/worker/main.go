@@ -115,7 +115,7 @@ func (w *JobHandler) Stop(key string) error {
 	return nil
 }
 
-// Print notification.
+// HandleNotification prints job-scoped notifications for jobs owned locally.
 func (w *JobHandler) HandleNotification(key string, payload []byte) error {
 	log.Info(w.logctx, log.Fields{"msg": "notification", "key": key, "payload": string(payload)})
 	return nil

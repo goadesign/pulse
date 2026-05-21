@@ -73,9 +73,9 @@ type (
 		Stop(key string) error
 	}
 
-	// NotificationHandler handle job notifications.
+	// NotificationHandler handles notifications for jobs owned by the worker.
 	NotificationHandler interface {
-		// HandleNotification handles a notification.
+		// HandleNotification handles a job-scoped notification.
 		HandleNotification(key string, payload []byte) error
 	}
 
@@ -319,7 +319,7 @@ func (w *Worker) releaseJob(ctx context.Context, key string) error {
 	return nil
 }
 
-// notify notifies the worker with the given payload.
+// notify delivers a job-scoped notification after verifying local ownership.
 func (w *Worker) notify(_ context.Context, key string, payload []byte) error {
 	if w.IsStopped() {
 		w.logger.Debug("worker stopped, ignoring notification")

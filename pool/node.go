@@ -537,7 +537,8 @@ func (node *Node) JobPayload(key string) ([]byte, bool) {
 	return []byte(payload), true
 }
 
-// NotifyWorker notifies the worker that handles the job with the given key.
+// NotifyWorker notifies the worker that currently owns the job with the given
+// key.
 func (node *Node) NotifyWorker(ctx context.Context, key string, payload []byte) error {
 	if node.IsClosed() {
 		return fmt.Errorf("NotifyWorker: pool %q is closed", node.PoolName)

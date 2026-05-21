@@ -70,12 +70,14 @@ See the [streaming package README](streaming/README.md) for more details.
 
 Pulse builds on top of [replicated maps](rmap/README.md) and
 [streaming](streaming/README.md) to implement a dedicated worker pool where jobs
-are dipatched to workers based on their key and a consistent hashing algorithm.
+and messages are dispatched to workers based on their key and a consistent
+hashing algorithm. Jobs create durable worker ownership; messages are
+hash-routed short-lived work that does not create job state.
 
 ```mermaid
 %%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
 flowchart LR
-    A[Job Producer]
+    A[Producer]
     subgraph Pool[Pool Node]
         Sink
     end
@@ -83,9 +85,9 @@ flowchart LR
         Reader
         B[Worker]
     end
-    A-->|Job+Key|Sink
-    Sink-.->|Job|Reader
-    Reader-.->|Job|B
+    A-->|Job or Message + Key|Sink
+    Sink-.->|Worker Event|Reader
+    Reader-.->|Worker Event|B
 
     classDef userCode fill:#9A6D1F, stroke:#D9B871, stroke-width:2px, color:#FFF2CC;
     classDef pulse fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
