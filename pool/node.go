@@ -82,6 +82,8 @@ const (
 	evInit string = "i"
 	// evStartJob is the event used to send new job to workers.
 	evStartJob string = "j"
+	// evMessage is the event used to send a keyed message to a hash-ring worker.
+	evMessage string = "m"
 	// evNotify is the event used to notify a worker running a specific job.
 	evNotify string = "n"
 	// evStopJob is the event used to stop a job.
@@ -288,7 +290,8 @@ func AddNode(ctx context.Context, poolName string, rdb *redis.Client, opts ...No
 
 // AddWorker adds a new worker to the pool and returns it. The worker starts
 // processing jobs immediately. handler can optionally implement the
-// NotificationHandler interface to handle notifications.
+// NotificationHandler and MessageHandler interfaces to handle job-scoped
+// notifications and hash-routed messages.
 func (node *Node) AddWorker(ctx context.Context, handler JobHandler) (*Worker, error) {
 	if node.IsClosed() {
 		return nil, fmt.Errorf("AddWorker: pool %q is closed", node.PoolName)
@@ -359,6 +362,20 @@ func (node *Node) PoolWorkers() []*Worker {
 func (node *Node) DispatchJob(ctx context.Context, key string, payload []byte) error {
 	job := marshalJob(&Job{Key: key, Payload: payload, CreatedAt: time.Now(), NodeID: node.ID})
 	return node.dispatchJob(ctx, key, job)
+}
+
+// DispatchMessage sends a keyed message to the worker currently assigned by the
+// pool hash ring. Messages do not create job ownership and are intended for
+// fire-and-forget work that should be load-balanced by key.
+func (node *Node) DispatchMessage(ctx context.Context, key string, payload []byte) error {
+	if node.IsClosed() {
+		return fmt.Errorf("DispatchMessage: pool %q is closed", node.PoolName)
+	}
+	if _, err := node.poolStream.Add(ctx, evMessage, marshalKeyedPayload(key, payload)); err != nil {
+		return fmt.Errorf("DispatchMessage: failed to add message to stream %q: %w", node.poolStream.Name, err)
+	}
+	node.logger.Info("message dispatched", "key", key)
+	return nil
 }
 
 func (node *Node) dispatchJob(ctx context.Context, key string, job []byte) error {
@@ -525,7 +542,7 @@ func (node *Node) NotifyWorker(ctx context.Context, key string, payload []byte) 
 	if node.IsClosed() {
 		return fmt.Errorf("NotifyWorker: pool %q is closed", node.PoolName)
 	}
-	if _, err := node.poolStream.Add(ctx, evNotify, marshalNotification(key, payload)); err != nil {
+	if _, err := node.poolStream.Add(ctx, evNotify, marshalKeyedPayload(key, payload)); err != nil {
 		return fmt.Errorf("NotifyWorker: failed to add notification to stream %q: %w", node.poolStream.Name, err)
 	}
 	node.logger.Info("notification sent", "key", key)
@@ -699,7 +716,7 @@ func (node *Node) routeWorkerEvent(ev *streaming.Event) error {
 		return nil
 	}
 
-	// Compute the worker ID that will handle the job.
+	// Compute the worker ID that will handle the event key.
 	key := unmarshalJobKey(ev.Payload)
 	wid, err := node.workerForEvent(ev.EventName, key)
 	if err != nil {
@@ -838,11 +855,11 @@ func (node *Node) returnDispatchStatus(ev *streaming.Event) {
 	val.(chan error) <- err
 }
 
-// workerForEvent returns the worker that should receive a pool event. Start
-// events are routed by the current consistent hash ring; stop and notification
-// events target the worker that currently owns the job.
+// workerForEvent returns the worker that should receive a pool event. Start and
+// message events are routed by the current consistent hash ring; stop and
+// notification events target the worker that currently owns the job.
 func (node *Node) workerForEvent(eventName, key string) (string, error) {
-	if eventName == evStartJob {
+	if eventName == evStartJob || eventName == evMessage {
 		activeWorkers := node.activeWorkers()
 		if len(activeWorkers) == 0 {
 			return "", fmt.Errorf("routeWorkerEvent: no active worker in pool %q", node.PoolName)

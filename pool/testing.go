@@ -10,17 +10,24 @@ import (
 	"goa.design/pulse/pulse"
 )
 
-// mockHandler is a mock worker mockHandler for testing
+// mockHandler implements the regular test worker job and notification contract.
 type mockHandler struct {
 	startFunc  func(job *Job) error
 	stopFunc   func(key string) error
 	notifyFunc func(key string, payload []byte) error
 }
 
-// mockHandlerWithoutNotify is a mock handler that doesn't implement NotificationHandler
-type mockHandlerWithoutNotify struct {
+// mockJobHandler implements only the required job handler contract.
+type mockJobHandler struct {
 	startFunc func(job *Job) error
 	stopFunc  func(key string) error
+}
+
+// mockMessageHandler extends the regular test job handler with explicit message
+// support so tests only opt into the message contract when they need it.
+type mockMessageHandler struct {
+	*mockHandler
+	messageFunc func(key string, payload []byte) error
 }
 
 const (
@@ -50,27 +57,35 @@ func newTestNode(t *testing.T, ctx context.Context, rdb *redis.Client, name stri
 // worker to the given node.
 func newTestWorker(t *testing.T, ctx context.Context, node *Node) *Worker {
 	t.Helper()
-	handler := &mockHandler{
-		startFunc:  func(job *Job) error { return nil },
-		stopFunc:   func(key string) error { return nil },
-		notifyFunc: func(key string, payload []byte) error { return nil },
-	}
+	handler := newMockHandler()
 	worker, err := node.AddWorker(ctx, handler)
 	require.NoError(t, err)
 	return worker
 }
 
-// newTestWorkerWithoutNotify creates a new Worker instance for testing purposes.
-// It sets up a mock handler without NotificationHandler for testing.
-func newTestWorkerWithoutNotify(t *testing.T, ctx context.Context, node *Node) *Worker {
+// newTestWorkerWithoutOptionalHandlers creates a worker whose handler only
+// implements the required job lifecycle methods.
+func newTestWorkerWithoutOptionalHandlers(t *testing.T, ctx context.Context, node *Node) *Worker {
 	t.Helper()
-	handler := &mockHandlerWithoutNotify{
-		startFunc: func(job *Job) error { return nil },
-		stopFunc:  func(key string) error { return nil },
-	}
+	handler := newMockJobHandler()
 	worker, err := node.AddWorker(ctx, handler)
 	require.NoError(t, err)
 	return worker
+}
+
+func newMockHandler() *mockHandler {
+	return &mockHandler{
+		startFunc:  func(job *Job) error { return nil },
+		stopFunc:   func(key string) error { return nil },
+		notifyFunc: func(key string, payload []byte) error { return nil },
+	}
+}
+
+func newMockJobHandler() *mockJobHandler {
+	return &mockJobHandler{
+		startFunc: func(job *Job) error { return nil },
+		stopFunc:  func(key string) error { return nil },
+	}
 }
 
 func (w *mockHandler) Start(job *Job) error  { return w.startFunc(job) }
@@ -78,6 +93,9 @@ func (w *mockHandler) Stop(key string) error { return w.stopFunc(key) }
 func (w *mockHandler) HandleNotification(key string, payload []byte) error {
 	return w.notifyFunc(key, payload)
 }
+func (w *mockMessageHandler) HandleMessage(key string, payload []byte) error {
+	return w.messageFunc(key, payload)
+}
 
-func (h *mockHandlerWithoutNotify) Start(job *Job) error  { return h.startFunc(job) }
-func (h *mockHandlerWithoutNotify) Stop(key string) error { return h.stopFunc(key) }
+func (h *mockJobHandler) Start(job *Job) error  { return h.startFunc(job) }
+func (h *mockJobHandler) Stop(key string) error { return h.stopFunc(key) }

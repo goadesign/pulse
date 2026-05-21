@@ -156,8 +156,9 @@ handler object.
 [![Worker AddWorker](../snippets/pool-addworker.png)](../examples/pool/worker/main.go#L55-L57)
 
 The job handler must implement the `Start` and `Stop` methods used to start and
-stop jobs. The handler may also optionally implement a `HandleNotification`
-method to receive notifications.
+stop jobs. The handler may also optionally implement `HandleNotification` to
+receive job-scoped notifications and `HandleMessage` to receive keyed messages
+that are routed by the pool hash ring without creating job ownership.
 
 [![Worker JobHandler](../snippets/worker-jobhandler.png)](worker.go#L59-L71)
 
@@ -177,11 +178,21 @@ passed to the worker's `Start` method.
 The `DispatchJob` method returns an error if the job could not be dispatched.
 This can happen if the pool is full or if the job key is invalid.
 
+### Dispatching A Message
+
+The `DispatchMessage` method sends a keyed, fire-and-forget message to the
+worker currently assigned by the pool hash ring. Messages do not create jobs,
+write job payloads, or require a worker to own a job with the same key. They are
+intended for short-lived work where the key should provide stable routing and
+load distribution across workers. A message handler can return `ErrRequeue` to
+leave the message pending for redelivery; any other error is treated as terminal.
+
 ### Notifications
 
-Nodes can send notifications to workers using the `NotifyWorker` method. The method
-takes as input a job key and a notification payload.  The notification payload
-is passed to the worker's `HandleNotification` method.
+Nodes can send notifications to workers using the `NotifyWorker` method. The
+method takes as input an existing job key and a notification payload. The
+notification payload is passed to the `HandleNotification` method of the worker
+that currently owns the job.
 
 ### Stopping A Job
 

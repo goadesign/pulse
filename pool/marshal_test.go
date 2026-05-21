@@ -59,3 +59,15 @@ func TestMarshalJob(t *testing.T) {
 		})
 	}
 }
+
+func TestMarshalKeyedPayload(t *testing.T) {
+	key := "test-key"
+	payload := []byte("test-payload")
+
+	marshaled := marshalKeyedPayload(key, payload)
+	gotKey, gotPayload := unmarshalKeyedPayload(marshaled)
+
+	assert.Equal(t, key, gotKey)
+	assert.Equal(t, payload, gotPayload)
+	assert.Equal(t, key, unmarshalJobKey(marshaled))
+}
