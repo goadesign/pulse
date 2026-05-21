@@ -60,6 +60,27 @@ func TestMarshalJob(t *testing.T) {
 	}
 }
 
+func TestUnmarshalLegacyJob(t *testing.T) {
+	job := &Job{
+		Key:       "test-key",
+		Payload:   []byte("test-payload"),
+		CreatedAt: time.Date(2022, 1, 1, 0, 0, 0, 0, time.UTC),
+		NodeID:    "test-node",
+		Requeued:  true,
+	}
+	marshaled := marshalJob(job)
+	legacy := marshaled[:len(marshaled)-1]
+
+	assert.NotPanics(t, func() {
+		decoded := unmarshalJob(legacy)
+		assert.Equal(t, job.Key, decoded.Key)
+		assert.Equal(t, job.Payload, decoded.Payload)
+		assert.Equal(t, job.CreatedAt, decoded.CreatedAt)
+		assert.Equal(t, job.NodeID, decoded.NodeID)
+		assert.False(t, decoded.Requeued)
+	})
+}
+
 func TestMarshalKeyedPayload(t *testing.T) {
 	key := "test-key"
 	payload := []byte("test-payload")

@@ -71,12 +71,19 @@ func unmarshalJob(data []byte) *Job {
 	if err := binary.Read(reader, binary.LittleEndian, &createdAtTimestamp); err != nil {
 		panic(err)
 	}
+	requeued := false
+	// v1.6.4 and earlier persisted start-job events without the Requeued flag.
+	// Those events can remain in Redis streams across a rolling upgrade, so the
+	// decoder treats the missing trailing field as the old dispatch contract.
+	if reader.Len() > 0 {
+		requeued = unmarshalBool(reader)
+	}
 	return &Job{
 		Key:       string(keyBytes),
 		Payload:   payload,
 		CreatedAt: time.Unix(0, createdAtTimestamp).UTC(),
 		NodeID:    nodeID,
-		Requeued:  unmarshalBool(reader),
+		Requeued:  requeued,
 	}
 }
 
