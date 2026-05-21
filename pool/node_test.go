@@ -650,7 +650,7 @@ func TestNotifyWorkerNoHandler(t *testing.T) {
 	defer ptesting.CleanupRedis(t, rdb, true, testName)
 
 	// Create a worker without NotificationHandler implementation
-	worker := newTestWorkerWithoutNotify(t, ctx, node)
+	worker := newTestWorkerWithoutOptionalHandlers(t, ctx, node)
 
 	// Dispatch a job to ensure the worker is assigned
 	jobKey := "test-job"
@@ -675,6 +675,73 @@ func TestNotifyWorkerNoHandler(t *testing.T) {
 	assert.Len(t, worker.Jobs(), 1, "Worker should still have the job")
 
 	// Shutdown node
+	assert.NoError(t, node.Shutdown(ctx), "Failed to shutdown node")
+}
+
+func TestDispatchMessageRoutesByHashWithoutJob(t *testing.T) {
+	testName := strings.Replace(t.Name(), "/", "_", -1)
+	ctx := ptesting.NewTestContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	node := newTestNode(t, ctx, rdb, testName)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+
+	messageKey := "message-key"
+	messagePayload := []byte("message payload")
+	received := make(chan string, 2)
+
+	node.h = &ptesting.Hasher{Index: 1}
+	handler1 := &mockMessageHandler{mockHandler: newMockHandler()}
+	handler2 := &mockMessageHandler{mockHandler: newMockHandler()}
+	worker1, err := node.AddWorker(ctx, handler1)
+	require.NoError(t, err)
+	worker2, err := node.AddWorker(ctx, handler2)
+	require.NoError(t, err)
+	handler1.messageFunc = func(key string, payload []byte) error {
+		assert.Equal(t, messageKey, key)
+		assert.Equal(t, messagePayload, payload)
+		received <- worker1.ID
+		return nil
+	}
+	handler2.messageFunc = func(key string, payload []byte) error {
+		assert.Equal(t, messageKey, key)
+		assert.Equal(t, messagePayload, payload)
+		received <- worker2.ID
+		return nil
+	}
+
+	require.NoError(t, node.DispatchMessage(ctx, messageKey, messagePayload))
+	select {
+	case got := <-received:
+		assert.Equal(t, worker2.ID, got)
+	case <-time.After(max):
+		t.Fatal("message was not routed to hash-ring worker")
+	}
+
+	assert.Empty(t, worker1.Jobs())
+	assert.Empty(t, worker2.Jobs())
+	assert.Empty(t, node.JobKeys())
+	_, ok := node.JobPayload(messageKey)
+	assert.False(t, ok)
+
+	assert.NoError(t, node.Shutdown(ctx), "Failed to shutdown node")
+}
+
+func TestDispatchMessageRequiresHandler(t *testing.T) {
+	testName := strings.Replace(t.Name(), "/", "_", -1)
+	ctx, buf := ptesting.NewBufferedLogContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	node := newTestNode(t, ctx, rdb, testName)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+
+	worker := newTestWorkerWithoutOptionalHandlers(t, ctx, node)
+	assert.NoError(t, node.DispatchMessage(ctx, "message-key", []byte("message payload")))
+
+	assert.Eventually(t, func() bool {
+		return strings.Contains(buf.String(), "handler failed: worker") &&
+			strings.Contains(buf.String(), "does not implement MessageHandler")
+	}, max, delay, "Expected missing MessageHandler error within the timeout period")
+	assert.Empty(t, worker.Jobs())
+
 	assert.NoError(t, node.Shutdown(ctx), "Failed to shutdown node")
 }
 

@@ -3,7 +3,8 @@
 This example shows how to use the pool package to create a pool of workers. It has three parts:
 
 1. The `worker` process registers a worker with the node and waits for jobs.
-2. The `producer` process starts and stops two jobs. It also notifies the worker handling the second job.
+2. The `producer` process starts and stops two jobs. It also notifies the worker
+   that owns the second job.
 3. The `scheduler` process starts runs a schedule that starts and stops jobs alternately.
 
 ## Running the example
@@ -31,8 +32,12 @@ $ source .env
 $ go run examples/pool/producer/main.go
 ```
 
-The above starts and stops two jobs. The first job is handled by the first worker,
-and the second job is handled by the second worker.
+The above starts and stops two jobs. The first job is handled by the first
+worker, and the second job is handled by the second worker. The producer also
+sends a job-scoped notification to the worker that owns the second job.
+
+For keyed work that should be routed by the worker hash ring without creating a
+durable job, use `DispatchMessage` instead of `NotifyWorker`.
 
 Finally in the same terminal used above run the following command:
 

@@ -6,10 +6,10 @@ dedicated worker pools.
 
 ## Overview
 
-A *dedicated* worker pool uses a consistent hashing algorithm to assign long
-running jobs to workers. Each job is associated with a key and each worker with
-a range of hashed values. The pool hashes the job key when the job is dispatched
-to route the job to the proper worker.
+A *dedicated* worker pool uses a consistent hashing algorithm to route keyed
+work to workers. Durable jobs use the key to choose the worker that owns and
+executes the job. Keyed messages use the same hash ring for short-lived work
+without creating job ownership.
 
 Workers can be added or removed from the pool dynamically. Jobs get
 automatically re-assigned to workers when the pool grows or shrinks. This makes
@@ -17,13 +17,13 @@ it possible to implement auto-scaling solutions, for example based on queueing
 delays.
 
 Pulse uses the [Jump Consistent Hash](https://arxiv.org/abs/1406.2294) algorithm
-to assign jobs to workers which provides a good balance between load balancing
+to assign keys to workers, which provides a good balance between load balancing
 and worker assignment stability.
 
 ```mermaid
 %%{init: {'themeVariables': { 'edgeLabelBackground': '#7A7A7A'}}}%%
 flowchart LR
-    A[Job Producer]
+    A[Producer]
     subgraph Pool["<span style='margin: 0 10px;'>Routing Pool Node</span>"]
         Sink["Job Sink"]
     end
@@ -31,9 +31,9 @@ flowchart LR
         Reader
         B[Worker]
     end
-    A-->|Job+Key|Sink
-    Sink-.->|Job|Reader
-    Reader-.->|Job|B
+    A-->|Job or Message + Key|Sink
+    Sink-.->|Worker Event|Reader
+    Reader-.->|Worker Event|B
 
     classDef userCode fill:#9A6D1F, stroke:#D9B871, stroke-width:2px, color:#FFF2CC;
     classDef pulse fill:#25503C, stroke:#5E8E71, stroke-width:2px, color:#D6E9C6;
@@ -81,12 +81,22 @@ type JobHandler struct {
 }
 
 // Pulse calls this method to start a job that was assigned to this worker.
-func (h *JobHandler) Start(ctx context.Context, key string, payload []byte) error {
+func (h *JobHandler) Start(job *pool.Job) error {
 	// ...
 }
 
 // Pulse calls this method to stop a job that was assigned to this worker.
-func (h *JobHandler) Stop(ctx context.Context, key string) error {
+func (h *JobHandler) Stop(key string) error {
+	// ...
+}
+
+// Pulse calls this method when a message key hashes to this worker.
+func (h *JobHandler) HandleMessage(key string, payload []byte) error {
+	// ...
+}
+
+// Pulse calls this method when this worker owns the notified job key.
+func (h *JobHandler) HandleNotification(key string, payload []byte) error {
 	// ...
 }
 ```
@@ -156,10 +166,10 @@ handler object.
 [![Worker AddWorker](../snippets/pool-addworker.png)](../examples/pool/worker/main.go#L55-L57)
 
 The job handler must implement the `Start` and `Stop` methods used to start and
-stop jobs. The handler may also optionally implement a `HandleNotification`
-method to receive notifications.
+stop durable jobs. The handler may also implement `HandleMessage` to receive
+keyed messages and `HandleNotification` to receive job-scoped notifications.
 
-[![Worker JobHandler](../snippets/worker-jobhandler.png)](worker.go#L59-L71)
+[![Worker JobHandler](../snippets/worker-jobhandler.png)](worker.go#L68-L87)
 
 The `AddWorker` function returns a new worker and an error. Workers can be
 removed from pool nodes using the `RemoveWorker` method.
@@ -171,17 +181,35 @@ input a job key and a job payload.
 
 [![Pool DispatchJob](../snippets/pool-dispatchjob.png)](../examples/pool/producer/main.go#L39-L42)
 
-The job key is used to route the job to the proper worker. The job payload is
-passed to the worker's `Start` method.
+The job key is used to route the job to the proper worker. If the worker starts
+the job successfully, the worker owns that key until the job stops or moves
+during rebalancing. The job payload is passed to the worker's `Start` method.
 
 The `DispatchJob` method returns an error if the job could not be dispatched.
 This can happen if the pool is full or if the job key is invalid.
 
+### Dispatching A Message
+
+The `DispatchMessage` method sends a keyed, fire-and-forget message to the
+worker currently assigned by the pool hash ring. Messages are the right primitive
+for short-lived work that needs stable key-based routing but must not create a
+durable job.
+
+Messages do not write job payloads and do not require any worker to own a job
+with the same key. The receiving worker must implement `HandleMessage`. A
+message handler can return `ErrRequeue` to leave the message pending for
+redelivery; any other error is treated as terminal.
+
 ### Notifications
 
-Nodes can send notifications to workers using the `NotifyWorker` method. The method
-takes as input a job key and a notification payload.  The notification payload
-is passed to the worker's `HandleNotification` method.
+Nodes can send notifications to workers using the `NotifyWorker` method. A
+notification is a job control event: it targets the worker that currently owns an
+existing job key and passes the notification payload to that worker's
+`HandleNotification` method.
+
+Use `NotifyWorker` when the message only makes sense for the active owner of an
+existing job. Use `DispatchMessage` when there is no durable job with the same
+key.
 
 ### Stopping A Job
 

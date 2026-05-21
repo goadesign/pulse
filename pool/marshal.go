@@ -134,7 +134,9 @@ func unmarshalBool(reader *bytes.Reader) bool {
 	return value
 }
 
-func marshalNotification(key string, payload []byte) []byte {
+// marshalKeyedPayload marshals the shared wire shape used by events whose
+// routing key is distinct from their opaque handler payload.
+func marshalKeyedPayload(key string, payload []byte) []byte {
 	var buf bytes.Buffer
 	if err := binary.Write(&buf, binary.LittleEndian, int32(len(key))); err != nil {
 		panic(err)
@@ -151,7 +153,8 @@ func marshalNotification(key string, payload []byte) []byte {
 	return buf.Bytes()
 }
 
-func unmarshalNotification(data []byte) (string, []byte) {
+// unmarshalKeyedPayload unmarshals data produced by marshalKeyedPayload.
+func unmarshalKeyedPayload(data []byte) (string, []byte) {
 	reader := bytes.NewReader(data)
 	var keyLength int32
 	if err := binary.Read(reader, binary.LittleEndian, &keyLength); err != nil {

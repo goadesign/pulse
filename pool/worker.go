@@ -73,10 +73,18 @@ type (
 		Stop(key string) error
 	}
 
-	// NotificationHandler handle job notifications.
+	// NotificationHandler handles notifications for jobs owned by the worker.
 	NotificationHandler interface {
-		// HandleNotification handles a notification.
+		// HandleNotification handles a job-scoped notification.
 		HandleNotification(key string, payload []byte) error
+	}
+
+	// MessageHandler handles keyed messages that are routed by the pool hash ring
+	// without requiring a running job with the same key. Returning ErrRequeue
+	// leaves the message pending for redelivery; any other error is terminal.
+	MessageHandler interface {
+		// HandleMessage handles a keyed message.
+		HandleMessage(key string, payload []byte) error
 	}
 
 	// ack is a worker event acknowledgement.
@@ -199,12 +207,16 @@ func (w *Worker) handleEvents(ctx context.Context, c <-chan *streaming.Event) {
 			case evStartJob:
 				w.logger.Debug("handleEvents: received start job", "event", ev.EventName, "id", ev.ID)
 				err = w.startJob(ctx, unmarshalJob(payload))
+			case evMessage:
+				w.logger.Debug("handleEvents: received message", "event", ev.EventName, "id", ev.ID)
+				key, payload := unmarshalKeyedPayload(payload)
+				err = w.message(key, payload)
 			case evStopJob:
 				w.logger.Debug("handleEvents: received stop job", "event", ev.EventName, "id", ev.ID)
 				err = w.stopJob(ctx, unmarshalJobKey(payload))
 			case evNotify:
 				w.logger.Debug("handleEvents: received notify", "event", ev.EventName, "id", ev.ID)
-				key, payload := unmarshalNotification(payload)
+				key, payload := unmarshalKeyedPayload(payload)
 				err = w.notify(ctx, key, payload)
 			}
 			if err != nil {
@@ -307,7 +319,7 @@ func (w *Worker) releaseJob(ctx context.Context, key string) error {
 	return nil
 }
 
-// notify notifies the worker with the given payload.
+// notify delivers a job-scoped notification after verifying local ownership.
 func (w *Worker) notify(_ context.Context, key string, payload []byte) error {
 	if w.IsStopped() {
 		w.logger.Debug("worker stopped, ignoring notification")
@@ -323,6 +335,20 @@ func (w *Worker) notify(_ context.Context, key string, payload []byte) error {
 	}
 	w.logger.Debug("handled notification", "payload", string(payload))
 	return nh.HandleNotification(key, payload)
+}
+
+// message handles a keyed message routed by the pool hash ring. Unlike
+// notifications, messages are independent of job ownership.
+func (w *Worker) message(key string, payload []byte) error {
+	if w.IsStopped() {
+		return fmt.Errorf("worker %q stopped", w.ID)
+	}
+	mh, ok := w.handler.(MessageHandler)
+	if !ok {
+		return fmt.Errorf("worker %q does not implement MessageHandler", w.ID)
+	}
+	w.logger.Debug("handled message", "payload", string(payload))
+	return mh.HandleMessage(key, payload)
 }
 
 // ackPoolEvent acknowledges the pool event that originated from the node with
