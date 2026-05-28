@@ -220,6 +220,53 @@ func TestRemoveReaderStream(t *testing.T) {
 	assert.Equal(t, []byte("payload3"), read.Payload)
 }
 
+func TestReaderCloseWithStalledSubscriber(t *testing.T) {
+	testName := strings.Replace(t.Name(), "/", "_", -1)
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	ctx := ptesting.NewTestContext(t)
+	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
+	require.NoError(t, err)
+
+	// Tiny buffer so the read loop's fan-out send blocks after a couple of
+	// events when the subscriber never drains its channel.
+	reader, err := s.NewReader(ctx,
+		options.WithReaderStartAtOldest(),
+		options.WithReaderBlockDuration(testBlockDuration),
+		options.WithReaderBufferSize(1))
+	require.NoError(t, err)
+
+	// Subscribe but deliberately never read from the channel so the read
+	// loop fills the buffer and then parks on the next fan-out send.
+	c := reader.Subscribe()
+
+	// Add more events than the buffer can hold so the read loop parks on
+	// `c <- ev` inside streamEvents.
+	for range 5 {
+		_, err = s.Add(ctx, "event", []byte("payload"))
+		require.NoError(t, err)
+	}
+
+	// Wait until the buffer is full, which means the read loop has consumed
+	// events and is now parked on the fan-out send to the stalled subscriber.
+	require.Eventually(t, func() bool { return len(c) == cap(c) }, max, delay)
+
+	// Close must return even though the subscriber stalled the read loop.
+	done := make(chan struct{})
+	go func() {
+		reader.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reader.Close() hung with a stalled subscriber")
+	}
+	assert.True(t, reader.IsClosed())
+
+	require.NoError(t, s.Destroy(ctx))
+}
+
 func TestEventCreatedAt(t *testing.T) {
 	rdb := ptesting.NewRedisClient(t)
 	defer ptesting.CleanupRedis(t, rdb, false, "")
