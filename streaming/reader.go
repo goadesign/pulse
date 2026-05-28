@@ -55,10 +55,6 @@ type (
 		closing bool
 		// eventFilter is the event filter if any.
 		eventFilter eventFilterFunc
-		// xreadFn fetches the next batch of events from Redis. It defaults
-		// to (*Reader).xread and is only overridden in tests to simulate
-		// read errors.
-		xreadFn func(context.Context) ([]redis.XStream, error)
 		// logger is the logger used by the reader.
 		logger pulse.Logger
 		// rdb is the redis connection.
@@ -221,16 +217,17 @@ func (r *Reader) start() {
 	})
 }
 
+// xreadFn fetches the next batch of events for a reader. It is a package
+// variable (rather than a struct field) so tests can simulate read errors
+// without polluting Reader; it defaults to (*Reader).xread.
+var xreadFn = (*Reader).xread
+
 // read reads events from the streams and sends them to the reader channel.
 func (r *Reader) read() {
 	ctx := context.Background()
 	defer r.cleanup()
-	readEvents := r.xread
-	if r.xreadFn != nil {
-		readEvents = r.xreadFn
-	}
 	for {
-		streamsEvents, err := readEvents(ctx)
+		streamsEvents, err := xreadFn(r, ctx)
 		if r.isClosing() {
 			return
 		}
