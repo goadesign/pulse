@@ -224,19 +224,28 @@ func (r *Reader) start() {
 	})
 }
 
+// xreadFn fetches the next batch of events for a reader. It is a package
+// variable (rather than a struct field) so tests can simulate read errors
+// without polluting Reader; it defaults to (*Reader).xread.
+var xreadFn = (*Reader).xread
+
 // read reads events from the streams and sends them to the reader channel.
 func (r *Reader) read() {
 	ctx := context.Background()
 	defer r.cleanup()
 	for {
-		streamsEvents, err := r.xread(ctx)
+		streamsEvents, err := xreadFn(r, ctx)
 		if r.isClosing() {
 			return
 		}
 		if err != nil {
 			if err := handleReadError(err, r.logger); err != nil {
 				r.logger.Error(fmt.Errorf("fatal error while reading events: %w, stopping", err))
-				r.Close()
+				// Close waits on this goroutine via wait.Wait, so calling it
+				// synchronously here would deadlock and leak the reader and its
+				// Redis connection. Trigger the shutdown asynchronously and let
+				// this goroutine return so cleanup can release the wait group.
+				pulse.Go(r.logger, r.Close)
 				return
 			}
 			continue
