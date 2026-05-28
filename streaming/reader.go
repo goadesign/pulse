@@ -55,6 +55,10 @@ type (
 		closing bool
 		// eventFilter is the event filter if any.
 		eventFilter eventFilterFunc
+		// xreadFn fetches the next batch of events from Redis. It defaults
+		// to (*Reader).xread and is only overridden in tests to simulate
+		// read errors.
+		xreadFn func(context.Context) ([]redis.XStream, error)
 		// logger is the logger used by the reader.
 		logger pulse.Logger
 		// rdb is the redis connection.
@@ -221,15 +225,23 @@ func (r *Reader) start() {
 func (r *Reader) read() {
 	ctx := context.Background()
 	defer r.cleanup()
+	readEvents := r.xread
+	if r.xreadFn != nil {
+		readEvents = r.xreadFn
+	}
 	for {
-		streamsEvents, err := r.xread(ctx)
+		streamsEvents, err := readEvents(ctx)
 		if r.isClosing() {
 			return
 		}
 		if err != nil {
 			if err := handleReadError(err, r.logger); err != nil {
 				r.logger.Error(fmt.Errorf("fatal error while reading events: %w, stopping", err))
-				r.Close()
+				// Close waits on this goroutine via wait.Wait, so calling it
+				// synchronously here would deadlock and leak the reader and its
+				// Redis connection. Trigger the shutdown asynchronously and let
+				// this goroutine return so cleanup can release the wait group.
+				pulse.Go(r.logger, r.Close)
 				return
 			}
 			continue

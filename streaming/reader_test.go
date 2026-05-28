@@ -1,6 +1,8 @@
 package streaming
 
 import (
+	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -122,6 +124,30 @@ func TestCleanupReader(t *testing.T) {
 	assert.Equal(t, rdb.Exists(ctx, s.key).Val(), int64(1))
 	assert.NoError(t, s.Destroy(ctx))
 	assert.Eventually(t, func() bool { return rdb.Exists(ctx, s.key).Val() == 0 }, max, delay)
+}
+
+func TestReaderCloseOnFatalReadError(t *testing.T) {
+	testName := strings.Replace(t.Name(), "/", "_", -1)
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	ctx := ptesting.NewTestContext(t)
+	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
+	require.NoError(t, err)
+	reader, err := s.NewReader(ctx, options.WithReaderBlockDuration(testBlockDuration))
+	require.NoError(t, err)
+
+	// Simulate a fatal read error (e.g. the underlying stream key being
+	// destroyed) before the read goroutine starts. The read loop reacts to a
+	// fatal error by closing the reader; because Close waits on the read
+	// goroutine, it must run asynchronously or it would deadlock and leak the
+	// reader and its Redis connection.
+	reader.xreadFn = func(context.Context) ([]redis.XStream, error) {
+		return nil, fmt.Errorf("stream key no longer exists")
+	}
+	reader.Subscribe()
+
+	require.Eventually(t, func() bool { return reader.IsClosed() }, max, delay,
+		"reader did not close after a fatal read error (Close likely deadlocked on its own read goroutine)")
 }
 
 func TestAddReaderStream(t *testing.T) {
