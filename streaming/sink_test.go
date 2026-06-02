@@ -19,6 +19,53 @@ var (
 	testAckDuration     = 50 * time.Millisecond
 )
 
+func TestSinkCloseWithStalledSubscriber(t *testing.T) {
+	testName := strings.Replace(t.Name(), "/", "_", -1)
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	ctx := ptesting.NewTestContext(t)
+	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
+	require.NoError(t, err)
+
+	// Tiny buffer so the read loop's fan-out send blocks after a couple of
+	// events when the subscriber never drains its channel.
+	sink, err := s.NewSink(ctx, "sink",
+		options.WithSinkStartAtOldest(),
+		options.WithSinkBlockDuration(testBlockDuration),
+		options.WithSinkBufferSize(1))
+	require.NoError(t, err)
+
+	// Subscribe but deliberately never read from the channel so the read
+	// loop fills the buffer and then parks on the next fan-out send.
+	c := sink.Subscribe()
+
+	// Add more events than the buffer can hold so the read loop parks on
+	// `c <- ev` inside streamEvents.
+	for range 5 {
+		_, err = s.Add(ctx, "event", []byte("payload"))
+		require.NoError(t, err)
+	}
+
+	// Wait until the buffer is full, which means the read loop has consumed
+	// events and is now parked on the fan-out send to the stalled subscriber.
+	require.Eventually(t, func() bool { return len(c) == cap(c) }, max, delay)
+
+	// Close must return even though the subscriber stalled the read loop.
+	done := make(chan struct{})
+	go func() {
+		sink.Close(ctx)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sink.Close() hung with a stalled subscriber")
+	}
+	assert.True(t, sink.IsClosed())
+
+	require.NoError(t, s.Destroy(ctx))
+}
+
 func TestNewSink(t *testing.T) {
 	testName := strings.Replace(t.Name(), "/", "_", -1)
 	rdb := ptesting.NewRedisClient(t)

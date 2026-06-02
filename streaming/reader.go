@@ -44,6 +44,8 @@ type (
 		chans []chan *Event
 		// startOnce is used to ensure the reader is started only once.
 		startOnce sync.Once
+		// closeOnce is used to ensure the reader is closed only once.
+		closeOnce sync.Once
 		// donechan is the reader donechan channel.
 		donechan chan struct{}
 		// streamschan notifies the reader when streams are added or
@@ -185,21 +187,26 @@ func (r *Reader) RemoveStream(ctx context.Context, stream *Stream) error {
 }
 
 // Close stops event polling and closes the reader channel. It is safe to call
-// Close multiple times.
+// Close multiple times; concurrent callers block until the first Close
+// completes. Close returns only once the read goroutine has stopped and its
+// resources are released, which may take up to one block duration.
 func (r *Reader) Close() {
-	r.lock.Lock()
-	if r.closing {
-		return
-	}
-	r.closing = true
-	close(r.donechan)
-	close(r.streamschan)
-	r.lock.Unlock()
-	r.wait.Wait()
-	r.lock.Lock()
-	defer r.lock.Unlock()
-	r.closed = true
-	r.logger.Info("stopped")
+	r.closeOnce.Do(func() {
+		// Close donechan first, without holding the lock, so the signal
+		// reaches the read loop even when it is parked on a fan-out send
+		// to a stalled subscriber (which holds the lock). Otherwise Close
+		// would deadlock acquiring the lock the read loop never releases.
+		close(r.donechan)
+		r.lock.Lock()
+		r.closing = true
+		close(r.streamschan)
+		r.lock.Unlock()
+		r.wait.Wait()
+		r.lock.Lock()
+		defer r.lock.Unlock()
+		r.closed = true
+		r.logger.Info("stopped")
+	})
 }
 
 // IsClosed returns true if the reader is stopped.
@@ -247,7 +254,7 @@ func (r *Reader) read() {
 		r.lock.Lock()
 		for _, events := range streamsEvents {
 			streamName := events.Stream[len(streamKeyPrefix):]
-			streamEvents(streamName, events.Stream, "", events.Messages, r.eventFilter, r.chans, r.rdb, r.logger)
+			streamEvents(streamName, events.Stream, "", events.Messages, r.eventFilter, r.chans, r.donechan, r.rdb, r.logger)
 			for i := range r.streamKeys {
 				if r.streamKeys[i] == events.Stream {
 					r.streamCursors[i] = events.Messages[len(events.Messages)-1].ID
@@ -321,6 +328,7 @@ func streamEvents(
 	msgs []redis.XMessage,
 	eventFilter eventFilterFunc,
 	chans []chan *Event,
+	done <-chan struct{},
 	rdb *redis.Client,
 	logger pulse.Logger,
 ) {
@@ -348,7 +356,17 @@ func streamEvents(
 		}
 		logger.Debug("event", "stream", streamName, "event", ev.EventName, "id", ev.ID, "channels", len(chans))
 		for _, c := range chans {
-			c <- ev
+			select {
+			case c <- ev:
+			case <-done:
+				// The reader/sink is closing; stop fanning out so the
+				// read loop can return and release its resources instead
+				// of blocking forever on a stalled subscriber. Any
+				// remaining subscribers and messages in this batch are
+				// abandoned: delivery is at-most-once and the reader/sink
+				// is being torn down, so partial fan-out is acceptable.
+				return
+			}
 		}
 	}
 }

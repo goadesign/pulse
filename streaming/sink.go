@@ -75,6 +75,8 @@ type (
 		donechan chan struct{}
 		// wait is the sink cleanup wait group.
 		wait sync.WaitGroup
+		// closeOnce is used to ensure the sink is closed only once.
+		closeOnce sync.Once
 		// closing is true if Close was called.
 		closing bool
 		// eventFilter is the event filter if any.
@@ -291,30 +293,33 @@ func (s *Sink) RemoveStream(ctx context.Context, stream *Stream) error {
 }
 
 // Close stops event polling, waits for all events to be processed, and closes the sink channel.
-// It is safe to call Close multiple times.
+// It is safe to call Close multiple times; concurrent callers block until the
+// first Close completes.
 func (s *Sink) Close(ctx context.Context) {
-	s.lock.Lock()
-	if s.closing {
+	s.closeOnce.Do(func() {
+		// Close donechan first, without holding the lock, so the signal
+		// reaches the read loop even when it is parked on a fan-out send
+		// to a stalled subscriber (which holds the lock). Otherwise Close
+		// would deadlock acquiring the lock the read loop never releases.
+		close(s.donechan)
+		s.lock.Lock()
+		s.closing = true
 		s.lock.Unlock()
-		return
-	}
-	s.closing = true
-	close(s.donechan)
-	s.lock.Unlock()
-	s.wait.Wait()
-	s.lock.Lock()
-	defer s.lock.Unlock()
-	for _, c := range s.chans {
-		close(c)
-	}
-	// Note: we do not delete the consumer from the keep-alive and consumer maps
-	// so that another instance may claim any pending messages.
-	s.consumersKeepAliveMap.Close()
-	for _, cm := range s.consumersMap {
-		cm.Close()
-	}
-	s.closed = true
-	s.logger.Info("closed")
+		s.wait.Wait()
+		s.lock.Lock()
+		defer s.lock.Unlock()
+		for _, c := range s.chans {
+			close(c)
+		}
+		// Note: we do not delete the consumer from the keep-alive and consumer maps
+		// so that another instance may claim any pending messages.
+		s.consumersKeepAliveMap.Close()
+		for _, cm := range s.consumersMap {
+			cm.Close()
+		}
+		s.closed = true
+		s.logger.Info("closed")
+	})
 }
 
 // IsClosed returns true if the sink was closed.
@@ -457,7 +462,7 @@ func (s *Sink) read(ctx context.Context) {
 		}
 		for _, events := range streams {
 			streamName := events.Stream[len(streamKeyPrefix):]
-			streamEvents(streamName, events.Stream, s.Name, events.Messages, s.eventFilter, s.chans, s.rdb, s.logger)
+			streamEvents(streamName, events.Stream, s.Name, events.Messages, s.eventFilter, s.chans, s.donechan, s.rdb, s.logger)
 		}
 		s.lock.Unlock()
 	}
@@ -574,7 +579,7 @@ func (s *Sink) claim(ctx context.Context, streamName string, args redis.XAutoCla
 	messages, start, err := s.rdb.XAutoClaim(ctx, &args).Result()
 	if len(messages) > 0 {
 		s.logger.Info("claimed", "stream", streamName, "messages", len(messages))
-		streamEvents(streamName, args.Stream, s.Name, messages, s.eventFilter, s.chans, s.rdb, s.logger)
+		streamEvents(streamName, args.Stream, s.Name, messages, s.eventFilter, s.chans, s.donechan, s.rdb, s.logger)
 	}
 	return start, err
 }
