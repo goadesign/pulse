@@ -21,7 +21,7 @@ func TestWorkerRequeueJobs(t *testing.T) {
 		ctx      = ptesting.NewTestContext(t)
 		testName = strings.Replace(t.Name(), "/", "_", -1)
 		rdb      = ptesting.NewRedisClient(t)
-		node     = newTestNode(t, ctx, rdb, testName)
+		node     = newFastCleanupTestNode(t, ctx, rdb, testName)
 	)
 	defer ptesting.CleanupRedis(t, rdb, false, testName)
 	ctx, cancel := context.WithTimeout(ctx, time.Second)
@@ -172,7 +172,7 @@ func TestStaleWorkerCleanupInNode(t *testing.T) {
 		ctx      = ptesting.NewTestContext(t)
 		testName = strings.Replace(t.Name(), "/", "_", -1)
 		rdb      = ptesting.NewRedisClient(t)
-		node     = newTestNode(t, ctx, rdb, testName)
+		node     = newFastCleanupTestNode(t, ctx, rdb, testName)
 	)
 	defer ptesting.CleanupRedis(t, rdb, false, testName)
 
@@ -207,8 +207,8 @@ func TestStaleWorkerCleanupAcrossNodes(t *testing.T) {
 		ctx      = ptesting.NewTestContext(t)
 		testName = strings.Replace(t.Name(), "/", "_", -1)
 		rdb      = ptesting.NewRedisClient(t)
-		node1    = newTestNode(t, ctx, rdb, testName+"_1")
-		node2    = newTestNode(t, ctx, rdb, testName+"_2")
+		node1    = newFastCleanupTestNode(t, ctx, rdb, testName+"_1")
+		node2    = newFastCleanupTestNode(t, ctx, rdb, testName+"_2")
 	)
 	defer ptesting.CleanupRedis(t, rdb, false, testName)
 
