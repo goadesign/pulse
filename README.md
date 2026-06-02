@@ -102,6 +102,15 @@ flowchart LR
 
 See the [pool package README](pool/README.md) for more details.
 
+## Leased Semaphores
+
+Pulse semaphores provide Redis-backed concurrency limits shared across many
+processes. A caller waits for a slot, receives a lease when admitted, and
+releases the lease when the protected work is complete. If a process dies while
+holding a slot, the lease expires so another caller can make progress.
+
+See the [semaphore package README](semaphore/README.md) for more details.
+
 ## Examples
 
 See the [examples](examples) directory for examples of how to use the packages
