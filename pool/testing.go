@@ -31,10 +31,14 @@ type mockMessageHandler struct {
 }
 
 const (
-	testWorkerShutdownTTL    = 100 * time.Millisecond
-	testJobSinkBlockDuration = 100 * time.Millisecond
-	testWorkerTTL            = 150 * time.Millisecond
-	testAckGracePeriod       = 50 * time.Millisecond
+	testWorkerShutdownTTL     = 100 * time.Millisecond
+	testJobSinkBlockDuration  = 100 * time.Millisecond
+	testWorkerTTL             = 2 * time.Second
+	testFastWorkerTTL         = 150 * time.Millisecond
+	testFastWorkerShutdownTTL = 100 * time.Millisecond
+	// testAckGracePeriod should cover scheduler jitter under -race; tests that
+	// need fast stale-worker detection use the worker TTLs above instead.
+	testAckGracePeriod = 500 * time.Millisecond
 )
 
 // newTestNode creates a new Node instance for testing purposes.
@@ -47,6 +51,22 @@ func newTestNode(t *testing.T, ctx context.Context, rdb *redis.Client, name stri
 		WithWorkerShutdownTTL(testWorkerShutdownTTL),
 		WithJobSinkBlockDuration(testJobSinkBlockDuration),
 		WithWorkerTTL(testWorkerTTL),
+		WithAckGracePeriod(testAckGracePeriod))
+	require.NoError(t, err)
+	return node
+}
+
+// newFastCleanupTestNode creates a node with deliberately short liveness TTLs
+// for tests that exercise stale node or worker cleanup. Regular dispatch tests
+// use newTestNode so a busy race-enabled scheduler cannot make healthy nodes
+// look dead.
+func newFastCleanupTestNode(t *testing.T, ctx context.Context, rdb *redis.Client, name string) *Node {
+	t.Helper()
+	node, err := AddNode(ctx, name, rdb,
+		WithLogger(pulse.ClueLogger(ctx)),
+		WithWorkerShutdownTTL(testFastWorkerShutdownTTL),
+		WithJobSinkBlockDuration(testJobSinkBlockDuration),
+		WithWorkerTTL(testFastWorkerTTL),
 		WithAckGracePeriod(testAckGracePeriod))
 	require.NoError(t, err)
 	return node

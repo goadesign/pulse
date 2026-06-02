@@ -98,8 +98,8 @@ func TestJobKeys(t *testing.T) {
 
 	node1 := newTestNode(t, ctx, rdb, testName)
 	node2 := newTestNode(t, ctx, rdb, testName)
-	newTestWorker(t, ctx, node1)
-	newTestWorker(t, ctx, node2)
+	worker1 := newTestWorker(t, ctx, node1)
+	worker2 := newTestWorker(t, ctx, node2)
 	defer func() {
 		assert.NoError(t, node1.Shutdown(ctx))
 		assert.NoError(t, node2.Shutdown(ctx))
@@ -107,6 +107,7 @@ func TestJobKeys(t *testing.T) {
 
 	// Configure nodes to send jobs to specific workers
 	node1.h, node2.h = &ptesting.Hasher{Index: 0}, &ptesting.Hasher{Index: 1}
+	requireActiveWorkerRing(t, []*Node{node1, node2}, worker1.ID, worker2.ID)
 
 	jobs := []struct {
 		key     string
@@ -333,12 +334,13 @@ func TestDispatchJobRaceCondition(t *testing.T) {
 
 	node1 := newTestNode(t, ctx, rdb, testName)
 	node2 := newTestNode(t, ctx, rdb, testName)
-	newTestWorker(t, ctx, node1)
-	newTestWorker(t, ctx, node2)
+	worker1 := newTestWorker(t, ctx, node1)
+	worker2 := newTestWorker(t, ctx, node2)
 	defer func() {
 		assert.NoError(t, node1.Shutdown(ctx))
 		assert.NoError(t, node2.Shutdown(ctx))
 	}()
+	requireActiveWorkerRing(t, []*Node{node1, node2}, worker1.ID, worker2.ID)
 
 	t.Run("concurrent dispatch of same job returns error", func(t *testing.T) {
 		// Start dispatching same job from both nodes concurrently
@@ -802,6 +804,7 @@ func TestTwoNodeJobDispatchAndAck(t *testing.T) {
 
 	// Configure nodes to send all jobs to worker2
 	node1.h, node2.h = &ptesting.Hasher{Index: 1}, &ptesting.Hasher{Index: 1}
+	requireActiveWorkerRing(t, []*Node{node1, node2}, worker1.ID, worker2.ID)
 
 	// Set up job completion signal
 	jobDone := make(chan struct{})
@@ -849,6 +852,7 @@ func TestNodeCloseAndRequeue(t *testing.T) {
 
 	// Configure nodes to send all jobs to worker1
 	node1.h, node2.h = &ptesting.Hasher{Index: 0}, &ptesting.Hasher{Index: 0}
+	requireActiveWorkerRing(t, []*Node{node1, node2}, worker1.ID, worker2.ID)
 
 	// Set up job requeuing detection
 	jobRequeued := make(chan struct{})
@@ -982,8 +986,8 @@ func TestStaleNodeStreamCleanup(t *testing.T) {
 		ctx      = ptesting.NewTestContext(t)
 		testName = strings.Replace(t.Name(), "/", "_", -1)
 		rdb      = ptesting.NewRedisClient(t)
-		node1    = newTestNode(t, ctx, rdb, testName)
-		node2    = newTestNode(t, ctx, rdb, testName)
+		node1    = newFastCleanupTestNode(t, ctx, rdb, testName)
+		node2    = newFastCleanupTestNode(t, ctx, rdb, testName)
 		numJobs  = 0
 	)
 	defer ptesting.CleanupRedis(t, rdb, false, testName)
@@ -1002,13 +1006,9 @@ func TestStaleNodeStreamCleanup(t *testing.T) {
 	node2.h = node1.h
 
 	// Create workers and dispatch jobs to both nodes to ensure streams exist
-	newTestWorker(t, ctx, node1)
-	newTestWorker(t, ctx, node2)
-
-	// Make sure workers are registered with both nodes
-	require.Eventually(t, func() bool {
-		return len(node1.PoolWorkers()) == 2 && len(node2.PoolWorkers()) == 2
-	}, max, delay, "Workers were not registered with both nodes")
+	worker1 := newTestWorker(t, ctx, node1)
+	worker2 := newTestWorker(t, ctx, node2)
+	requireActiveWorkerRing(t, []*Node{node1, node2}, worker1.ID, worker2.ID)
 
 	// Dispatch jobs to both nodes
 	assert.NoError(t, node1.DispatchJob(ctx, "job1", []byte("payload1")))
@@ -1319,7 +1319,7 @@ func TestRequeueOrphanedPayloads(t *testing.T) {
 			testName := strings.Replace(t.Name(), "/", "_", -1)
 			ctx := ptesting.NewTestContext(t)
 			rdb := ptesting.NewRedisClient(t)
-			node := newTestNode(t, ctx, rdb, testName)
+			node := newFastCleanupTestNode(t, ctx, rdb, testName)
 			worker := newTestWorker(t, ctx, node)
 			defer ptesting.CleanupRedis(t, rdb, true, testName)
 
@@ -1348,7 +1348,7 @@ func TestRequeueOrphanedPayloads(t *testing.T) {
 			// Requeue orphaned payloads.
 			// First call records the first-seen timestamp; second call after grace requeues.
 			node.requeueOrphanedPayloads(ctx)
-			time.Sleep(2*testWorkerTTL + 20*time.Millisecond)
+			time.Sleep(orphanedPayloadGrace(node) + 20*time.Millisecond)
 			node.requeueOrphanedPayloads(ctx)
 
 			// Verify the previously deleted job keys reappear in the job map.
@@ -1362,6 +1362,33 @@ func TestRequeueOrphanedPayloads(t *testing.T) {
 			assert.NoError(t, node.Shutdown(ctx))
 		})
 	}
+}
+
+// requireActiveWorkerRing waits until every node has replicated the same active
+// worker ring the test is about to route through. Dispatch tests depend on this
+// contract; without it they can race rmap propagation instead of testing pool
+// behavior.
+func requireActiveWorkerRing(t *testing.T, nodes []*Node, workerIDs ...string) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		for _, node := range nodes {
+			if !sameStrings(node.activeWorkers(), workerIDs) {
+				return false
+			}
+		}
+		return true
+	}, max, delay, "active worker ring did not converge")
+}
+
+// orphanedPayloadGrace mirrors the recovery grace used by
+// requeueOrphanedPayloads so tests wait for the behavior's contract instead of
+// an unrelated timing constant.
+func orphanedPayloadGrace(node *Node) time.Duration {
+	grace := 2 * node.workerTTL
+	if grace < node.ackGracePeriod {
+		return node.ackGracePeriod
+	}
+	return grace
 }
 
 type mockAcker struct {
