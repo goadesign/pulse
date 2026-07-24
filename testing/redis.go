@@ -69,6 +69,11 @@ func CleanupRedis(t *testing.T, rdb *redis.Client, checkClean bool, testName str
 					// reconnecting replicas can order the next generation correctly.
 					continue
 				}
+				if isDestroyedStreamLifecycle(ctx, rdb, k) {
+					// Destroyed stream lifecycles are the intentional fence that
+					// prevents concurrent sinks from resurrecting stream metadata.
+					continue
+				}
 				if streamRegexp.MatchString(k) {
 					// Node streams are cleaned up asynchronously, so ignore them
 					continue
@@ -82,6 +87,17 @@ func CleanupRedis(t *testing.T, rdb *redis.Client, checkClean bool, testName str
 		require.NoError(t, keysErr)
 	}
 	assert.NoError(t, rdb.FlushDB(ctx).Err())
+}
+
+// isDestroyedStreamLifecycle reports whether key is the lifecycle fence of a
+// destroyed stream. Destroyed lifecycles intentionally outlive Stream.Destroy
+// so concurrent sinks cannot recreate the stream metadata.
+func isDestroyedStreamLifecycle(ctx context.Context, rdb *redis.Client, key string) bool {
+	if !strings.HasPrefix(key, "pulse:streammeta:") || !strings.HasSuffix(key, ":lifecycle") {
+		return false
+	}
+	state, err := rdb.HGet(ctx, key, "state").Result()
+	return err == nil && state == "destroyed"
 }
 
 func isDestroyTombstone(ctx context.Context, rdb *redis.Client, key string) bool {

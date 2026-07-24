@@ -87,6 +87,20 @@ type (
 		// streamKey is the Redis key of the stream.
 		streamKey string
 	}
+
+	// readRetry computes jittered exponential backoff delays for reader and
+	// sink Redis failures. Jitter spans half to full of the current backoff
+	// so replicas that fail together do not retry in lockstep.
+	readRetry struct {
+		backoff time.Duration
+	}
+)
+
+const (
+	// minReadRetryBackoff is the first retry backoff after a Redis failure.
+	minReadRetryBackoff = 50 * time.Millisecond
+	// maxReadRetryBackoff caps the exponential retry backoff.
+	maxReadRetryBackoff = 5 * time.Second
 )
 
 // newReader creates a new reader.
@@ -230,16 +244,24 @@ func (r *Reader) start() {
 var xreadFn = (*Reader).xread
 
 // read reads events from the streams and sends them to the reader channel.
+// Transient Redis failures are retried with jittered exponential backoff so
+// reader replicas that fail together do not hammer Redis in lockstep.
 func (r *Reader) read() {
 	ctx := context.Background()
 	defer r.cleanup()
+	var retry readRetry
 	for {
 		streamsEvents, err := xreadFn(r, ctx)
 		if r.isClosing() {
 			return
 		}
 		if err != nil {
-			if err := handleReadError(err, r.logger); err != nil {
+			if err == redis.Nil {
+				// No event at this time, just loop.
+				retry.reset()
+				continue
+			}
+			if isFatalReaderError(err) {
 				r.logger.Error(fmt.Errorf("fatal error while reading events: %w, stopping", err))
 				// Close waits on this goroutine via wait.Wait, so calling it
 				// synchronously here would deadlock and leak the reader and its
@@ -248,13 +270,19 @@ func (r *Reader) read() {
 				pulse.Go(r.logger, r.Close)
 				return
 			}
+			if !retry.wait(r.donechan, err, r.logger) {
+				return
+			}
 			continue
 		}
+		retry.reset()
 
 		r.lock.Lock()
 		for _, events := range streamsEvents {
 			streamName := events.Stream[len(streamKeyPrefix):]
-			streamEvents(streamName, events.Stream, "", events.Messages, r.eventFilter, r.chans, r.donechan, r.rdb, r.logger)
+			if err := streamEvents(ctx, streamName, events.Stream, "", events.Messages, r.rdb, false, r.eventFilter, r.chans, r.donechan, r.logger); err != nil {
+				r.logger.Error(fmt.Errorf("failed to stream events: %w", err))
+			}
 			for i := range r.streamKeys {
 				if r.streamKeys[i] == events.Stream {
 					r.streamCursors[i] = events.Messages[len(events.Messages)-1].ID
@@ -319,21 +347,65 @@ func (e *Event) CreatedAt() time.Time {
 	return time.Unix(seconds, nanos).UTC()
 }
 
-// streamEvents filters and streams the Redis messages as events to c.
-// The caller is responsible for locking c.
+// reset clears the backoff so the next failure starts from the minimum delay.
+func (r *readRetry) reset() {
+	r.backoff = 0
+}
+
+// wait logs err and sleeps for the next jittered backoff delay. It returns
+// false when done closes during the wait, signaling the caller to stop.
+func (r *readRetry) wait(done <-chan struct{}, err error, logger pulse.Logger) bool {
+	d := r.next()
+	logger.Error(fmt.Errorf("failed to read events: %w, retrying in %v", err, d))
+	select {
+	case <-done:
+		return false
+	case <-time.After(d):
+		return true
+	}
+}
+
+// next returns a delay uniformly distributed in [backoff/2, backoff] and
+// doubles the backoff up to maxReadRetryBackoff.
+func (r *readRetry) next() time.Duration {
+	if r.backoff == 0 {
+		r.backoff = minReadRetryBackoff
+	}
+	d := r.backoff/2 + time.Duration(rand.Int63n(int64(r.backoff/2)+1))
+	r.backoff = min(2*r.backoff, maxReadRetryBackoff)
+	return d
+}
+
+// streamEvents filters and streams the Redis messages as events to the
+// subscriber channels. The caller is responsible for locking chans. For sinks
+// (sinkName non-empty) acker settles events that are never delivered to
+// subscribers so the recovery cursor keeps advancing: filtered events are
+// acknowledged individually, and when autoAck is set the whole batch is
+// settled upfront because delivery is already at-most-once.
 func streamEvents(
+	ctx context.Context,
 	streamName string,
 	streamKey string,
 	sinkName string,
 	msgs []redis.XMessage,
+	acker Acker,
+	autoAck bool,
 	eventFilter eventFilterFunc,
 	chans []chan *Event,
 	done <-chan struct{},
-	rdb *redis.Client,
 	logger pulse.Logger,
-) {
+) error {
 	if len(msgs) == 0 {
-		return
+		return nil
+	}
+	if autoAck && sinkName != "" {
+		ids := make([]string, len(msgs))
+		for i, msg := range msgs {
+			ids[i] = msg.ID
+		}
+		if err := acker.XAck(ctx, streamKey, sinkName, ids...).Err(); err != nil {
+			return fmt.Errorf("failed to advance recovery cursor for auto-acked events: %w", err)
+		}
 	}
 	for _, event := range msgs {
 		var topic string
@@ -348,9 +420,14 @@ func streamEvents(
 			Topic:      topic,
 			Payload:    []byte(event.Values[payloadKey].(string)),
 			streamKey:  streamKey,
-			Acker:      rdb,
+			Acker:      acker,
 		}
 		if eventFilter != nil && !eventFilter(ev) {
+			if sinkName != "" && !autoAck {
+				if err := acker.XAck(ctx, streamKey, sinkName, ev.ID).Err(); err != nil {
+					return fmt.Errorf("failed to acknowledge filtered event %s: %w", ev.ID, err)
+				}
+			}
 			logger.Debug("event filtered", "event", ev.EventName, "id", ev.ID, "stream", streamName)
 			continue
 		}
@@ -365,26 +442,15 @@ func streamEvents(
 				// remaining subscribers and messages in this batch are
 				// abandoned: delivery is at-most-once and the reader/sink
 				// is being torn down, so partial fan-out is acceptable.
-				return
+				return nil
 			}
 		}
 	}
+	return nil
 }
 
-// handleReadError retries retryable read errors and ignores non-retryable.
-func handleReadError(err error, logger pulse.Logger) error {
-	if strings.Contains(err.Error(), "stream key no longer exists") {
-		return err // Fatal error
-	}
-	if err == redis.Nil {
-		return nil // No event at this time, just loop
-	}
-	if strings.Contains(err.Error(), "NOGROUP") {
-		return nil // Consumer group was removed with RemoveStream, just loop (s.streamCursors will be updated)
-	}
-	// Retryable error, sleep and loop
-	d := time.Duration(rand.Intn(maxJitterMs)) * time.Millisecond
-	logger.Error(fmt.Errorf("failed to read events: %w, retrying in %v", err, d))
-	time.Sleep(d)
-	return nil
+// isFatalReaderError reports whether the read loop must stop instead of
+// retrying, which happens when the underlying stream key was destroyed.
+func isFatalReaderError(err error) bool {
+	return strings.Contains(err.Error(), "stream key no longer exists")
 }

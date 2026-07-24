@@ -149,6 +149,37 @@ flowchart LR
     linkStyle 6 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
 ```
 
+## Failure recovery
+
+Sinks are designed to survive Redis state loss without dropping acknowledged
+work or losing unacknowledged events:
+
+- **Lossless consumer group recovery**: each sink keeps a durable *recovery
+  cursor* per stream (the highest event ID known to be fully acknowledged),
+  advanced atomically with every acknowledgment from the exact pending entry
+  list state. When the Redis consumer group disappears (e.g. `XGROUP DESTROY`
+  or key loss) the sink recreates the group at the recovery cursor — never at
+  `$` — so every unacknowledged event is redelivered and no acknowledged event
+  is replayed. Events acknowledged out of order ahead of the cursor may be
+  redelivered after recovery (at-least-once).
+- **Jittered retries**: transient Redis failures in readers and sinks are
+  retried with exponential backoff jittered between half and full of the
+  current delay so replicas do not retry in lockstep.
+- **Prompt shutdown**: `Sink.Close` cancels all sink-owned Redis I/O,
+  including blocked reads and recovery in progress. `AddStream` and
+  `RemoveStream` return `ErrSinkClosed` after `Close`.
+- **Fenced maintenance**: idle-message claiming (`XAUTOCLAIM`) and stale
+  consumer cleanup run under a per-stream lease fenced with Redis time; lease
+  renewal and the guarded mutation are one atomic operation so a stale sink
+  instance can never mutate the pending entry list after another instance
+  takes over.
+- **Destroy fence**: `Stream.Destroy` atomically deletes the stream and all
+  its sink metadata and marks the stream destroyed. Concurrent sinks observe
+  the destruction and drop the stream instead of resurrecting its metadata;
+  only a subsequent `NewSink` or `AddStream` deliberately recreates it.
+- The stream TTL (see above) is restored whenever a sink attaches to the
+  stream, even when the consumer group already exists.
+
 ## Reading from multiple streams
 
 Readers and sinks can also read concurrently from multiple streams:
