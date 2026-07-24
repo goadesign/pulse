@@ -418,6 +418,53 @@ func TestDestroyFencesSinkMetadataWrites(t *testing.T) {
 	assert.Equal(t, "destroyed", rdb.HGet(ctx, lifecycleKey(s.key), "state").Val())
 }
 
+// TestDispatchLeavesRemovedStreamEventsPending verifies that a batch read for
+// a stream removed from this sink concurrently with the read is left pending
+// for the surviving group members instead of being acknowledged undelivered,
+// which would permanently drop the events for the whole group.
+func TestDispatchLeavesRemovedStreamEventsPending(t *testing.T) {
+	testName := strings.Replace(t.Name(), "/", "_", -1)
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	ctx := ptesting.NewTestContext(t)
+	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
+	require.NoError(t, err)
+	removed, err := s.NewSink(ctx, "sink",
+		options.WithSinkStartAtOldest(),
+		options.WithSinkBlockDuration(testBlockDuration))
+	require.NoError(t, err)
+	defer removed.Close(ctx)
+	s2, err := NewStream(testName, ptesting.NewRedisClient(t), options.WithStreamLogger(pulse.ClueLogger(ctx)))
+	require.NoError(t, err)
+	survivor, err := s2.NewSink(ctx, "sink",
+		options.WithSinkStartAtOldest(),
+		options.WithSinkBlockDuration(testBlockDuration))
+	require.NoError(t, err)
+	defer cleanupSink(t, ctx, s2, survivor)
+
+	// Drop the stream from one sink; the group survives through the other
+	// member. Wait out reads issued before the removal so the event below is
+	// deterministically delivered to the survivor's consumer PEL, unacked.
+	c := survivor.Subscribe()
+	require.NoError(t, removed.RemoveStream(ctx, s))
+	time.Sleep(3 * testBlockDuration)
+	id, err := s.Add(ctx, "event", []byte("payload"))
+	require.NoError(t, err)
+	ev := receiveEvent(t, c)
+	require.Equal(t, id, ev.ID)
+
+	// Replay the racing batch against the sink that no longer owns the
+	// stream: dispatch must not settle the group's pending entry.
+	require.NoError(t, removed.dispatch([]redis.XStream{{
+		Stream:   s.key,
+		Messages: []redis.XMessage{{ID: id, Values: map[string]any{nameKey: "event", payloadKey: "payload"}}},
+	}}))
+	pending, err := rdb.XPending(ctx, s.key, "sink").Result()
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), pending.Count, "unowned batch must stay pending for surviving members")
+	require.NoError(t, survivor.Ack(ctx, ev))
+}
+
 // TestSinkAcknowledgesFilteredEvents verifies that events dropped by the sink
 // topic filter are acknowledged so they cannot hold back the recovery cursor.
 func TestSinkAcknowledgesFilteredEvents(t *testing.T) {

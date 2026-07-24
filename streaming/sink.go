@@ -402,21 +402,17 @@ func (s *Sink) read() {
 
 // dispatch fans out one XREADGROUP reply to the subscribers, settling events
 // through the recovery acker. Batches for streams removed from the sink
-// concurrently with the read are acknowledged without delivery so the
-// recovery cursor keeps advancing for the remaining sink instances.
+// concurrently with the read are left pending, never acknowledged: if other
+// sink instances remain in the group, the fenced idle-claim redelivers the
+// entries to one of them (stale-consumer cleanup skips consumers with pending
+// events), and if this was the last member the group was already destroyed so
+// the pending entries are gone with it.
 func (s *Sink) dispatch(streams []redis.XStream) error {
 	for _, events := range streams {
 		s.lock.Lock()
 		state, owned := s.streams[events.Stream]
 		if !owned {
 			s.lock.Unlock()
-			ids := make([]string, len(events.Messages))
-			for i, msg := range events.Messages {
-				ids[i] = msg.ID
-			}
-			if err := s.acker.XAck(s.ctx, events.Stream, s.Name, ids...).Err(); err != nil {
-				s.logger.Error(fmt.Errorf("failed to settle events of removed stream %s: %w", events.Stream, err))
-			}
 			continue
 		}
 		err := streamEvents(s.ctx, state.stream.Name, state.stream.key, s.Name, events.Messages, s.acker, s.noAck, s.eventFilter, s.chans, s.donechan, s.logger)
