@@ -587,12 +587,16 @@ func TestDispatchJobRaceCondition(t *testing.T) {
 		jobKey := "cleanup-job"
 		payload := []byte("test payload")
 
-		// Corrupt the pool stream to force dispatch failure
-		err := rdb.Del(ctx, "pulse:stream:"+poolStreamName(node1.PoolName)).Err()
-		require.NoError(t, err, "Failed to delete pool stream")
+		// Replace the Redis stream with a string so XADD fails. Deleting the
+		// stream no longer forces this path because the pool sink now
+		// recovers externally deleted consumer groups.
+		streamKey := "pulse:stream:" + poolStreamName(node1.PoolName)
+		require.NoError(t, rdb.Del(ctx, streamKey).Err())
+		require.NoError(t, rdb.Set(ctx, streamKey, "wrong-type", 0).Err())
+		defer func() { require.NoError(t, rdb.Del(ctx, streamKey).Err()) }()
 
 		// Attempt dispatch (should fail)
-		err = node1.DispatchJob(ctx, jobKey, payload)
+		err := node1.DispatchJob(ctx, jobKey, payload)
 		require.Error(t, err, "Expected dispatch to fail")
 
 		// Verify pending entry was cleaned up

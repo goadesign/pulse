@@ -8,7 +8,6 @@ import (
 
 	redis "github.com/redis/go-redis/v9"
 	"goa.design/pulse/pulse"
-	"goa.design/pulse/rmap"
 	"goa.design/pulse/streaming/options"
 )
 
@@ -180,41 +179,20 @@ func (s *Stream) Remove(ctx context.Context, ids ...string) error {
 	return nil
 }
 
-// Destroy deletes the entire stream and all its messages.
+// Destroy deletes the entire stream: its events and every piece of sink
+// metadata (consumer groups, recovery cursors, leases, and the sink
+// membership map) in one atomic operation. The stream lifecycle is marked
+// destroyed so concurrent sinks cannot resurrect the metadata; only a
+// subsequent NewSink or Sink.AddStream call deliberately recreates the
+// stream. Destroy is idempotent.
 func (s *Stream) Destroy(ctx context.Context) error {
-	if err := s.rdb.Del(ctx, s.key).Err(); err != nil {
+	if err := destroyStream(ctx, s); err != nil {
 		err := fmt.Errorf("failed to destroy stream: %w", err)
-		s.logger.Error(err)
-		return err
-	}
-	if err := s.destroyConsumersMap(ctx); err != nil {
-		err := fmt.Errorf("failed to destroy stream sink map: %w", err)
 		s.logger.Error(err)
 		return err
 	}
 	s.logger.Info("stream deleted")
 	return nil
-}
-
-// destroyConsumersMap removes the per-stream sink membership map through the
-// rmap destroy protocol so reconnecting replicas observe the same revisioned
-// destroy semantics as every other replicated map.
-func (s *Stream) destroyConsumersMap(ctx context.Context) error {
-	mapName := consumersMapName(s)
-	mapKey := fmt.Sprintf("map:%s:content", mapName)
-	exists, err := s.rdb.Exists(ctx, mapKey).Result()
-	if err != nil {
-		return err
-	}
-	if exists == 0 {
-		return nil
-	}
-	consumers, err := rmap.Join(ctx, mapName, s.rdb, consumersMapOptions(s, s.rootLogger)...)
-	if err != nil {
-		return err
-	}
-	defer consumers.Close()
-	return consumers.Destroy(ctx)
 }
 
 // redisKeyRegex is a regular expression that matches valid Redis keys.
