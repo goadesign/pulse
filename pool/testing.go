@@ -31,14 +31,14 @@ type mockMessageHandler struct {
 }
 
 const (
-	testWorkerShutdownTTL     = 100 * time.Millisecond
-	testJobSinkBlockDuration  = 100 * time.Millisecond
-	testWorkerTTL             = 2 * time.Second
-	testFastWorkerTTL         = 150 * time.Millisecond
-	testFastWorkerShutdownTTL = 100 * time.Millisecond
+	testRequeueTimeout       = 100 * time.Millisecond
+	testJobSinkBlockDuration = 100 * time.Millisecond
+	testWorkerTTL            = 2 * time.Second
+	testFastWorkerTTL        = 500 * time.Millisecond
+	testFastRequeueTimeout   = 100 * time.Millisecond
 	// testAckGracePeriod should cover scheduler jitter under -race; tests that
 	// need fast stale-worker detection use the worker TTLs above instead.
-	testAckGracePeriod = 500 * time.Millisecond
+	testAckGracePeriod = 4 * time.Second
 )
 
 // newTestNode creates a new Node instance for testing purposes.
@@ -46,12 +46,25 @@ const (
 // suitable for testing, and uses the provided Redis client and name.
 func newTestNode(t *testing.T, ctx context.Context, rdb *redis.Client, name string) *Node {
 	t.Helper()
+	return newTestNodeWithLogger(t, ctx, rdb, name, pulse.NoopLogger())
+}
+
+// newTestNodeWithLogger creates a regular test node with the supplied logger.
+func newTestNodeWithLogger(
+	t *testing.T,
+	ctx context.Context,
+	rdb *redis.Client,
+	name string,
+	logger pulse.Logger,
+) *Node {
+	t.Helper()
 	node, err := AddNode(ctx, name, rdb,
-		WithLogger(pulse.ClueLogger(ctx)),
-		WithWorkerShutdownTTL(testWorkerShutdownTTL),
+		WithLogger(logger),
+		WithRequeueTimeout(testRequeueTimeout),
 		WithJobSinkBlockDuration(testJobSinkBlockDuration),
 		WithWorkerTTL(testWorkerTTL),
-		WithAckGracePeriod(testAckGracePeriod))
+		WithDispatchTimeout(2*testAckGracePeriod),
+		WithRecoveryGrace(testAckGracePeriod))
 	require.NoError(t, err)
 	return node
 }
@@ -63,11 +76,12 @@ func newTestNode(t *testing.T, ctx context.Context, rdb *redis.Client, name stri
 func newFastCleanupTestNode(t *testing.T, ctx context.Context, rdb *redis.Client, name string) *Node {
 	t.Helper()
 	node, err := AddNode(ctx, name, rdb,
-		WithLogger(pulse.ClueLogger(ctx)),
-		WithWorkerShutdownTTL(testFastWorkerShutdownTTL),
+		WithLogger(pulse.NoopLogger()),
+		WithRequeueTimeout(testFastRequeueTimeout),
 		WithJobSinkBlockDuration(testJobSinkBlockDuration),
 		WithWorkerTTL(testFastWorkerTTL),
-		WithAckGracePeriod(testAckGracePeriod))
+		WithDispatchTimeout(2*testAckGracePeriod),
+		WithRecoveryGrace(testAckGracePeriod))
 	require.NoError(t, err)
 	return node
 }

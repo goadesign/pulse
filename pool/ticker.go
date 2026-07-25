@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -19,6 +20,7 @@ type (
 		C         <-chan time.Time
 		c         chan time.Time
 		name      string
+		node      *Node
 		lock      sync.Mutex
 		tickerMap *rmap.Map
 		timer     *time.Timer
@@ -43,6 +45,12 @@ func (node *Node) NewTicker(ctx context.Context, name string, d time.Duration, o
 	if node.clientOnly {
 		return nil, fmt.Errorf("cannot create ticker on client-only node")
 	}
+	if err := node.ensureGenerationActive(ctx); err != nil {
+		return nil, fmt.Errorf("create ticker: %w", err)
+	}
+	if d < time.Millisecond {
+		return nil, fmt.Errorf("create ticker: duration must be at least 1ms")
+	}
 	name = node.PoolName + ":" + name
 	o := parseTickerOptions(opts...)
 	logger := o.logger
@@ -54,25 +62,33 @@ func (node *Node) NewTicker(ctx context.Context, name string, d time.Duration, o
 		C:         c,
 		c:         c,
 		name:      name,
+		node:      node,
 		tickerMap: node.tickerMap,
 		mapch:     node.tickerMap.Subscribe(),
 		wg:        &sync.WaitGroup{},
 		logger:    logger,
 	}
 	if current, ok := node.tickerMap.Get(name); ok {
-		_, curd := deserialize(current)
+		_, curd, err := deserialize(current)
+		if err != nil {
+			node.tickerMap.Unsubscribe(t.mapch)
+			return nil, fmt.Errorf("create ticker: decode shared state: %w", err)
+		}
 		if d == curd {
 			t.next = current
 		}
 	}
 	if t.next == "" {
 		next := serialize(time.Now().Add(d), d)
-		if _, err := t.tickerMap.SetAndWait(ctx, t.name, next); err != nil {
+		if err := node.setPoolMapAndWait(ctx, node.tickerMap, node.resources.tickers, t.name, next); err != nil {
 			return nil, fmt.Errorf("failed to store tick and duration: %s", err)
 		}
 		t.next = next
 	}
-	t.initTimer()
+	if err := t.initTimer(); err != nil {
+		node.tickerMap.Unsubscribe(t.mapch)
+		return nil, fmt.Errorf("create ticker: %w", err)
+	}
 	t.wg.Add(1)
 	pulse.Go(logger, func() { t.handleEvents() })
 	return t, nil
@@ -103,12 +119,21 @@ func (t *Ticker) Close() {
 // not close the channel, to prevent a concurrent goroutine reading from the
 // channel from seeing an erroneous "tick".
 func (t *Ticker) Stop() {
+	if err := t.stop(context.Background()); err != nil {
+		t.logger.Error(err, "msg", "failed to stop ticker")
+	}
+}
+
+// stop deletes the canonical shared ticker before stopping this local replica.
+// A deletion failure leaves the ticker live so its owner can retry.
+func (t *Ticker) stop(ctx context.Context) error {
 	t.lock.Lock()
+	if err := t.node.deletePoolMap(ctx, t.node.resources.tickers, t.name); err != nil {
+		t.lock.Unlock()
+		return fmt.Errorf("delete shared ticker %q: %w", t.name, err)
+	}
 	if t.timer != nil {
 		t.timer.Stop()
-	}
-	if _, err := t.tickerMap.Delete(context.Background(), t.name); err != nil {
-		t.logger.Error(err, "msg", "failed to delete ticker")
 	}
 	if t.mapch != nil {
 		t.tickerMap.Unsubscribe(t.mapch)
@@ -116,6 +141,7 @@ func (t *Ticker) Stop() {
 	t.mapch = nil
 	t.lock.Unlock()
 	t.wg.Wait()
+	return nil
 }
 
 // handleEvents handles events from the ticker timer and map.
@@ -153,7 +179,12 @@ func (t *Ticker) handleEvents() {
 				continue
 			}
 			t.next = next
-			t.initTimer()
+			if err := t.initTimer(); err != nil {
+				t.logger.Error(err, "msg", "invalid shared ticker state")
+				t.stopInvalidStateLocked()
+				t.lock.Unlock()
+				return
+			}
 			t.lock.Unlock()
 		case <-t.timer.C:
 			t.handleTick()
@@ -165,13 +196,24 @@ func (t *Ticker) handleEvents() {
 func (t *Ticker) handleTick() {
 	t.lock.Lock()
 	defer t.lock.Unlock()
-	ts, d := deserialize(t.next)
+	ts, d, err := deserialize(t.next)
+	if err != nil {
+		t.logger.Error(err, "msg", "invalid shared ticker state")
+		t.stopInvalidStateLocked()
+		return
+	}
 	ts = ts.Add(d)
 	for ts.Before(time.Now()) {
 		ts = ts.Add(d)
 	}
 	next := serialize(ts, d)
-	prev, err := t.tickerMap.TestAndSet(context.Background(), t.name, t.next, next)
+	prev, err := t.node.testAndSetPoolMap(
+		context.Background(),
+		t.node.resources.tickers,
+		t.name,
+		t.next,
+		next,
+	)
 	if err != nil {
 		t.handleAdvanceFailureLocked(err, d)
 		return
@@ -179,21 +221,45 @@ func (t *Ticker) handleTick() {
 	if prev != t.next {
 		// Another node already updated the ticker, restart the timer.
 		t.next = prev
-		t.initTimer()
+		if err := t.initTimer(); err != nil {
+			t.logger.Error(err, "msg", "invalid shared ticker state")
+			t.stopInvalidStateLocked()
+		}
 		return
 	}
 	t.next = next
-	t.initTimer()
+	if err := t.initTimer(); err != nil {
+		t.logger.Error(err, "msg", "invalid shared ticker state")
+		t.stopInvalidStateLocked()
+		return
+	}
 	select {
 	case t.c <- time.Now():
 	default:
 	}
 }
 
-// initTimer sets the timer to fire at the next tick.
-func (t *Ticker) initTimer() {
-	next, _ := deserialize(t.next)
+// initTimer sets the timer to fire at the next strictly decoded tick.
+func (t *Ticker) initTimer() error {
+	next, _, err := deserialize(t.next)
+	if err != nil {
+		return err
+	}
 	t.resetTimerLocked(time.Until(next))
+	return nil
+}
+
+// stopInvalidStateLocked stops this replica after Redis returned malformed
+// canonical state. The caller holds lock; another explicit NewTicker may repair
+// the state only through the normal construction contract.
+func (t *Ticker) stopInvalidStateLocked() {
+	if t.mapch != nil {
+		t.tickerMap.Unsubscribe(t.mapch)
+		t.mapch = nil
+	}
+	if t.timer != nil {
+		t.timer.Stop()
+	}
 }
 
 // handleAdvanceFailureLocked logs a transient Redis advance failure and rearms
@@ -201,6 +267,14 @@ func (t *Ticker) initTimer() {
 // caller must hold t.lock.
 func (t *Ticker) handleAdvanceFailureLocked(err error, interval time.Duration) {
 	t.logger.Error(err, "msg", "failed to update next tick")
+	if errors.Is(err, ErrPoolGenerationLost) {
+		if t.mapch != nil {
+			t.tickerMap.Unsubscribe(t.mapch)
+			t.mapch = nil
+		}
+		t.timer.Stop()
+		return
+	}
 	t.resetTimerLocked(min(interval, tickerRetryMaxInterval))
 }
 
@@ -230,13 +304,22 @@ func serialize(t time.Time, d time.Duration) string {
 	return ts + "|" + ds
 }
 
-// deserialize returns the time and duration represented by the given serialized
-// string. s must be a value returned by serialize, the behavior is undefined
-// otherwise.
-func deserialize(s string) (time.Time, time.Duration) {
+// deserialize validates and returns one canonical shared ticker state.
+func deserialize(s string) (time.Time, time.Duration, error) {
 	parts := strings.Split(s, "|")
-	ts, _ := strconv.ParseInt(parts[0], 10, 64)
-	t := time.UnixMicro(ts)
-	d, _ := time.ParseDuration(parts[1])
-	return t, d
+	if len(parts) != 2 {
+		return time.Time{}, 0, fmt.Errorf("ticker state %q must contain timestamp and duration", s)
+	}
+	ts, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return time.Time{}, 0, fmt.Errorf("ticker state %q has invalid timestamp: %w", s, err)
+	}
+	d, err := time.ParseDuration(parts[1])
+	if err != nil {
+		return time.Time{}, 0, fmt.Errorf("ticker state %q has invalid duration: %w", s, err)
+	}
+	if d < time.Millisecond {
+		return time.Time{}, 0, fmt.Errorf("ticker state %q has duration below 1ms", s)
+	}
+	return time.UnixMicro(ts), d, nil
 }

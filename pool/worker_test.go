@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"goa.design/pulse/pulse"
 	"goa.design/pulse/rmap"
 	ptesting "goa.design/pulse/testing"
 )
@@ -21,10 +22,21 @@ func TestWorkerRequeueJobs(t *testing.T) {
 		ctx      = ptesting.NewTestContext(t)
 		testName = strings.Replace(t.Name(), "/", "_", -1)
 		rdb      = ptesting.NewRedisClient(t)
-		node     = newFastCleanupTestNode(t, ctx, rdb, testName)
 	)
 	defer ptesting.CleanupRedis(t, rdb, false, testName)
-	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	node, err := AddNode(
+		ctx,
+		testName,
+		rdb,
+		WithLogger(pulse.NoopLogger()),
+		WithRequeueTimeout(testFastRequeueTimeout),
+		WithJobSinkBlockDuration(testJobSinkBlockDuration),
+		WithWorkerTTL(testFastWorkerTTL),
+		WithDispatchTimeout(16*time.Second),
+		WithRecoveryGrace(8*time.Second),
+	)
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	// Create a worker and dispatch a job
@@ -36,7 +48,7 @@ func TestWorkerRequeueJobs(t *testing.T) {
 
 	// Emulate the worker failing by preventing it from refreshing its keepalive
 	// This means we can't cleanup cleanly, hence "false" in CleanupRedis
-	worker.stop(ctx)
+	require.NoError(t, worker.stop(ctx))
 
 	// Create a new worker to pick up the requeued job
 	newWorker := newTestWorker(t, ctx, node)
@@ -51,7 +63,7 @@ func TestWorkerRequeueJobs(t *testing.T) {
 	// Increase 'max' to cover the time until requeue happens
 	require.Eventually(t, func() bool {
 		return len(newWorker.Jobs()) == 2
-	}, time.Second, delay, "job was not requeued")
+	}, 10*time.Second, delay, "job was not requeued")
 
 	// Cleanup
 	assert.NoError(t, node.Shutdown(ctx))
@@ -95,6 +107,20 @@ func TestWorkerRebalanceReleasesPreviousJobOwner(t *testing.T) {
 	assert.NoError(t, node.Shutdown(ctx))
 }
 
+func TestWorkerJobsPreservesRequeuedState(t *testing.T) {
+	worker := &Worker{ID: "worker", CreatedAt: time.Unix(1, 0)}
+	worker.jobs.Store("job", &Job{
+		Key:       "job",
+		Payload:   []byte("payload"),
+		CreatedAt: time.Unix(2, 0),
+		Requeued:  true,
+	})
+
+	jobs := worker.Jobs()
+	require.Len(t, jobs, 1)
+	assert.True(t, jobs[0].Requeued)
+}
+
 func TestWorkerStartFailurePayloadOwnership(t *testing.T) {
 	var (
 		ctx      = ptesting.NewTestContext(t)
@@ -130,11 +156,86 @@ func TestWorkerStartFailurePayloadOwnership(t *testing.T) {
 	})
 	assert.ErrorIs(t, err, errStart)
 	assert.Empty(t, snapshotJobOwners(t, ctx, node, "requeued-job"))
-	gotPayload, ok := snapshotValue(t, ctx, node, node.jobPayloadMap, "requeued-job")
-	require.True(t, ok)
-	assert.Equal(t, "requeued payload", gotPayload)
+	_, ok = snapshotValue(t, ctx, node, node.jobPayloadMap, "requeued-job")
+	assert.False(t, ok)
 
 	assert.NoError(t, node.Shutdown(ctx))
+}
+
+func TestWorkerStartFailureRetriesDurableCleanup(t *testing.T) {
+	ctx := ptesting.NewTestContext(t)
+	testName := strings.Replace(t.Name(), "/", "_", -1)
+	rdb := ptesting.NewRedisClient(t)
+	failure := errors.New("injected start cleanup failure")
+	hook := &poolRedisHook{
+		failure:         failure,
+		startCleanupSHA: cleanupFailedStartScript.Hash(),
+	}
+	rdb.AddHook(hook)
+	node := newTestNode(t, ctx, rdb, testName)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	worker := newTestWorker(t, ctx, node)
+	startFailure := errors.New("start failed")
+	worker.handler.(*mockHandler).startFunc = func(job *Job) error {
+		return startFailure
+	}
+	job := &Job{
+		Key:       "job",
+		Payload:   []byte("payload"),
+		CreatedAt: time.Now(),
+		NodeID:    node.ID,
+	}
+
+	hook.failStartCleanup.Store(true)
+	err := worker.startJob(ctx, job)
+	require.ErrorIs(t, err, ErrRequeue)
+	require.ErrorIs(t, err, failure)
+	require.Equal(t, []string{worker.ID}, snapshotJobOwners(t, ctx, node, job.Key))
+	payload, ok := snapshotValue(t, ctx, node, node.jobPayloadMap, job.Key)
+	require.True(t, ok)
+	require.Equal(t, "payload", payload)
+
+	hook.failStartCleanup.Store(false)
+	err = worker.startJob(ctx, job)
+	require.ErrorIs(t, err, startFailure)
+	require.Empty(t, snapshotJobOwners(t, ctx, node, job.Key))
+	_, ok = snapshotValue(t, ctx, node, node.jobPayloadMap, job.Key)
+	require.False(t, ok)
+
+	require.NoError(t, node.Shutdown(ctx))
+}
+
+func TestWorkerLoopDropsMalformedEventAndContinues(t *testing.T) {
+	ctx := ptesting.NewTestContext(t)
+	testName := strings.Replace(t.Name(), "/", "_", -1)
+	rdb := ptesting.NewRedisClient(t)
+	node := newTestNode(t, ctx, rdb, testName)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	worker := newTestWorker(t, ctx, node)
+	started := make(chan string, 1)
+	worker.handler.(*mockHandler).startFunc = func(job *Job) error {
+		started <- job.Key
+		return nil
+	}
+
+	malformedID, err := worker.stream.Add(ctx, evStartJob, []byte{1, 2, 3})
+	require.NoError(t, err)
+	job := &Job{
+		Key:       "valid",
+		Payload:   []byte("payload"),
+		CreatedAt: time.Now(),
+		NodeID:    node.ID,
+	}
+	_, err = worker.stream.Add(ctx, evStartJob, marshalEnvelope(node.ID, marshalJob(job)))
+	require.NoError(t, err)
+	require.Equal(t, job.Key, <-started)
+	streamKey := generationStreamKey(ctx, rdb, worker.stream.Name)
+	require.Eventually(t, func() bool {
+		events, rangeErr := rdb.XRange(ctx, streamKey, malformedID, malformedID).Result()
+		return rangeErr == nil && len(events) == 0
+	}, max, delay)
+
+	require.NoError(t, node.Shutdown(ctx))
 }
 
 func TestWorkerControlEventsRequireLocalOwnership(t *testing.T) {
@@ -184,7 +285,7 @@ func TestStaleWorkerCleanupInNode(t *testing.T) {
 	staleWorkers := make([]*Worker, 5)
 	for i := 0; i < 5; i++ {
 		staleWorkers[i] = newTestWorker(t, ctx, node)
-		staleWorkers[i].stop(ctx)
+		require.NoError(t, staleWorkers[i].stop(ctx))
 		// Set the last seen time to a past time
 		_, err := node.workerKeepAliveMap.Set(ctx, staleWorkers[i].ID, strconv.FormatInt(time.Now().Add(-2*node.workerTTL).UnixNano(), 10))
 		assert.NoError(t, err)

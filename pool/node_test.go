@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"goa.design/pulse/pulse"
 	"goa.design/pulse/streaming"
 	ptesting "goa.design/pulse/testing"
 )
@@ -25,6 +27,342 @@ const (
 	// max is the maximum time to wait for an assertion to pass
 	max = time.Second
 )
+
+// poolRedisHook injects one rmap destroy failure for cleanup retry tests.
+type poolRedisHook struct {
+	failDestroy          atomic.Bool
+	failCompletion       atomic.Bool
+	failDetach           atomic.Bool
+	failNodeInit         atomic.Bool
+	failStartCleanup     atomic.Bool
+	blockShutdownCheck   atomic.Bool
+	key                  string
+	detachKey            string
+	completionSHA        string
+	startCleanupSHA      string
+	shutdownKey          string
+	nodeStreamPrefix     string
+	shutdownCheckStart   chan struct{}
+	releaseShutdownCheck chan struct{}
+	failure              error
+}
+
+// DialHook preserves normal Redis dialing.
+func (h *poolRedisHook) DialHook(next redis.DialHook) redis.DialHook {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return next(ctx, network, addr)
+	}
+}
+
+// ProcessHook fails the selected map's Lua destroy operation.
+func (h *poolRedisHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if h.blockShutdownCheck.Load() && cmd.Name() == "hexists" {
+			args := cmd.Args()
+			if len(args) == 3 && args[1] == h.shutdownKey && args[2] == "shutdown" &&
+				h.blockShutdownCheck.CompareAndSwap(true, false) {
+				close(h.shutdownCheckStart)
+				<-h.releaseShutdownCheck
+			}
+		}
+		if h.failCompletion.Load() && cmd.Name() == "evalsha" {
+			args := cmd.Args()
+			if len(args) > 1 && args[1] == h.completionSHA {
+				return h.failure
+			}
+		}
+		if h.failStartCleanup.Load() && cmd.Name() == "evalsha" {
+			args := cmd.Args()
+			if len(args) > 1 && args[1] == h.startCleanupSHA {
+				return h.failure
+			}
+		}
+		if h.failDetach.Load() && cmd.Name() == "evalsha" {
+			for _, arg := range cmd.Args() {
+				if value, ok := arg.(string); ok && strings.HasPrefix(value, h.detachKey) {
+					return h.failure
+				}
+			}
+		}
+		if h.failNodeInit.Load() && cmd.Name() == "evalsha" {
+			for _, arg := range cmd.Args() {
+				value, ok := arg.(string)
+				if ok && strings.HasPrefix(value, h.nodeStreamPrefix) &&
+					h.failNodeInit.CompareAndSwap(true, false) {
+					return h.failure
+				}
+			}
+		}
+		if h.failDestroy.Load() && cmd.Name() == "evalsha" {
+			for _, arg := range cmd.Args() {
+				if key, ok := arg.(string); ok && key == h.key {
+					return h.failure
+				}
+			}
+		}
+		return next(ctx, cmd)
+	}
+}
+
+// ProcessPipelineHook preserves normal Redis pipelines.
+func (h *poolRedisHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		return next(ctx, cmds)
+	}
+}
+
+// generationStreamKey returns the lifecycle-selected physical stream key for a
+// logical name, or the empty string before lifecycle binding.
+func generationStreamKey(ctx context.Context, rdb *redis.Client, name string) string {
+	key := rdb.HGet(ctx, "pulse:stream:"+name+":lifecycle", "physical_key").Val()
+	if key == "" {
+		return ""
+	}
+	if rdb.Type(ctx, key).Val() != "stream" {
+		return ""
+	}
+	return key
+}
+
+func TestAddNodeRollsBackPostRegistrationFailure(t *testing.T) {
+	ctx := ptesting.NewTestContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	poolName := strings.ReplaceAll(t.Name(), "/", "_")
+	failure := errors.New("injected node stream initialization failure")
+	hook := &poolRedisHook{
+		nodeStreamPrefix: "pulse:stream:" + nodeStreamName(poolName, ""),
+		failure:          failure,
+	}
+	hook.failNodeInit.Store(true)
+	rdb.AddHook(hook)
+
+	_, err := AddNode(ctx, poolName, rdb, WithJobSinkBlockDuration(50*time.Millisecond))
+	require.ErrorIs(t, err, failure)
+	leases, err := rdb.HKeys(ctx, rmapContentKey(nodeKeepAliveMapName(poolName))).Result()
+	require.NoError(t, err)
+	for _, key := range leases {
+		require.True(t, key == "=rev" || key == "=kind", "leaked node registration %q", key)
+	}
+	keys, err := rdb.Keys(ctx, "pulse:stream:"+nodeStreamName(poolName, "")+"*").Result()
+	require.NoError(t, err)
+	for _, key := range keys {
+		require.NotEqual(t, "stream", rdb.Type(ctx, key).Val(), "leaked node stream %q", key)
+	}
+
+	node, err := AddNode(ctx, poolName, rdb, WithJobSinkBlockDuration(50*time.Millisecond))
+	require.NoError(t, err)
+	require.NoError(t, node.Shutdown(ctx))
+}
+
+func TestAddNodeRejectsInvalidOptions(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx := ptesting.NewTestContext(t)
+	cases := []struct {
+		name string
+		opts []NodeOption
+	}{
+		{name: "worker TTL", opts: []NodeOption{WithWorkerTTL(time.Millisecond)}},
+		{name: "requeue timeout", opts: []NodeOption{WithRequeueTimeout(500 * time.Microsecond)}},
+		{name: "job sink block", opts: []NodeOption{WithJobSinkBlockDuration(500 * time.Microsecond)}},
+		{name: "queued jobs", opts: []NodeOption{WithMaxQueuedJobs(0)}},
+		{name: "dispatch timeout", opts: []NodeOption{WithDispatchTimeout(500 * time.Microsecond)}},
+		{name: "recovery grace", opts: []NodeOption{WithRecoveryGrace(500 * time.Microsecond)}},
+		{name: "cleanup lease", opts: []NodeOption{WithCleanupLease(500 * time.Microsecond)}},
+		{
+			name: "dispatch retention precision",
+			opts: []NodeOption{WithDispatchResultRetention(500 * time.Microsecond)},
+		},
+		{
+			name: "dispatch retention window",
+			opts: []NodeOption{
+				WithDispatchTimeout(time.Second),
+				WithDispatchResultRetention(time.Second),
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := AddNode(ctx, t.Name(), rdb, tc.opts...)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestClosingImmediatelyFencesAdmission(t *testing.T) {
+	ctx := ptesting.NewTestContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	node := newTestNode(t, ctx, rdb, strings.ReplaceAll(t.Name(), "/", "_"))
+
+	closed := make(chan error, 1)
+	go func() {
+		closed <- node.Close(ctx)
+	}()
+	require.Eventually(t, func() bool {
+		node.lock.RLock()
+		defer node.lock.RUnlock()
+		return node.closing
+	}, max, delay)
+
+	_, err := node.AddWorker(ctx, &mockHandler{})
+	require.ErrorContains(t, err, "closed")
+	require.ErrorContains(t, node.DispatchJob(ctx, "job", nil), "closed")
+	require.ErrorContains(t, node.DispatchMessage(ctx, "message", nil), "closed")
+	require.ErrorContains(t, node.StopJob(ctx, "job"), "closed")
+	require.ErrorContains(t, node.NotifyWorker(ctx, "job", nil), "closed")
+	require.NoError(t, <-closed)
+}
+
+func TestShutdownPublishesWhileCloseIsInProgress(t *testing.T) {
+	ctx := ptesting.NewTestContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	poolName := strings.ReplaceAll(t.Name(), "/", "_")
+	first := newTestNode(t, ctx, rdb, poolName)
+	peer := newTestNode(t, ctx, rdb, poolName)
+
+	closeResult := make(chan error, 1)
+	go func() {
+		closeResult <- first.Close(ctx)
+	}()
+	require.Eventually(t, func() bool {
+		first.lock.RLock()
+		defer first.lock.RUnlock()
+		return first.closing
+	}, max, delay)
+	require.NoError(t, first.Shutdown(ctx))
+	require.NoError(t, <-closeResult)
+	require.True(t, first.IsShutdown())
+	require.True(t, peer.IsShutdown())
+}
+
+func TestAddNodeTakesOverExpiredPoolCleanup(t *testing.T) {
+	ctx := ptesting.NewTestContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	poolName := strings.ReplaceAll(t.Name(), "/", "_")
+	old := newTestNode(t, ctx, rdb, poolName)
+	generation := old.poolStream.Generation()
+	require.NoError(t, old.Close(ctx))
+	require.NoError(t, rdb.HSet(
+		ctx,
+		poolCleanupGenerationsKey(poolName),
+		"state", poolCleanupFinishingState,
+		"generation", generation,
+		"owner", "crashed",
+		"lease_until", "0",
+	).Err())
+	require.NoError(t, rdb.HSet(
+		ctx,
+		rmapContentKey(nodeShutdownMapName(poolName)),
+		"shutdown", "crashed",
+	).Err())
+
+	next := newTestNode(t, ctx, rdb, poolName)
+	require.NotEqual(t, generation, next.poolStream.Generation())
+	record, err := rdb.HGetAll(ctx, poolCleanupGenerationsKey(poolName)).Result()
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{
+		"state":      poolCleanupCompleteState,
+		"generation": generation,
+	}, record)
+	require.NoError(t, next.Shutdown(ctx))
+	record, err = rdb.HGetAll(ctx, poolCleanupGenerationsKey(poolName)).Result()
+	require.NoError(t, err)
+	require.Len(t, record, 2)
+}
+
+func TestExpiredCleanupOwnerCannotDeleteReusedPool(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx := ptesting.NewTestContext(t)
+	poolName := t.Name()
+	stream, err := streaming.NewStream(poolStreamName(poolName), rdb)
+	require.NoError(t, err)
+	require.NoError(t, stream.Open(ctx))
+	generation := stream.Generation()
+	resources, err := establishPoolResources(
+		ctx,
+		rdb,
+		poolName,
+		generation,
+		1000,
+		30*time.Second,
+		time.Second,
+		5*time.Minute,
+	)
+	require.NoError(t, err)
+	_, err = stream.Add(ctx, evInit, nil)
+	require.NoError(t, err)
+
+	status, err := claimPoolCleanup(ctx, rdb, poolName, generation, "paused", time.Second)
+	require.NoError(t, err)
+	require.Equal(t, poolCleanupClaimed, status)
+	require.NoError(t, rdb.HSet(ctx, poolCleanupGenerationsKey(poolName), "lease_until", "0").Err())
+	status, err = claimPoolCleanup(ctx, rdb, poolName, generation, "takeover", time.Second)
+	require.NoError(t, err)
+	require.Equal(t, poolCleanupClaimed, status)
+
+	require.NoError(t, destroyCleanupStream(ctx, rdb, poolName, generation, "takeover", time.Second))
+	require.NoError(t, destroyPoolMap(
+		ctx,
+		rdb,
+		poolName,
+		resources.jobs,
+		generation,
+		"takeover",
+		time.Second,
+	))
+	require.NoError(t, completePoolCleanupScript.Run(
+		ctx,
+		rdb,
+		[]string{poolCleanupGenerationsKey(poolName), poolResourcesKey(poolName)},
+		generation,
+		"takeover",
+		poolCleanupFinishingState,
+		poolCleanupCompleteState,
+		poolResourceStateActive,
+		poolResourceStateDestroyed,
+	).Err())
+	require.Error(t, renewPoolCleanup(ctx, rdb, poolName, generation, "takeover", time.Second))
+
+	recreated, err := streaming.NewStream(poolStreamName(poolName), rdb)
+	require.NoError(t, err)
+	_, err = recreated.Add(ctx, evInit, nil)
+	require.NoError(t, err)
+	require.NotEqual(t, generation, recreated.Generation())
+	replacementResources, err := establishPoolResources(
+		ctx,
+		rdb,
+		poolName,
+		recreated.Generation(),
+		1000,
+		30*time.Second,
+		30*time.Second,
+		5*time.Minute,
+	)
+	require.NoError(t, err)
+	require.NotEqual(t, resources.jobs, replacementResources.jobs)
+	replacementKey := rmapContentKey(replacementResources.jobs)
+	require.NoError(t, rdb.HSet(ctx, replacementKey, "replacement", "value").Err())
+	for _, pair := range [][2]string{
+		{resources.nodeKeepAlive, replacementResources.nodeKeepAlive},
+		{resources.workers, replacementResources.workers},
+		{resources.jobs, replacementResources.jobs},
+		{resources.jobPending, replacementResources.jobPending},
+	} {
+		require.NotEqual(t, pair[0], pair[1])
+		require.NoError(t, rdb.HSet(ctx, rmapContentKey(pair[0]), "stale", "old").Err())
+		require.False(t, rdb.HExists(ctx, rmapContentKey(pair[1]), "stale").Val())
+	}
+
+	err = destroyPoolMap(ctx, rdb, poolName, resources.jobs, generation, "paused", time.Second)
+	require.ErrorContains(t, err, "POOLCLEANUPLOST")
+	require.Equal(t, "value", rdb.HGet(ctx, replacementKey, "replacement").Val())
+	require.NoError(t, recreated.Destroy(ctx))
+}
 
 func TestWorkers(t *testing.T) {
 	testName := strings.Replace(t.Name(), "/", "_", -1)
@@ -399,81 +737,51 @@ func TestDispatchJobRaceCondition(t *testing.T) {
 
 	t.Run("claim rejects active pending job from redis", func(t *testing.T) {
 		jobKey := "active-redis-pending-job"
-		pendingHash := rmapContentKey(jobPendingMapName(testName))
-		pendingUntil := strconv.FormatInt(time.Now().Add(time.Hour).UnixNano(), 10)
-		require.NoError(t, rdb.HSet(ctx, pendingHash, jobKey, pendingUntil).Err())
+		pendingHash := rmapContentKey(node2.resources.jobPending)
+		const pendingNonce = "active-dispatch"
+		storedGuard := pendingNonce + "\x00" + "1-0"
+		require.NoError(t, rdb.HSet(ctx, pendingHash, jobKey, storedGuard).Err())
 		_, localExists := node2.jobPendingMap.Get(jobKey)
 		require.False(t, localExists)
 
-		pendingTS, err := node2.claimDispatch(ctx, jobKey)
-		require.Empty(t, pendingTS)
+		_, err := node2.publishDispatch(ctx, jobKey, "replacement", marshalJob(&Job{Key: jobKey}))
 		require.True(t, errors.Is(err, ErrJobExists), "Expected ErrJobExists, got: %v", err)
 
 		stored, err := rdb.HGet(ctx, pendingHash, jobKey).Result()
 		require.NoError(t, err)
-		require.Equal(t, pendingUntil, stored)
+		require.Equal(t, storedGuard, stored)
 	})
 
-	t.Run("claim replaces stale pending job and publishes it", func(t *testing.T) {
-		jobKey := "stale-redis-pending-job"
-		pendingHash := rmapContentKey(jobPendingMapName(testName))
-		staleUntil := strconv.FormatInt(time.Now().Add(-time.Hour).UnixNano(), 10)
-		require.NoError(t, rdb.HSet(ctx, pendingHash, jobKey, staleUntil).Err())
+	t.Run("claim never replaces pending dispatch without completion", func(t *testing.T) {
+		jobKey := "unknown-redis-pending-job"
+		pendingHash := rmapContentKey(node2.resources.jobPending)
+		const pendingNonce = "unknown-dispatch"
+		storedGuard := pendingNonce + "\x00" + "1-0"
+		require.NoError(t, rdb.HSet(ctx, pendingHash, jobKey, storedGuard).Err())
 
-		pendingTS, err := node2.claimDispatch(ctx, jobKey)
-		require.NoError(t, err)
-		require.NotEmpty(t, pendingTS)
+		_, err := node2.publishDispatch(ctx, jobKey, "replacement", marshalJob(&Job{Key: jobKey}))
+		require.ErrorIs(t, err, ErrJobExists)
 
 		stored, err := rdb.HGet(ctx, pendingHash, jobKey).Result()
 		require.NoError(t, err)
-		require.Equal(t, pendingTS, stored)
-		require.Eventually(t, func() bool {
-			local, exists := node2.jobPendingMap.Get(jobKey)
-			return exists && local == pendingTS
-		}, max, delay)
-		node2.releaseDispatchPending(jobKey, pendingTS)
+		require.Equal(t, storedGuard, stored)
+		require.Error(t, node2.completeDispatch(ctx, jobKey, pendingNonce))
+		require.NoError(t, rdb.HDel(ctx, pendingHash, jobKey).Err())
 	})
 
-	t.Run("claim rejects malformed pending job", func(t *testing.T) {
-		jobKey := "malformed-redis-pending-job"
-		pendingHash := rmapContentKey(jobPendingMapName(testName))
-		const malformedPending = "not-a-timestamp"
-		require.NoError(t, rdb.HSet(ctx, pendingHash, jobKey, malformedPending).Err())
+	t.Run("claim treats every persisted value as an owned nonce", func(t *testing.T) {
+		jobKey := "opaque-redis-pending-job"
+		pendingHash := rmapContentKey(node2.resources.jobPending)
+		const opaquePending = "not-a-timestamp"
+		require.NoError(t, rdb.HSet(ctx, pendingHash, jobKey, opaquePending).Err())
 
-		pendingTS, err := node2.claimDispatch(ctx, jobKey)
-		require.Empty(t, pendingTS)
-		require.Error(t, err)
-		require.False(t, errors.Is(err, ErrJobExists))
+		_, err := node2.publishDispatch(ctx, jobKey, "replacement", marshalJob(&Job{Key: jobKey}))
+		require.ErrorIs(t, err, ErrJobExists)
 
 		stored, err := rdb.HGet(ctx, pendingHash, jobKey).Result()
 		require.NoError(t, err)
-		require.Equal(t, malformedPending, stored)
-	})
-
-	t.Run("release only removes owned pending guard", func(t *testing.T) {
-		jobKey := "owned-pending-release-job"
-		pendingHash := rmapContentKey(jobPendingMapName(testName))
-		pendingTS, err := node2.claimDispatch(ctx, jobKey)
-		require.NoError(t, err)
-		require.NotEmpty(t, pendingTS)
-		require.Eventually(t, func() bool {
-			local, exists := node2.jobPendingMap.Get(jobKey)
-			return exists && local == pendingTS
-		}, max, delay)
-
-		node2.releaseDispatchPending(jobKey, "not-"+pendingTS)
-		stored, err := rdb.HGet(ctx, pendingHash, jobKey).Result()
-		require.NoError(t, err)
-		require.Equal(t, pendingTS, stored)
-
-		node2.releaseDispatchPending(jobKey, pendingTS)
-		pendingExists, err := rdb.HExists(ctx, pendingHash, jobKey).Result()
-		require.NoError(t, err)
-		require.False(t, pendingExists)
-		require.Eventually(t, func() bool {
-			_, exists := node2.jobPendingMap.Get(jobKey)
-			return !exists
-		}, max, delay)
+		require.Equal(t, opaquePending, stored)
+		require.NoError(t, rdb.HDel(ctx, pendingHash, jobKey).Err())
 	})
 
 	t.Run("concurrent atomic claims admit one dispatcher", func(t *testing.T) {
@@ -483,14 +791,20 @@ func TestDispatchJobRaceCondition(t *testing.T) {
 		var wg sync.WaitGroup
 		for i := 0; i < 20; i++ {
 			wg.Add(1)
-			go func() {
+			go func(i int) {
 				defer wg.Done()
-				pendingTS, err := node2.claimDispatch(ctx, jobKey)
+				dispatchID := fmt.Sprintf("dispatch-%d", i)
+				_, err := node2.publishDispatch(
+					ctx,
+					jobKey,
+					dispatchID,
+					marshalJob(&Job{Key: jobKey, dispatchID: dispatchID}),
+				)
 				if err == nil {
-					pendingCh <- pendingTS
+					pendingCh <- dispatchID
 				}
 				errCh <- err
-			}()
+			}(i)
 		}
 		wg.Wait()
 		close(errCh)
@@ -511,14 +825,14 @@ func TestDispatchJobRaceCondition(t *testing.T) {
 		}
 		require.Equal(t, 1, successCount)
 		require.Equal(t, 19, errorCount)
-		node2.releaseDispatchPending(jobKey, <-pendingCh)
+		require.NoError(t, node2.completeDispatch(ctx, jobKey, <-pendingCh))
 	})
 
 	t.Run("dispatch checks redis when local payload replica is stale", func(t *testing.T) {
 		jobKey := "stale-local-payload-job"
 		payload := []byte("test payload")
-		payloadHash := rmapContentKey(jobPayloadMapName(testName))
-		pendingHash := rmapContentKey(jobPendingMapName(testName))
+		payloadHash := rmapContentKey(node2.resources.jobPayloads)
+		pendingHash := rmapContentKey(node2.resources.jobPending)
 
 		// Simulate the production race: Redis already has the live job payload,
 		// but this node's local rmap replica has not applied that update yet.
@@ -533,22 +847,20 @@ func TestDispatchJobRaceCondition(t *testing.T) {
 		require.False(t, pendingExists)
 	})
 
-	t.Run("dispatch after pending job times out succeeds", func(t *testing.T) {
+	t.Run("dispatch never reopens unknown pending job", func(t *testing.T) {
 		jobKey := "timeout-job"
 		payload := []byte("test payload")
 
-		// Set a stale pending timestamp
-		staleTS := time.Now().Add(-time.Hour).UnixNano()
-		_, err := node1.jobPendingMap.SetAndWait(ctx, jobKey, strconv.FormatInt(staleTS, 10))
-		require.NoError(t, err, "Failed to set stale pending timestamp")
+		const nonce = "unknown-dispatch"
+		_, err := node1.jobPendingMap.SetAndWait(ctx, jobKey, nonce)
+		require.NoError(t, err)
 		defer func() {
 			_, err = node1.jobPendingMap.Delete(ctx, jobKey)
-			assert.NoError(t, err, "Failed to delete pending timestamp")
+			assert.NoError(t, err)
 		}()
 
-		// Dispatch should succeed because pending timestamp is in the past
 		err = node1.DispatchJob(ctx, jobKey, payload)
-		assert.NoError(t, err, "Dispatch should succeed after pending timeout")
+		require.ErrorIs(t, err, ErrJobExists)
 	})
 
 	t.Run("dispatch cleans up pending entry on success", func(t *testing.T) {
@@ -566,38 +878,37 @@ func TestDispatchJobRaceCondition(t *testing.T) {
 		}, max, delay, "Pending entry should be cleaned up after successful dispatch")
 	})
 
-	t.Run("dispatch rejects invalid pending timestamp", func(t *testing.T) {
+	t.Run("dispatch treats pending guard as opaque nonce", func(t *testing.T) {
 		jobKey := "invalid-timestamp-job"
 		payload := []byte("test payload")
 
-		// Set an invalid pending timestamp
 		_, err := node1.jobPendingMap.SetAndWait(ctx, jobKey, "invalid-timestamp")
-		require.NoError(t, err, "Failed to set invalid pending timestamp")
+		require.NoError(t, err)
 
 		err = node1.DispatchJob(ctx, jobKey, payload)
-		require.Error(t, err)
-		require.False(t, errors.Is(err, ErrJobExists))
-		require.Contains(t, err.Error(), "malformed pending guard")
-		stored, err := rdb.HGet(ctx, rmapContentKey(jobPendingMapName(testName)), jobKey).Result()
+		require.ErrorIs(t, err, ErrJobExists)
+		stored, err := rdb.HGet(ctx, rmapContentKey(node2.resources.jobPending), jobKey).Result()
 		require.NoError(t, err)
 		require.Equal(t, "invalid-timestamp", stored)
 	})
 
-	// Keep this test last, it destroys the stream
+	// Keep this test last because it temporarily replaces the stream key.
 	t.Run("dispatch cleans up pending entry on failure", func(t *testing.T) {
 		jobKey := "cleanup-job"
 		payload := []byte("test payload")
 
-		// Replace the Redis stream with a string so XADD fails. Deleting the
-		// stream no longer forces this path because the pool sink now
-		// recovers externally deleted consumer groups.
-		streamKey := "pulse:stream:" + poolStreamName(node1.PoolName)
+		// Replace the Redis stream with a string so XADD fails after the pending
+		// dispatch guard is claimed. Deleting the stream no longer forces this
+		// path because the pool sink now repairs externally deleted streams.
+		streamKey := generationStreamKey(ctx, rdb, poolStreamName(node1.PoolName))
+		require.NotEmpty(t, streamKey)
 		require.NoError(t, rdb.Del(ctx, streamKey).Err())
-		require.NoError(t, rdb.Set(ctx, streamKey, "wrong-type", 0).Err())
+		err := rdb.Set(ctx, streamKey, "wrong-type", 0).Err()
+		require.NoError(t, err)
 		defer func() { require.NoError(t, rdb.Del(ctx, streamKey).Err()) }()
 
 		// Attempt dispatch (should fail)
-		err := node1.DispatchJob(ctx, jobKey, payload)
+		err = node1.DispatchJob(ctx, jobKey, payload)
 		require.Error(t, err, "Expected dispatch to fail")
 
 		// Verify pending entry was cleaned up
@@ -607,6 +918,137 @@ func TestDispatchJobRaceCondition(t *testing.T) {
 		}, max, delay, "Pending entry should be cleaned up after failed dispatch")
 	})
 
+}
+
+func TestDispatchCancellationRetainsAdmissionUntilDefinitiveCompletion(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx := ptesting.NewTestContext(t)
+	node, err := AddNode(
+		ctx,
+		t.Name(),
+		rdb,
+		WithDispatchTimeout(100*time.Millisecond),
+		WithRecoveryGrace(50*time.Millisecond),
+	)
+	require.NoError(t, err)
+
+	dispatchCtx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+	err = node.DispatchJob(dispatchCtx, "job", []byte("payload"))
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	pendingKey := rmapContentKey(jobPendingMapName(t.Name()))
+	guard, err := rdb.HGet(ctx, pendingKey, "job").Result()
+	require.NoError(t, err)
+	require.NotEmpty(t, guard)
+	dispatchID := guard
+	require.ErrorIs(t, node.DispatchJob(ctx, "job", []byte("duplicate")), ErrJobExists)
+	_, waiterExists := node.pendingJobChannels.Load(dispatchID)
+	require.False(t, waiterExists)
+
+	require.NoError(t, node.completeDispatch(ctx, "job", dispatchID))
+	replacement, err := node.publishDispatch(
+		ctx,
+		"job",
+		"replacement",
+		marshalJob(&Job{Key: "job", dispatchID: "replacement"}),
+	)
+	require.NoError(t, err)
+	require.NotEmpty(t, replacement)
+	require.NoError(t, node.completeDispatch(ctx, "job", "replacement"))
+	require.NoError(t, node.Close(ctx))
+	require.NoError(t, node.poolStream.Destroy(ctx))
+}
+
+func TestPoolRoutingDropsMalformedEventAndContinues(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx := ptesting.NewTestContext(t)
+	node := newTestNode(t, ctx, rdb, t.Name())
+	received := make(chan string, 1)
+	handler := &mockMessageHandler{
+		mockHandler: newMockHandler(),
+		messageFunc: func(key string, payload []byte) error {
+			received <- key + ":" + string(payload)
+			return nil
+		},
+	}
+	_, err := node.AddWorker(ctx, handler)
+	require.NoError(t, err)
+
+	_, err = node.poolStream.Add(ctx, evMessage, []byte{1, 2, 3})
+	require.NoError(t, err)
+	require.NoError(t, node.DispatchMessage(ctx, "valid", []byte("payload")))
+	require.Equal(t, "valid:payload", <-received)
+	require.Eventually(t, func() bool {
+		pending, pendingErr := rdb.XPending(
+			ctx,
+			generationStreamKey(ctx, rdb, node.poolStream.Name),
+			node.poolSink.Name,
+		).Result()
+		return pendingErr == nil && pending.Count == 0
+	}, max, delay)
+
+	require.NoError(t, node.Shutdown(ctx))
+}
+
+func TestWorkerAckReleasesDispatchAfterCallerNodeCrash(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx := ptesting.NewTestContext(t)
+	node := newTestNode(t, ctx, rdb, t.Name())
+	const (
+		jobKey      = "job"
+		dispatchID  = "crashed-dispatch"
+		workerID    = "worker"
+		workerEvent = "worker-event"
+	)
+	eventID, err := node.publishDispatch(
+		ctx,
+		jobKey,
+		dispatchID,
+		marshalJob(&Job{Key: jobKey, NodeID: "crashed-node", dispatchID: dispatchID}),
+	)
+	require.NoError(t, err)
+	pending := &streaming.Event{
+		ID:        eventID,
+		EventName: evStartJob,
+		Payload: marshalJob(&Job{
+			Key:        jobKey,
+			NodeID:     "crashed-node",
+			dispatchID: dispatchID,
+		}),
+		Acker: &mockAcker{
+			XAckFunc: func(ctx context.Context, _, _ string, _ ...string) *redis.IntCmd {
+				return redis.NewIntCmd(ctx, 1)
+			},
+		},
+	}
+	node.pendingEvents.Store(pendingEventKey(workerID, workerEvent), pending)
+
+	node.ackWorkerEvent(&streaming.Event{
+		Payload: marshalEnvelope(workerID, marshalAck(&ack{EventID: workerEvent})),
+	})
+	require.Eventually(t, func() bool {
+		return !rdb.HExists(ctx, rmapContentKey(node.resources.jobPending), jobKey).Val()
+	}, max, delay)
+	_, exists := node.pendingEvents.Load(pendingEventKey(workerID, workerEvent))
+	require.False(t, exists)
+	require.NoError(t, node.Shutdown(ctx))
+}
+
+func TestPoolScriptsRecoverAfterScriptFlush(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx := ptesting.NewTestContext(t)
+	node := newTestNode(t, ctx, rdb, t.Name())
+	worker := newTestWorker(t, ctx, node)
+	requireActiveWorkerRing(t, []*Node{node}, worker.ID)
+	require.NoError(t, rdb.ScriptFlush(ctx).Err())
+
+	require.NoError(t, node.DispatchJob(ctx, "job", []byte("payload")))
+	require.NoError(t, node.StopJob(ctx, "job"))
+	require.NoError(t, node.Shutdown(ctx))
 }
 
 func TestNotifyWorker(t *testing.T) {
@@ -653,7 +1095,7 @@ func TestNotifyWorkerNoHandler(t *testing.T) {
 	testName := strings.Replace(t.Name(), "/", "_", -1)
 	ctx, buf := ptesting.NewBufferedLogContext(t)
 	rdb := ptesting.NewRedisClient(t)
-	node := newTestNode(t, ctx, rdb, testName)
+	node := newTestNodeWithLogger(t, ctx, rdb, testName, pulse.ClueLogger(ctx))
 	defer ptesting.CleanupRedis(t, rdb, true, testName)
 
 	// Create a worker without NotificationHandler implementation
@@ -737,7 +1179,7 @@ func TestDispatchMessageRequiresHandler(t *testing.T) {
 	testName := strings.Replace(t.Name(), "/", "_", -1)
 	ctx, buf := ptesting.NewBufferedLogContext(t)
 	rdb := ptesting.NewRedisClient(t)
-	node := newTestNode(t, ctx, rdb, testName)
+	node := newTestNodeWithLogger(t, ctx, rdb, testName, pulse.ClueLogger(ctx))
 	defer ptesting.CleanupRedis(t, rdb, true, testName)
 
 	worker := newTestWorkerWithoutOptionalHandlers(t, ctx, node)
@@ -795,6 +1237,275 @@ func TestClose(t *testing.T) {
 
 	// Shutdown the node
 	assert.NoError(t, node.Shutdown(ctx))
+}
+
+func TestShutdownReapsStaleNodeWithRedisTime(t *testing.T) {
+	ctx := ptesting.NewTestContext(t)
+	testName := strings.ReplaceAll(t.Name(), "/", "_")
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	node := newTestNode(t, ctx, rdb, testName)
+	now, err := rdb.Time(ctx).Result()
+	require.NoError(t, err)
+	_, err = node.nodeKeepAliveMap.Set(
+		ctx,
+		"crashed-node",
+		strconv.FormatInt(now.Add(-2*node.workerTTL).UnixNano(), 10),
+	)
+	require.NoError(t, err)
+
+	require.NoError(t, node.Shutdown(ctx))
+	require.True(t, node.cleanupComplete)
+}
+
+func TestShutdownRetriesPartialCleanup(t *testing.T) {
+	ctx := ptesting.NewTestContext(t)
+	testName := strings.ReplaceAll(t.Name(), "/", "_")
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	failure := errors.New("injected pool cleanup failure")
+	hook := &poolRedisHook{
+		key:           rmapContentKey(workerMapName(testName)),
+		completionSHA: completePoolCleanupScript.Hash(),
+		failure:       failure,
+	}
+	rdb.AddHook(hook)
+	node := newTestNode(t, ctx, rdb, testName)
+	hook.failDestroy.Store(true)
+
+	err := node.Shutdown(ctx)
+	require.ErrorIs(t, err, failure)
+	require.True(t, node.IsClosed())
+	require.False(t, node.cleanupComplete)
+	state, err := rdb.HGet(ctx, "pulse:stream:"+poolStreamName(testName)+":lifecycle", "state").Result()
+	require.NoError(t, err)
+	require.Equal(t, "destroyed", state)
+	require.NotEqual(t, "destroy", rdb.HGet(ctx, hook.key, "=kind").Val())
+
+	hook.failDestroy.Store(false)
+	hook.failCompletion.Store(true)
+	err = node.Shutdown(ctx)
+	require.ErrorIs(t, err, failure)
+	require.Contains(t, err.Error(), "failed to record cleanup completion")
+	_, err = AddNode(ctx, testName, rdb)
+	require.EqualError(t, err, `AddNode: pool "`+testName+`" is shutting down`)
+
+	hook.failCompletion.Store(false)
+	require.NoError(t, node.Shutdown(ctx))
+	require.True(t, node.cleanupComplete)
+	require.EqualValues(t, 0, rdb.Exists(ctx, rmapContentKey(nodeShutdownMapName(testName))).Val())
+}
+
+func TestCompletedCleanupStillClosesLocalNode(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		close func(context.Context, *Node) error
+	}{
+		{name: "Shutdown", close: func(ctx context.Context, node *Node) error {
+			return node.Shutdown(ctx)
+		}},
+		{name: "Close", close: func(ctx context.Context, node *Node) error {
+			return node.Close(ctx)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := ptesting.NewTestContext(t)
+			rdb := ptesting.NewRedisClient(t)
+			defer ptesting.CleanupRedis(t, rdb, false, "")
+			node := newTestNode(t, ctx, rdb, strings.ReplaceAll(t.Name(), "/", "_"))
+			worker := newTestWorker(t, ctx, node)
+			producer := newTestProducer("stale-resumed", func() (*JobPlan, error) {
+				return &JobPlan{}, nil
+			})
+			require.NoError(t, node.Schedule(ctx, producer, time.Millisecond))
+			require.NoError(t, rdb.HSet(
+				ctx,
+				poolCleanupGenerationsKey(node.PoolName),
+				"state", poolCleanupCompleteState,
+				"generation", node.resources.generation,
+			).Err())
+			require.NoError(t, node.poolStream.Destroy(ctx))
+
+			require.NoError(t, test.close(ctx, node))
+			require.True(t, node.IsClosed())
+			require.True(t, node.IsShutdown())
+			require.True(t, worker.IsStopped())
+			require.True(t, node.poolSink.IsClosed())
+			done := make(chan struct{})
+			go func() {
+				node.scheduleWG.Wait()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				require.Fail(t, "schedule goroutine was not joined")
+			}
+		})
+	}
+}
+
+func TestCompletedCleanupPreservesSettlementErrorAfterLocalTeardown(t *testing.T) {
+	ctx := ptesting.NewTestContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	node := newTestNode(t, ctx, rdb, strings.ReplaceAll(t.Name(), "/", "_"))
+	worker := newTestWorker(t, ctx, node)
+	settlementErr := errors.New("injected terminal settlement failure")
+	node.settlements.begin(worker.ID)(settlementErr)
+	require.NoError(t, rdb.HSet(
+		ctx,
+		poolCleanupGenerationsKey(node.PoolName),
+		"state", poolCleanupCompleteState,
+		"generation", node.resources.generation,
+	).Err())
+	require.NoError(t, node.poolStream.Destroy(ctx))
+
+	firstErr := node.Close(ctx)
+	require.ErrorIs(t, firstErr, settlementErr)
+	require.True(t, node.IsClosed())
+	require.True(t, node.IsShutdown())
+	require.True(t, worker.IsStopped())
+	require.True(t, node.poolSink.IsClosed())
+	secondErr := node.Close(ctx)
+	require.ErrorIs(t, secondErr, settlementErr)
+	require.Equal(t, firstErr.Error(), secondErr.Error())
+}
+
+func TestLateShutdownCannotCleanNewPoolGeneration(t *testing.T) {
+	ctx := ptesting.NewTestContext(t)
+	testName := strings.ReplaceAll(t.Name(), "/", "_")
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	oldNode := newTestNode(t, ctx, rdb, testName)
+	oldGeneration := oldNode.poolStream.Generation()
+	require.NoError(t, oldNode.Shutdown(ctx))
+
+	newNode := newTestNode(t, ctx, rdb, testName)
+	require.NotEqual(t, oldGeneration, newNode.poolStream.Generation())
+	require.NoError(t, oldNode.Shutdown(ctx))
+	require.False(t, newNode.IsClosed())
+	require.NoError(t, newNode.Shutdown(ctx))
+}
+
+func TestOldGenerationMutationCannotRecreateDeletedMap(t *testing.T) {
+	ctx := ptesting.NewTestContext(t)
+	testName := strings.ReplaceAll(t.Name(), "/", "_")
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	oldNode := newTestNode(t, ctx, rdb, testName)
+	oldMapKey := rmapContentKey(oldNode.resources.workerKeepAlive)
+	require.NoError(t, oldNode.Shutdown(ctx))
+	require.EqualValues(t, 0, rdb.Exists(ctx, oldMapKey).Val())
+	newNode := newTestNode(t, ctx, rdb, testName)
+
+	err := oldNode.setPoolMap(ctx, oldNode.resources.workerKeepAlive, "stale", "1")
+	require.ErrorIs(t, err, ErrPoolGenerationLost)
+	require.EqualValues(t, 0, rdb.Exists(ctx, oldMapKey).Val())
+	require.NotEqual(t, oldNode.resources.workerKeepAlive, newNode.resources.workerKeepAlive)
+
+	require.NoError(t, newNode.Shutdown(ctx))
+}
+
+func TestAddNodePostRegistrationShutdownCheck(t *testing.T) {
+	ctx := ptesting.NewTestContext(t)
+	testName := strings.ReplaceAll(t.Name(), "/", "_")
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	hook := &poolRedisHook{
+		shutdownKey:          rmapContentKey(nodeShutdownMapName(testName)),
+		shutdownCheckStart:   make(chan struct{}),
+		releaseShutdownCheck: make(chan struct{}),
+	}
+	rdb.AddHook(hook)
+	first, err := AddNode(
+		ctx,
+		testName,
+		rdb,
+		WithWorkerTTL(2*time.Second),
+		WithRequeueTimeout(100*time.Millisecond),
+		WithDispatchTimeout(time.Second),
+		WithRecoveryGrace(500*time.Millisecond),
+		WithJobSinkBlockDuration(100*time.Millisecond),
+	)
+	require.NoError(t, err)
+	hook.blockShutdownCheck.Store(true)
+
+	type addResult struct {
+		node *Node
+		err  error
+	}
+	added := make(chan addResult, 1)
+	go func() {
+		node, err := AddNode(
+			ctx,
+			testName,
+			rdb,
+			WithWorkerTTL(2*time.Second),
+			WithRequeueTimeout(100*time.Millisecond),
+			WithDispatchTimeout(time.Second),
+			WithRecoveryGrace(500*time.Millisecond),
+			WithJobSinkBlockDuration(100*time.Millisecond),
+		)
+		added <- addResult{node: node, err: err}
+	}()
+
+	select {
+	case <-hook.shutdownCheckStart:
+	case <-time.After(max):
+		t.Fatal("AddNode did not reach post-registration shutdown check")
+	}
+	require.NoError(t, rdb.HSet(ctx, hook.shutdownKey, "shutdown", first.ID).Err())
+	close(hook.releaseShutdownCheck)
+	result := <-added
+	require.NoError(t, result.err)
+	require.Eventually(t, result.node.IsClosed, max, delay)
+	require.True(t, result.node.IsShutdown())
+
+	require.NoError(t, rdb.HDel(ctx, hook.shutdownKey, "shutdown").Err())
+	require.NoError(t, first.Shutdown(ctx))
+}
+
+func TestPeerShutdownDetachFailureIsRetriedAndSurfaced(t *testing.T) {
+	ctx := ptesting.NewTestContext(t)
+	testName := strings.ReplaceAll(t.Name(), "/", "_")
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	failure := errors.New("injected peer detach failure")
+	hook := &poolRedisHook{
+		detachKey: "map:stream:" + poolStreamName(testName) + ":generation:",
+		failure:   failure,
+	}
+	rdb.AddHook(hook)
+	first := newTestNode(t, ctx, rdb, testName)
+	peer := newTestNode(t, ctx, rdb, testName)
+	require.NoError(t, first.close(ctx, true))
+	hook.failDetach.Store(true)
+	require.NoError(t, rdb.HSet(
+		ctx,
+		rmapContentKey(nodeShutdownMapName(testName)),
+		"shutdown",
+		first.ID,
+	).Err())
+	peer.ownShutdown(context.Background())
+
+	require.Eventually(t, func() bool {
+		return rdb.HExists(
+			ctx,
+			rmapContentKey(nodeShutdownMapName(testName)),
+			shutdownErrorKey(peer.ID),
+		).Val()
+	}, peer.workerTTL, delay)
+	start := time.Now()
+	err := first.waitForPoolNodes(ctx)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "failed to detach pool sink")
+	require.Less(t, time.Since(start), peer.workerTTL)
+	require.False(t, peer.IsClosed())
+
+	hook.failDetach.Store(false)
+	require.Eventually(t, peer.IsClosed, peer.workerTTL, delay)
+	require.NoError(t, first.Shutdown(ctx))
 }
 
 func TestTwoNodeJobDispatchAndAck(t *testing.T) {
@@ -882,7 +1593,7 @@ func TestNodeCloseAndRequeue(t *testing.T) {
 	select {
 	case <-jobRequeued:
 		// Job successfully requeued
-	case <-time.After(max):
+	case <-time.After(2 * testAckGracePeriod):
 		t.Error("Timeout: job was not requeued within expected time")
 	}
 
@@ -921,71 +1632,6 @@ func TestAckWorkerEventWithMissingPendingEvent(t *testing.T) {
 	assert.True(t, true, "ackWorkerEvent should complete without panic")
 }
 
-func TestStaleEventsAreRemoved(t *testing.T) {
-	// Setup
-	ctx := ptesting.NewTestContext(t)
-	testName := strings.Replace(t.Name(), "/", "_", -1)
-	rdb := ptesting.NewRedisClient(t)
-	defer ptesting.CleanupRedis(t, rdb, true, testName)
-	node := newTestNode(t, ctx, rdb, testName)
-	defer func() { assert.NoError(t, node.Shutdown(ctx)) }()
-
-	// Add a stale event manually
-	staleEventID := fmt.Sprintf("%d-0", time.Now().Add(-2*pendingEventTTL).UnixNano()/int64(time.Millisecond))
-	staleEvent := &streaming.Event{
-		ID:        staleEventID,
-		EventName: "test-event",
-		Payload:   []byte("test-payload"),
-		Acker: &mockAcker{
-			XAckFunc: func(ctx context.Context, streamKey, sinkName string, ids ...string) *redis.IntCmd {
-				return redis.NewIntCmd(ctx, 0)
-			},
-		},
-	}
-	node.pendingEvents.Store(pendingEventKey("worker", staleEventID), staleEvent)
-
-	// Add a fresh event
-	freshEventID := fmt.Sprintf("%d-0", time.Now().Add(-time.Second).UnixNano()/int64(time.Millisecond))
-	freshEvent := &streaming.Event{
-		ID:        freshEventID,
-		EventName: "test-event",
-		Payload:   []byte("test-payload"),
-		Acker: &mockAcker{
-			XAckFunc: func(ctx context.Context, streamKey, sinkName string, ids ...string) *redis.IntCmd {
-				return redis.NewIntCmd(ctx, 0)
-			},
-		},
-	}
-	node.pendingEvents.Store(pendingEventKey("worker", freshEventID), freshEvent)
-
-	// Create a mock event to trigger the ackWorkerEvent function
-	mockEventID := "mock-event-id"
-	mockEvent := &streaming.Event{
-		ID:        mockEventID,
-		EventName: evAck,
-		Payload:   marshalEnvelope("worker", marshalAck(&ack{EventID: mockEventID})),
-		Acker: &mockAcker{
-			XAckFunc: func(ctx context.Context, streamKey, sinkName string, ids ...string) *redis.IntCmd {
-				return redis.NewIntCmd(ctx, 0)
-			},
-		},
-	}
-	node.pendingEvents.Store(pendingEventKey("worker", mockEventID), mockEvent)
-
-	// Call ackWorkerEvent to trigger the stale event cleanup
-	node.ackWorkerEvent(mockEvent)
-
-	assert.Eventually(t, func() bool {
-		_, ok := node.pendingEvents.Load(pendingEventKey("worker", staleEventID))
-		return !ok
-	}, max, delay, "Stale event should have been removed")
-
-	assert.Eventually(t, func() bool {
-		_, ok := node.pendingEvents.Load(pendingEventKey("worker", freshEventID))
-		return ok
-	}, max, delay, "Fresh event should still be present")
-}
-
 func TestStaleNodeStreamCleanup(t *testing.T) {
 	var (
 		ctx      = ptesting.NewTestContext(t)
@@ -1020,19 +1666,17 @@ func TestStaleNodeStreamCleanup(t *testing.T) {
 	assert.NoError(t, node1.DispatchJob(ctx, "job1", []byte("payload1")))
 	assert.NoError(t, node2.DispatchJob(ctx, "job2", []byte("payload2")))
 
-	// Verify both streams exist initially
-	name1 := "pulse:stream:" + nodeStreamName(node1.PoolName, node1.ID)
-	name2 := "pulse:stream:" + nodeStreamName(node2.PoolName, node2.ID)
+	// Verify both generation-qualified streams exist initially.
+	var name1, name2 string
 	assert.Eventually(t, func() bool {
-		exists1, err1 := rdb.Exists(ctx, name1).Result()
-		exists2, err2 := rdb.Exists(ctx, name2).Result()
-		return err1 == nil && err2 == nil && exists1 == 1 && exists2 == 1
+		name1 = generationStreamKey(ctx, rdb, nodeStreamName(node1.PoolName, node1.ID))
+		name2 = generationStreamKey(ctx, rdb, nodeStreamName(node2.PoolName, node2.ID))
+		return name1 != "" && name2 != ""
 	}, max, delay, "Node streams should exist initially")
 
 	// Set node2's last seen time to a stale value
 	close(node2.stop)
-	_, err := node2.nodeKeepAliveMap.Set(ctx, node2.ID,
-		strconv.FormatInt(time.Now().Add(-3*node2.workerTTL).UnixNano(), 10))
+	_, err := node2.nodeKeepAliveMap.Set(ctx, node2.ID, "0")
 	assert.NoError(t, err)
 	node2.wg.Wait()
 	node2.stop = make(chan struct{}) // so we can close
@@ -1054,10 +1698,56 @@ func TestStaleNodeStreamCleanup(t *testing.T) {
 		_, exists := node1.nodeKeepAliveMap.Get(node2.ID)
 		return !exists
 	}, max, delay, "Stale node should have been removed from keep-alive map")
+	lifecycle, err := rdb.HGetAll(ctx, "pulse:stream:"+nodeStreamName(node2.PoolName, node2.ID)+":lifecycle").Result()
+	require.NoError(t, err)
+	require.Equal(t, node2.nodeStream.Generation(), lifecycle["generation"])
+	require.Equal(t, "destroyed", lifecycle["state"])
 
-	// Clean up
-	assert.NoError(t, node2.Close(ctx))
+	// A stale node that resumes observes the cleanup fence before mutating
+	// ownership and performs complete local teardown.
+	err = node2.ensureGenerationActive(ctx)
+	require.ErrorIs(t, err, ErrPoolGenerationLost)
+	require.Eventually(t, node2.IsClosed, max, delay)
+	require.NoError(t, node2.Close(ctx))
 	assert.NoError(t, node1.Shutdown(ctx))
+}
+
+func TestInactiveNodeDiscoveryRemainsUntilStreamDestroySucceeds(t *testing.T) {
+	ctx := ptesting.NewTestContext(t)
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	staleID := "stale-node"
+	hook := &poolRedisHook{
+		failure: errors.New("destroy failed"),
+		key:     "pulse:stream:" + nodeStreamName(t.Name(), staleID) + ":lifecycle",
+	}
+	rdb.AddHook(hook)
+	node := newTestNode(t, ctx, rdb, t.Name())
+	staleStream, err := streaming.NewStream(nodeStreamName(node.PoolName, staleID), rdb)
+	require.NoError(t, err)
+	_, err = staleStream.Add(ctx, evInit, []byte(staleID))
+	require.NoError(t, err)
+	now, err := rdb.Time(ctx).Result()
+	require.NoError(t, err)
+	_, err = node.nodeKeepAliveMap.SetAndWait(
+		ctx,
+		staleID,
+		strconv.FormatInt(now.Add(-2*node.workerTTL).UnixNano(), 10),
+	)
+	require.NoError(t, err)
+	hook.failDestroy.Store(true)
+
+	node.cleanupInactiveNodes()
+	_, exists := node.nodeKeepAliveMap.Get(staleID)
+	require.True(t, exists)
+
+	hook.failDestroy.Store(false)
+	node.cleanupInactiveNodes()
+	require.Eventually(t, func() bool {
+		_, exists = node.nodeKeepAliveMap.Get(staleID)
+		return !exists
+	}, max, delay)
+	require.NoError(t, node.Shutdown(ctx))
 }
 
 func TestShutdownStopsAllJobs(t *testing.T) {
@@ -1147,7 +1837,8 @@ func TestWorkerAckStreams(t *testing.T) {
 	assert.Same(t, stream1, stream2, "Expected same stream instance to be returned")
 
 	// Verify stream exists before shutdown
-	streamKey := "pulse:stream:" + nodeStreamName(testName, node.ID)
+	streamKey := generationStreamKey(ctx, rdb, nodeStreamName(testName, node.ID))
+	require.NotEmpty(t, streamKey)
 	exists, err := rdb.Exists(ctx, streamKey).Result()
 	assert.NoError(t, err)
 	assert.Equal(t, int64(1), exists, "Expected stream to exist before shutdown")
@@ -1187,8 +1878,7 @@ func TestStaleWorkerCleanupAfterJobRequeue(t *testing.T) {
 
 	// Make the worker stale by stopping it and setting an old keepalive
 	staleWorker.stop(ctx)
-	_, err := node.workerKeepAliveMap.Set(ctx, staleWorker.ID,
-		strconv.FormatInt(time.Now().Add(-2*node.workerTTL).UnixNano(), 10))
+	_, err := node.workerKeepAliveMap.Set(ctx, staleWorker.ID, "0")
 	require.NoError(t, err)
 
 	// Create a new worker to receive requeued jobs
@@ -1197,7 +1887,7 @@ func TestStaleWorkerCleanupAfterJobRequeue(t *testing.T) {
 	// Wait for cleanup to happen and jobs to be requeued
 	require.Eventually(t, func() bool {
 		return len(newWorker.Jobs()) == 3
-	}, max, delay, "Jobs were not requeued to new worker")
+	}, 2*node.workerTTL, delay, "Jobs were not requeued to new worker")
 
 	// Verify stale worker was deleted
 	require.Eventually(t, func() bool {
@@ -1325,7 +2015,7 @@ func TestRequeueOrphanedPayloads(t *testing.T) {
 			testName := strings.Replace(t.Name(), "/", "_", -1)
 			ctx := ptesting.NewTestContext(t)
 			rdb := ptesting.NewRedisClient(t)
-			node := newFastCleanupTestNode(t, ctx, rdb, testName)
+			node := newTestNode(t, ctx, rdb, testName)
 			worker := newTestWorker(t, ctx, node)
 			defer ptesting.CleanupRedis(t, rdb, true, testName)
 
@@ -1363,7 +2053,7 @@ func TestRequeueOrphanedPayloads(t *testing.T) {
 				// The requeued jobs may end up on this worker or another (if present);
 				// in this test there is only one worker, so they should all reappear here.
 				return len(jobs) == len(tt.setupJobs)
-			}, max, delay, fmt.Sprintf("Orphaned payload requeue did not restore job keys; expected %d jobs in jobMap", len(tt.setupJobs)))
+			}, 15*time.Second, delay, fmt.Sprintf("Orphaned payload requeue did not restore job keys; expected %d jobs in jobMap", len(tt.setupJobs)))
 
 			assert.NoError(t, node.Shutdown(ctx))
 		})
@@ -1383,7 +2073,7 @@ func requireActiveWorkerRing(t *testing.T, nodes []*Node, workerIDs ...string) {
 			}
 		}
 		return true
-	}, max, delay, "active worker ring did not converge")
+	}, 5*time.Second, delay, "active worker ring did not converge")
 }
 
 // orphanedPayloadGrace mirrors the recovery grace used by
@@ -1391,8 +2081,8 @@ func requireActiveWorkerRing(t *testing.T, nodes []*Node, workerIDs ...string) {
 // an unrelated timing constant.
 func orphanedPayloadGrace(node *Node) time.Duration {
 	grace := 2 * node.workerTTL
-	if grace < node.ackGracePeriod {
-		return node.ackGracePeriod
+	if grace < node.recoveryGrace {
+		return node.recoveryGrace
 	}
 	return grace
 }

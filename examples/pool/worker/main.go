@@ -37,7 +37,7 @@ type (
 func main() {
 	// Setup Redis connection
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
+		Addr:     os.Getenv("REDIS_ADDR"),
 		Password: os.Getenv("REDIS_PASSWORD"),
 	})
 

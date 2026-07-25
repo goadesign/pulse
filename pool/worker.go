@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/oklog/ulid/v2"
+	redis "github.com/redis/go-redis/v9"
 	"goa.design/clue/log"
 
 	"goa.design/pulse/pulse"
@@ -26,26 +27,29 @@ type (
 		// Time worker was created.
 		CreatedAt time.Time
 
-		node              *Node
-		handler           JobHandler
-		stream            *streaming.Stream
-		reader            *streaming.Reader
-		done              chan struct{}
-		jobsMap           *rmap.Map
-		jobPayloadsMap    *rmap.Map
-		keepAliveMap      *rmap.Map
-		shutdownMap       *rmap.Map
-		workerTTL         time.Duration
-		workerShutdownTTL time.Duration
-		pendingJobTTL     time.Duration
-		logger            pulse.Logger
-		wg                sync.WaitGroup
+		node           *Node
+		handler        JobHandler
+		stream         *streaming.Stream
+		reader         *streaming.Reader
+		done           chan struct{}
+		jobsMap        *rmap.Map
+		jobPayloadsMap *rmap.Map
+		keepAliveMap   *rmap.Map
+		shutdownMap    *rmap.Map
+		workerTTL      time.Duration
+		requeueTimeout time.Duration
+		logger         pulse.Logger
+		wg             sync.WaitGroup
+		rebalanceLock  sync.Mutex
 
 		jobs        sync.Map // jobs being handled by the worker indexed by job key
 		nodeStreams sync.Map
 
 		lock    sync.RWMutex
 		stopped bool
+		// streamDestroyed records completion of the retryable distributed stop
+		// side effect after local worker goroutines have stopped.
+		streamDestroyed bool
 	}
 
 	// Job is a job that can be added to a worker.
@@ -63,6 +67,9 @@ type (
 		Worker *Worker
 		// NodeID is the ID of the node that created the job.
 		NodeID string
+		// dispatchID correlates an admitted dispatch before its event is
+		// published. It is intentionally not part of the public job contract.
+		dispatchID string
 	}
 
 	// JobHandler starts and stops jobs.
@@ -91,57 +98,102 @@ type (
 	ack struct {
 		// EventID is the ID of the event being acknowledged.
 		EventID string
+		// JobKey is the singleton admission key completed by this ack.
+		JobKey string
 		// Error is the error that occurred while handling the event if any.
 		Error string
 	}
 )
 
-var errJobNotOwned = errors.New("job not owned by worker")
+var (
+	errJobNotOwned = errors.New("job not owned by worker")
+
+	// errDispatchIdentityMismatch reports that a start event's payload
+	// diverged from the admitted dispatch record. The identity is derived
+	// from immutable event bytes, so this is an invariant violation that no
+	// retry can repair: the event must be acknowledged with a terminal error.
+	errDispatchIdentityMismatch = errors.New("dispatch payload identity mismatch")
+)
 
 // newWorker creates a new worker.
 func newWorker(ctx context.Context, node *Node, h JobHandler) (*Worker, error) {
-	wid := ulid.Make().String()
-	createdAt := time.Now()
-	if _, err := node.workerMap.SetAndWait(ctx, wid, strconv.FormatInt(createdAt.UnixNano(), 10)); err != nil {
-		return nil, fmt.Errorf("failed to add worker %q to pool %q: %w", wid, node.PoolName, err)
+	if err := node.ensureGenerationActive(ctx); err != nil {
+		return nil, err
 	}
-	now := strconv.FormatInt(time.Now().UnixNano(), 10)
-	if _, err := node.workerKeepAliveMap.SetAndWait(ctx, wid, now); err != nil {
-		return nil, fmt.Errorf("failed to update worker keep-alive: %w", err)
+	wid := ulid.Make().String()
+	createdAt, err := node.rdb.Time(ctx).Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read Redis time for worker %q: %w", wid, err)
 	}
 	stream, err := streaming.NewStream(workerStreamName(wid), node.rdb, options.WithStreamLogger(node.logger))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create jobs stream for worker %q: %w", wid, err)
 	}
 	if _, err := stream.Add(ctx, evInit, marshalEnvelope(node.ID, []byte(wid))); err != nil {
-		return nil, fmt.Errorf("failed to add init event to worker stream %q: %w", workerStreamName(wid), err)
+		destroyErr := stream.Destroy(context.WithoutCancel(ctx))
+		return nil, errors.Join(
+			fmt.Errorf("failed to add init event to worker stream %q: %w", workerStreamName(wid), err),
+			destroyErr,
+		)
 	}
 	reader, err := stream.NewReader(ctx, options.WithReaderBlockDuration(node.workerTTL/2), options.WithReaderStartAtOldest())
 	if err != nil {
-		return nil, fmt.Errorf("failed to create reader for worker %q: %w", wid, err)
+		destroyErr := stream.Destroy(context.WithoutCancel(ctx))
+		return nil, errors.Join(
+			fmt.Errorf("failed to create reader for worker %q: %w", wid, err),
+			destroyErr,
+		)
+	}
+	if err := node.setPoolMapAndWait(
+		ctx,
+		node.workerMap,
+		node.resources.workers,
+		wid,
+		strconv.FormatInt(createdAt.UnixNano(), 10),
+	); err != nil {
+		reader.Close()
+		destroyErr := stream.Destroy(context.WithoutCancel(ctx))
+		return nil, errors.Join(
+			fmt.Errorf("failed to add worker %q to pool %q: %w", wid, node.PoolName, err),
+			destroyErr,
+		)
+	}
+	now, err := node.updateWorkerHeartbeat(ctx, wid)
+	if err == nil {
+		err = waitPoolMapValue(ctx, node.workerKeepAliveMap, wid, now)
+	}
+	if err != nil {
+		removeErr := node.deletePoolMap(context.WithoutCancel(ctx), node.resources.workers, wid)
+		reader.Close()
+		destroyErr := stream.Destroy(context.WithoutCancel(ctx))
+		return nil, errors.Join(
+			fmt.Errorf("failed to update worker keep-alive: %w", err),
+			removeErr,
+			destroyErr,
+		)
 	}
 	w := &Worker{
-		ID:                wid,
-		node:              node,
-		handler:           h,
-		CreatedAt:         time.Now(),
-		stream:            stream,
-		reader:            reader,
-		done:              make(chan struct{}),
-		jobsMap:           node.jobMap,
-		jobPayloadsMap:    node.jobPayloadMap,
-		keepAliveMap:      node.workerKeepAliveMap,
-		shutdownMap:       node.nodeShutdownMap,
-		workerTTL:         node.workerTTL,
-		workerShutdownTTL: node.workerShutdownTTL,
-		logger:            node.logger.WithPrefix("worker", wid),
-		jobs:              sync.Map{},
-		nodeStreams:       sync.Map{},
+		ID:             wid,
+		node:           node,
+		handler:        h,
+		CreatedAt:      createdAt,
+		stream:         stream,
+		reader:         reader,
+		done:           make(chan struct{}),
+		jobsMap:        node.jobMap,
+		jobPayloadsMap: node.jobPayloadMap,
+		keepAliveMap:   node.workerKeepAliveMap,
+		shutdownMap:    node.nodeShutdownMap,
+		workerTTL:      node.workerTTL,
+		requeueTimeout: node.requeueTimeout,
+		logger:         node.logger.WithPrefix("worker", wid),
+		jobs:           sync.Map{},
+		nodeStreams:    sync.Map{},
 	}
 
 	w.logger.Info("created",
 		"worker_ttl", w.workerTTL,
-		"worker_shutdown_ttl", w.workerShutdownTTL)
+		"worker_requeue_timeout", w.requeueTimeout)
 
 	w.wg.Add(2)
 
@@ -149,7 +201,8 @@ func newWorker(ctx context.Context, node *Node, h JobHandler) (*Worker, error) {
 	// not cancel the worker.
 	logCtx := context.Background()
 	logCtx = log.WithContext(logCtx, ctx)
-	pulse.Go(w.logger, func() { w.handleEvents(logCtx, reader.Subscribe()) })
+	events := reader.Subscribe()
+	pulse.Go(w.logger, func() { w.handleEvents(logCtx, events) })
 	pulse.Go(w.logger, func() { w.keepAlive(logCtx) })
 
 	return w, nil
@@ -176,6 +229,7 @@ func (w *Worker) Jobs() []*Job {
 			CreatedAt: job.CreatedAt,
 			Worker:    &Worker{ID: w.ID, node: w.node, CreatedAt: w.CreatedAt},
 			NodeID:    job.NodeID,
+			Requeued:  job.Requeued,
 		})
 	}
 	return jobs
@@ -198,37 +252,74 @@ func (w *Worker) handleEvents(ctx context.Context, c <-chan *streaming.Event) {
 			if !ok {
 				return
 			}
-			nodeID, payload := unmarshalEnvelope(ev.Payload)
-			var err error
+			if err := w.refreshHeartbeat(ctx); err != nil {
+				w.logger.Error(fmt.Errorf("worker intake heartbeat failed: %w", err))
+				if redis.HasErrorPrefix(err, "WORKERCLEANUPLOST") {
+					return
+				}
+				continue
+			}
+			nodeID, payload, err := unmarshalEnvelope(ev.Payload)
+			if err != nil {
+				w.dropMalformedEvent(ctx, ev, fmt.Errorf("decode worker event envelope: %w", err))
+				continue
+			}
+			var dispatched *Job
 			switch ev.EventName {
 			case evInit:
 				w.logger.Debug("handleEvents: received init", "event", ev.EventName, "id", ev.ID)
 				continue
 			case evStartJob:
 				w.logger.Debug("handleEvents: received start job", "event", ev.EventName, "id", ev.ID)
-				err = w.startJob(ctx, unmarshalJob(payload))
+				dispatched, err = unmarshalJob(payload)
+				if err == nil {
+					err = w.startJob(ctx, dispatched)
+				}
 			case evMessage:
 				w.logger.Debug("handleEvents: received message", "event", ev.EventName, "id", ev.ID)
-				key, payload := unmarshalKeyedPayload(payload)
-				err = w.message(key, payload)
+				var key string
+				key, payload, err = unmarshalKeyedPayload(payload)
+				if err == nil {
+					err = w.message(key, payload)
+				}
 			case evStopJob:
 				w.logger.Debug("handleEvents: received stop job", "event", ev.EventName, "id", ev.ID)
-				err = w.stopJob(ctx, unmarshalJobKey(payload))
+				var key string
+				key, err = unmarshalJobKey(payload)
+				if err == nil {
+					err = w.stopJob(ctx, key)
+				}
 			case evNotify:
 				w.logger.Debug("handleEvents: received notify", "event", ev.EventName, "id", ev.ID)
-				key, payload := unmarshalKeyedPayload(payload)
-				err = w.notify(ctx, key, payload)
+				var key string
+				key, payload, err = unmarshalKeyedPayload(payload)
+				if err == nil {
+					err = w.notify(ctx, key, payload)
+				}
+			default:
+				err = fmt.Errorf("unknown worker event %q", ev.EventName)
 			}
 			if err != nil {
+				if redis.HasErrorPrefix(err, "WORKERCLEANUPLOST") {
+					return
+				}
 				if errors.Is(err, ErrRequeue) {
-					w.logger.Info("requeue", "event", ev.EventName, "id", ev.ID, "after", w.pendingJobTTL)
+					w.logger.Info("requeue", "event", ev.EventName, "id", ev.ID)
 					continue
 				}
-				w.ackPoolEvent(ctx, nodeID, ev.ID, err)
+				if dispatched != nil && dispatched.dispatchID != "" {
+					w.node.ownDispatchSettlement(w, nodeID, ev.ID, dispatched, err)
+				} else {
+					w.ackPoolEvent(ctx, nodeID, ev.ID, err)
+				}
 				w.logger.Error(fmt.Errorf("handler failed: %w", err), "event", ev.EventName, "id", ev.ID)
 				continue
 			}
-			w.ackPoolEvent(ctx, nodeID, ev.ID, nil)
+			if dispatched != nil && dispatched.dispatchID != "" {
+				w.node.ownDispatchSettlement(w, nodeID, ev.ID, dispatched, nil)
+			} else {
+				w.ackPoolEvent(ctx, nodeID, ev.ID, nil)
+			}
 		case <-w.done:
 			w.logger.Debug("handleEvents: done")
 			return
@@ -236,21 +327,56 @@ func (w *Worker) handleEvents(ctx context.Context, c <-chan *streaming.Event) {
 	}
 }
 
+// dropMalformedEvent logs and removes an envelope that cannot identify its
+// sender, so a permanent worker loop never reprocesses the poison entry.
+func (w *Worker) dropMalformedEvent(ctx context.Context, event *streaming.Event, decodeErr error) {
+	w.logger.Error(decodeErr, "event", event.EventName, "id", event.ID)
+	if err := w.stream.Remove(ctx, event.ID); err != nil {
+		w.logger.Error(fmt.Errorf("drop malformed worker event %s: %w", event.ID, err))
+	}
+}
+
 // stop stops the reader, destroys the stream and closes the worker.
-func (w *Worker) stop(ctx context.Context) {
-	w.lock.Lock()
-	if w.stopped {
-		w.lock.Unlock()
-		return
+func (w *Worker) stop(ctx context.Context) error {
+	w.stopLocal()
+	w.lock.RLock()
+	destroyed := w.streamDestroyed
+	w.lock.RUnlock()
+	if destroyed {
+		return nil
 	}
-	w.stopped = true
-	w.lock.Unlock()
-	w.reader.Close()
 	if err := w.stream.Destroy(ctx); err != nil {
-		w.logger.Error(fmt.Errorf("failed to destroy stream for worker: %w", err))
+		return fmt.Errorf("failed to destroy stream for worker: %w", err)
 	}
-	close(w.done)
-	w.wg.Wait()
+	w.lock.Lock()
+	w.streamDestroyed = true
+	w.lock.Unlock()
+	return nil
+}
+
+// stopLocal stops and joins worker intake without mutating Redis. It is used
+// when pool cleanup already destroyed the worker's generation-owned resources.
+func (w *Worker) stopLocal() {
+	firstAttempt := w.stopIntake()
+	if firstAttempt {
+		w.wg.Wait()
+	}
+}
+
+// stopIntake closes worker-owned input without joining the calling goroutine.
+func (w *Worker) stopIntake() bool {
+	w.lock.Lock()
+	firstAttempt := !w.stopped
+	if firstAttempt {
+		w.stopped = true
+	}
+	w.lock.Unlock()
+
+	if firstAttempt {
+		close(w.done)
+		w.reader.Close()
+	}
+	return firstAttempt
 }
 
 // startJob starts a job.
@@ -258,33 +384,135 @@ func (w *Worker) startJob(ctx context.Context, job *Job) error {
 	if w.IsStopped() {
 		return fmt.Errorf("worker %q stopped", w.ID)
 	}
-	if _, err := w.jobsMap.AppendUniqueValues(ctx, w.ID, job.Key); err != nil {
-		w.logger.Error(fmt.Errorf("failed to add job %q to jobs map: %w, requeueing", job.Key, err))
-		return ErrRequeue
+	if err := w.refreshHeartbeat(ctx); err != nil {
+		return err
 	}
-	if _, err := w.jobPayloadsMap.Set(ctx, job.Key, string(job.Payload)); err != nil {
-		w.logger.Error(fmt.Errorf("failed to add job payload %q to job payloads map: %w, requeueing", job.Key, err))
-		if _, _, removeErr := w.jobsMap.RemoveValues(ctx, w.ID, job.Key); removeErr != nil {
-			w.logger.Error(fmt.Errorf("start failure handling: failed to remove job %q from jobs map: %w", job.Key, removeErr))
+	if err := w.node.ensureGenerationActive(ctx); err != nil {
+		return err
+	}
+	if job.dispatchID != "" {
+		claimed, err := w.claimDispatchedStart(ctx, job)
+		if err != nil {
+			if errors.Is(err, errDispatchIdentityMismatch) {
+				// Invariant violation: fail the event terminally instead of
+				// redelivering bytes that can never match their admission.
+				return err
+			}
+			return errors.Join(ErrRequeue, err)
 		}
-		return ErrRequeue
+		if !claimed {
+			return ErrRequeue
+		}
+	} else {
+		if err := w.node.appendPoolMapValue(ctx, w.node.resources.jobs, w.ID, job.Key); err != nil {
+			w.logger.Error(fmt.Errorf("failed to add job %q to jobs map: %w, requeueing", job.Key, err))
+			return ErrRequeue
+		}
+		if err := w.node.setPoolMap(ctx, w.node.resources.jobPayloads, job.Key, string(job.Payload)); err != nil {
+			w.logger.Error(fmt.Errorf("failed to add job payload %q to job payloads map: %w, requeueing", job.Key, err))
+			if cleanupErr := w.cleanupFailedStart(ctx, job.Key); cleanupErr != nil {
+				return errors.Join(
+					ErrRequeue,
+					fmt.Errorf("persist job payload %q: %w", job.Key, err),
+					cleanupErr,
+				)
+			}
+			return ErrRequeue
+		}
 	}
 	job.Worker = w
 	if err := w.handler.Start(job); err != nil {
 		w.logger.Debug("handler failed to start job", "job", job.Key, "error", err)
-		if _, _, err := w.jobsMap.RemoveValues(ctx, w.ID, job.Key); err != nil {
-			w.logger.Error(fmt.Errorf("start failure handling: failed to remove job %q from jobs map: %w", job.Key, err))
-		}
-		if !job.Requeued {
-			if _, err := w.jobPayloadsMap.Delete(ctx, job.Key); err != nil {
-				w.logger.Error(fmt.Errorf("start failure handling: failed to remove job payload %q from job payloads map: %w", job.Key, err))
-			}
+		if cleanupErr := w.cleanupFailedStart(ctx, job.Key); cleanupErr != nil {
+			return errors.Join(ErrRequeue, err, cleanupErr)
 		}
 		return err
 	}
 	w.logger.Info("started job", "job", job.Key)
 	w.jobs.Store(job.Key, job)
 	return nil
+}
+
+// claimDispatchedStart creates durable ownership exactly once for the pending
+// dispatch capability before the handler can run.
+func (w *Worker) claimDispatchedStart(ctx context.Context, job *Job) (bool, error) {
+	identity, err := dispatchIdentity(job.Key, job.Payload)
+	if err != nil {
+		return false, fmt.Errorf("claim dispatched start for job %q: %w", job.Key, err)
+	}
+	result, err := claimWorkerStartScript.Run(
+		ctx,
+		w.node.rdb,
+		[]string{
+			fmt.Sprintf("pulse:stream:%s:lifecycle", w.node.poolStream.Name),
+			rmapContentKey(w.node.resources.jobPending),
+			dispatchRecordKey(w.node.resources.dispatches, job.dispatchID),
+			rmapContentKey(w.node.resources.jobPayloads),
+			rmapContentKey(w.node.resources.jobs),
+			rmapUpdateChannel(w.node.resources.jobs),
+			rmapUpdateChannel(w.node.resources.jobPayloads),
+			rmapContentKey(w.node.resources.workers),
+			rmapContentKey(w.node.resources.workerCleanup),
+		},
+		w.node.resources.generation,
+		"active",
+		job.Key,
+		job.dispatchID,
+		w.ID,
+		job.Payload,
+		identity,
+	).Int64()
+	if err != nil {
+		if redis.HasErrorPrefix(err, "DISPATCHIDENTITYMISMATCH") {
+			return false, fmt.Errorf("%w: job %q dispatch %q", errDispatchIdentityMismatch, job.Key, job.dispatchID)
+		}
+		return false, fmt.Errorf("claim dispatched start for job %q: %w", job.Key, err)
+	}
+	return result == 1, nil
+}
+
+// cleanupFailedStart atomically removes durable ownership and payload under the
+// exact pool-stream generation. Callers must retry the event while this recipe
+// fails and may report terminal handler failure only after it succeeds.
+func (w *Worker) cleanupFailedStart(ctx context.Context, key string) error {
+	err := cleanupFailedStartScript.Run(
+		ctx,
+		w.node.rdb,
+		[]string{
+			fmt.Sprintf("pulse:stream:%s:lifecycle", w.node.poolStream.Name),
+			rmapContentKey(w.node.resources.jobs),
+			rmapUpdateChannel(w.node.resources.jobs),
+			rmapContentKey(w.node.resources.jobPayloads),
+			rmapUpdateChannel(w.node.resources.jobPayloads),
+		},
+		w.node.resources.generation,
+		w.ID,
+		key,
+		"active",
+	).Err()
+	if err != nil {
+		return fmt.Errorf("clean failed start for job %q: %w", key, err)
+	}
+	return nil
+}
+
+// markDispatchSettled makes a successfully started exact-dispatch job eligible
+// for ordinary running-job rebalancing only after its original dispatch event
+// and durable terminal record have settled atomically.
+func (w *Worker) markDispatchSettled(key, dispatchID string) {
+	w.lock.Lock()
+	defer w.lock.Unlock()
+	value, ok := w.jobs.Load(key)
+	if !ok {
+		return
+	}
+	job := value.(*Job)
+	if job.dispatchID != dispatchID {
+		return
+	}
+	settled := *job
+	settled.dispatchID = ""
+	w.jobs.Store(key, &settled)
 }
 
 // stopJob stops a job.
@@ -295,7 +523,7 @@ func (w *Worker) stopJob(ctx context.Context, key string) error {
 		}
 		return err
 	}
-	if _, err := w.jobPayloadsMap.Delete(ctx, key); err != nil {
+	if err := w.node.deletePoolMap(ctx, w.node.resources.jobPayloads, key); err != nil {
 		w.logger.Error(fmt.Errorf("stop job: failed to remove job payload %q from job payloads map: %w", key, err))
 	}
 	w.logger.Info("stopped job", "job", key)
@@ -308,12 +536,15 @@ func (w *Worker) releaseJob(ctx context.Context, key string) error {
 	if _, ok := w.jobs.Load(key); !ok {
 		return fmt.Errorf("%w: %s", errJobNotOwned, key)
 	}
+	if err := w.node.ensureGenerationActive(ctx); err != nil {
+		return err
+	}
 	if err := w.handler.Stop(key); err != nil {
 		return fmt.Errorf("failed to stop job %q: %w", key, err)
 	}
 	w.logger.Debug("stopped job", "job", key)
 	w.jobs.Delete(key)
-	if _, _, err := w.jobsMap.RemoveValues(ctx, w.ID, key); err != nil {
+	if err := w.node.removePoolMapValue(ctx, w.node.resources.jobs, w.ID, key); err != nil {
 		return fmt.Errorf("failed to release job %q from jobs map: %w", key, err)
 	}
 	return nil
@@ -351,22 +582,46 @@ func (w *Worker) message(key string, payload []byte) error {
 	return mh.HandleMessage(key, payload)
 }
 
-// ackPoolEvent acknowledges the pool event that originated from the node with
-// the given ID.
+// ackPoolEvent publishes the worker outcome to the originating node. It retries
+// while that node stream exists; a vanished exact generation leaves the
+// original pool event to sink recovery, while dispatched starts are already
+// durably terminal through settleDispatchedStart.
 func (w *Worker) ackPoolEvent(ctx context.Context, nodeID, eventID string, ackerr error) {
-	stream, err := w.node.getNodeStream(nodeID)
-	if err != nil {
-		w.logger.Error(fmt.Errorf("failed to get ack stream for node %q: %w", nodeID, err))
-		return
-	}
-
 	var msg string
 	if ackerr != nil {
 		msg = ackerr.Error()
 	}
 	ack := &ack{EventID: eventID, Error: msg}
-	if _, err := stream.Add(ctx, evAck, marshalEnvelope(w.ID, marshalAck(ack)), options.WithOnlyIfStreamExists()); err != nil {
-		w.logger.Error(fmt.Errorf("failed to ack event %q from node %q: %w", eventID, nodeID, err))
+	payload := marshalEnvelope(w.ID, marshalAck(ack))
+	delay := 100 * time.Millisecond
+	for {
+		stream, err := w.node.getNodeStream(nodeID)
+		if err == nil {
+			_, err = stream.Add(ctx, evAck, payload, options.WithOnlyIfStreamExists())
+		}
+		if err == nil {
+			return
+		}
+		if errors.Is(err, streaming.ErrStreamNotFound) ||
+			errors.Is(err, streaming.ErrStreamDestroyed) {
+			return
+		}
+		w.logger.Error(
+			fmt.Errorf("failed to ack event %q from node %q: %w", eventID, nodeID, err),
+			"retry_in",
+			delay,
+		)
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+			delay = min(delay*2, 5*time.Second)
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-w.done:
+			timer.Stop()
+			return
+		}
 	}
 }
 
@@ -382,9 +637,11 @@ func (w *Worker) keepAlive(ctx context.Context) {
 			if w.IsStopped() {
 				return // Let's not recreate the map if we just deleted it
 			}
-			now := strconv.FormatInt(time.Now().UnixNano(), 10)
-			if _, err := w.keepAliveMap.Set(ctx, w.ID, now); err != nil {
+			if err := w.refreshHeartbeat(ctx); err != nil {
 				w.logger.Error(fmt.Errorf("failed to update worker keep-alive: %w", err))
+				if redis.HasErrorPrefix(err, "WORKERCLEANUPLOST") {
+					return
+				}
 			}
 		case <-w.done:
 			w.logger.Debug("keepAlive: done")
@@ -393,12 +650,28 @@ func (w *Worker) keepAlive(ctx context.Context) {
 	}
 }
 
+// refreshHeartbeat renews the Redis-time worker liveness proof. A cleanup
+// fence is terminal and closes intake before further handler or ownership work.
+func (w *Worker) refreshHeartbeat(ctx context.Context) error {
+	_, err := w.node.updateWorkerHeartbeat(ctx, w.ID)
+	if redis.HasErrorPrefix(err, "WORKERCLEANUPLOST") {
+		w.stopIntake()
+	}
+	return err
+}
+
 // rebalance rebalances the jobs handled by the worker.
 func (w *Worker) rebalance(ctx context.Context, activeWorkers []string) {
+	w.rebalanceLock.Lock()
+	defer w.rebalanceLock.Unlock()
+
 	w.logger.Debug("rebalance")
 	rebalanced := make(map[string]*Job)
 	w.jobs.Range(func(key, value any) bool {
 		job := value.(*Job)
+		if job.dispatchID != "" {
+			return true
+		}
 		wid := activeWorkers[w.node.h.Hash(job.Key, int64(len(activeWorkers)))]
 		if wid != w.ID {
 			rebalanced[job.Key] = job
@@ -411,19 +684,21 @@ func (w *Worker) rebalance(ctx context.Context, activeWorkers []string) {
 		return
 	}
 	for key, job := range rebalanced {
-		job.Requeued = true
+		requeue := *job
+		requeue.Requeued = true
+		requeue.dispatchID = ""
 		if err := w.releaseJob(ctx, key); err != nil {
 			w.logger.Error(fmt.Errorf("rebalance: failed to release job: %w", err), "job", key)
 			if _, ok := w.jobs.Load(key); !ok {
-				if err := w.startJob(ctx, job); err != nil {
+				if err := w.startJob(ctx, &requeue); err != nil {
 					w.logger.Error(fmt.Errorf("rebalance: failed to restart job: %w", err), "job", key)
 				}
 			}
 			continue
 		}
-		if _, err := w.node.poolStream.Add(ctx, evStartJob, marshalJob(job)); err != nil {
+		if _, err := w.node.poolStream.Add(ctx, evStartJob, marshalJob(&requeue)); err != nil {
 			w.logger.Error(fmt.Errorf("rebalance: failed to requeue job: %w", err), "job", key)
-			if err := w.startJob(ctx, job); err != nil {
+			if err := w.startJob(ctx, &requeue); err != nil {
 				w.logger.Error(fmt.Errorf("rebalance: failed to restart job: %w", err), "job", key)
 				continue
 			}
@@ -433,129 +708,80 @@ func (w *Worker) rebalance(ctx context.Context, activeWorkers []string) {
 	}
 }
 
-// requeueJobs requeues the jobs handled by the worker.
-// This should be done after the worker is stopped.
+// requeueJobs requeues the jobs handled by the worker during graceful
+// shutdown. It self-acquires the worker requeue lease — the same capability
+// stale-worker cleanup uses — so exactly one party republishes the jobs, and
+// every publication flows through the lease-fenced stable dedup records. When
+// this worker loses the lease, the winning cleanup owner owns the requeue.
 func (w *Worker) requeueJobs(ctx context.Context) error {
-	jobsToRequeue := make(map[string]*Job)
+	var unsettled []string
 	jobCount := 0
-	w.jobs.Range(func(key, value any) bool {
+	w.jobs.Range(func(_, value any) bool {
 		job := value.(*Job)
-		jobsToRequeue[key.(string)] = job
+		if job.dispatchID != "" {
+			unsettled = append(unsettled, job.dispatchID)
+			return true
+		}
 		jobCount++
 		return true
 	})
+	if len(unsettled) > 0 {
+		sort.Strings(unsettled)
+		return fmt.Errorf("requeueJobs: exact dispatch settlements still pending: %v", unsettled)
+	}
 	if jobCount == 0 {
 		w.logger.Debug("requeueJobs: no jobs to requeue")
 		return nil
 	}
-	createdAt := strconv.FormatInt(w.CreatedAt.UnixNano(), 10)
 	w.logger.Debug("requeueJobs: requeuing", "jobs", jobCount)
 
-	// First mark the worker as inactive so that requeued jobs are not assigned to this worker
-	// Use optimistic locking to avoid race conditions.
-	prev, err := w.node.workerMap.TestAndSet(ctx, w.ID, createdAt, "-")
+	lease, err := w.node.acquireGracefulRequeue(ctx, w.ID)
 	if err != nil {
-		return fmt.Errorf("requeueJobs: failed to mark worker as inactive: %w", err)
+		return fmt.Errorf("requeueJobs: failed to acquire requeue lease: %w", err)
 	}
-	if prev == "-" {
-		w.logger.Debug("requeueJobs: jobs already requeued, skipping requeue")
+	if lease == nil {
+		w.logger.Debug("requeueJobs: requeue owned elsewhere, skipping")
 		return nil
 	}
-	// If the optimistic lock failed (unexpected value), force the worker to
-	// inactive anyway. This worker is stopped and must not receive requeued jobs.
-	if prev != createdAt {
-		w.logger.Error(fmt.Errorf("requeueJobs: failed optimistic lock for worker inactive mark"), "worker", w.ID, "expected", createdAt, "got", prev)
-		if _, err := w.node.workerMap.Set(ctx, w.ID, "-"); err != nil {
-			return fmt.Errorf("requeueJobs: failed to force worker inactive state: %w", err)
+	complete := false
+	defer func() {
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+		defer cancel()
+		if err := w.node.releaseWorkerCleanup(releaseCtx, lease, complete); err != nil {
+			w.logger.Error(fmt.Errorf("requeueJobs: release lease: %w", err))
 		}
-	}
+	}()
 
-	retryUntil := time.Now().Add(w.workerTTL)
-	for retryUntil.After(time.Now()) {
-		remainingJobs := w.attemptRequeue(ctx, jobsToRequeue)
-		jobsToRequeue = remainingJobs
-		if len(remainingJobs) == 0 {
+	stopLocal := func(key string) error {
+		if _, ok := w.jobs.Load(key); !ok {
+			return nil
+		}
+		if err := w.handler.Stop(key); err != nil {
+			return fmt.Errorf("requeueJobs: failed to stop job %q: %w", key, err)
+		}
+		w.jobs.Delete(key)
+		w.logger.Debug("requeueJobs: stopped", "job", key)
+		return nil
+	}
+	retryUntil := time.Now().Add(w.requeueTimeout)
+	for {
+		complete = w.node.requeueWorkerJobs(ctx, lease, stopLocal)
+		if complete || !retryUntil.After(time.Now()) {
 			break
 		}
-	}
-
-	failedCount := len(jobsToRequeue)
-	w.logger.Info("requeued", "jobs", jobCount, "failed", failedCount)
-	if failedCount > 0 {
-		return fmt.Errorf("requeueJobs: failed to requeue %d/%d jobs after retrying for %v", failedCount, jobCount, w.workerTTL)
-	}
-
-	return nil
-}
-
-// attemptRequeue attempts to requeue the jobs in the given map.
-// It returns any job that failed to be requeued.
-func (w *Worker) attemptRequeue(ctx context.Context, jobsToRequeue map[string]*Job) map[string]*Job {
-	var wg sync.WaitGroup
-	type result struct {
-		key string
-		err error
-	}
-	resultChan := make(chan result, len(jobsToRequeue))
-	defer close(resultChan)
-
-	wg.Add(len(jobsToRequeue))
-	for key, job := range jobsToRequeue {
-		pulse.Go(w.logger, func() {
-			defer wg.Done()
-			err := w.requeueJob(ctx, job)
-			if err != nil {
-				w.logger.Error(fmt.Errorf("failed to requeue job: %w", err), "job", key)
-			} else {
-				w.logger.Debug("requeueJobs: requeued", "job", key)
-			}
-			resultChan <- result{key: key, err: err}
-		})
-	}
-	wg.Wait()
-
-	remainingJobs := make(map[string]*Job)
-	for {
+		if err := w.node.renewWorkerCleanup(ctx, lease); err != nil {
+			return fmt.Errorf("requeueJobs: requeue lease lost: %w", err)
+		}
 		select {
-		case res := <-resultChan:
-			if res.err != nil {
-				w.logger.Error(fmt.Errorf("requeueJobs: failed to requeue job %q: %w", res.key, res.err))
-				remainingJobs[res.key] = jobsToRequeue[res.key]
-				continue
-			}
-			delete(remainingJobs, res.key)
-			w.logger.Info("requeued", "job", res.key)
-			if len(remainingJobs) == 0 {
-				w.logger.Debug("requeueJobs: all jobs requeued")
-				return remainingJobs
-			}
-		case <-time.After(w.workerShutdownTTL):
-			w.logger.Error(fmt.Errorf("requeueJobs: timeout reached, some jobs may not have been processed"))
-			return remainingJobs
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
-}
-
-// requeueJob requeues a job.
-func (w *Worker) requeueJob(ctx context.Context, job *Job) error {
-	job.Requeued = true
-	eventID, err := w.node.poolStream.Add(ctx, evStartJob, marshalJob(job))
-	if err != nil {
-		return fmt.Errorf("requeueJob: failed to add job to pool stream: %w", err)
+	if !complete {
+		return fmt.Errorf("requeueJobs: failed to requeue %d jobs after retrying for %v", jobCount, w.requeueTimeout)
 	}
-	// Mark this event as a "requeue" so any node waiting for a dispatch return (if any)
-	// can simply clean up without blocking.
-	w.node.pendingJobChannels.Store(eventID, nil)
-
-	// Stop locally, but do not touch the replicated job/payload maps: we want the
-	// payload to remain available for distributed recovery until the job is
-	// confirmed running elsewhere.
-	if _, ok := w.jobs.Load(job.Key); ok {
-		if err := w.handler.Stop(job.Key); err != nil {
-			return fmt.Errorf("requeueJob: failed to stop job %q: %w", job.Key, err)
-		}
-		w.jobs.Delete(job.Key)
-	}
+	w.logger.Info("requeued", "jobs", jobCount)
 	return nil
 }
 
