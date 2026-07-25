@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -992,14 +993,15 @@ func TestStaleNodeStreamCleanup(t *testing.T) {
 		rdb      = ptesting.NewRedisClient(t)
 		node1    = newFastCleanupTestNode(t, ctx, rdb, testName)
 		node2    = newFastCleanupTestNode(t, ctx, rdb, testName)
-		numJobs  = 0
+		numJobs  atomic.Int64
 	)
 	defer ptesting.CleanupRedis(t, rdb, false, testName)
 
-	// Configure nodes to send jobs to specific workers
+	// Configure nodes to send jobs to specific workers. The hasher is shared
+	// by both nodes and called from concurrent routing and rebalance
+	// goroutines, so its state must be synchronized.
 	node1.h = &ptesting.Hasher{IndexFunc: func(key string, numBuckets int64) int64 {
-		numJobs++
-		if numJobs > 2 {
+		if numJobs.Add(1) > 2 {
 			return 0 // to avoid panics on cleanup where jobs get requeued
 		}
 		if key == "job1" {
