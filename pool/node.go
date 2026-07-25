@@ -2283,17 +2283,41 @@ func (node *Node) cleanupWorker(ctx context.Context, workerID string) {
 			node.logger.Error(fmt.Errorf("cleanupWorker: release lease: %w", err), "worker", workerID)
 		}
 	}()
+	complete = node.requeueWorkerJobs(ctx, lease, nil)
+}
+
+// requeueWorkerJobs republishes every job owned by the leased worker through
+// the lease-fenced stable publication records and deletes the worker once all
+// jobs are processed. onProcessed, when non-nil, observes each job key that
+// left the worker's ownership so a gracefully stopping worker can stop its
+// local handler; an onProcessed error leaves the job for the next attempt.
+// It returns true when the worker was completely requeued and deleted.
+func (node *Node) requeueWorkerJobs(
+	ctx context.Context,
+	lease *workerCleanupLease,
+	onProcessed func(key string) error,
+) bool {
+	workerID := lease.workerID
+	processKey := func(key string) bool {
+		if onProcessed == nil {
+			return true
+		}
+		if err := onProcessed(key); err != nil {
+			node.logger.Error(fmt.Errorf("requeueWorkerJobs: local stop failed: %w", err), "job", key, "worker", workerID)
+			return false
+		}
+		return true
+	}
 
 	// Get the worker's jobs
 	keys, ok := node.jobMap.GetValues(workerID)
 	if !ok || len(keys) == 0 {
 		if err := node.deleteStaleWorker(ctx, lease); err != nil {
-			node.logger.Error(fmt.Errorf("cleanupWorkerJobs: failed to delete worker: %w", err), "worker", workerID)
-			return
+			node.logger.Error(fmt.Errorf("requeueWorkerJobs: failed to delete worker: %w", err), "worker", workerID)
+			return false
 		}
-		complete = true
 		node.logger.Info("cleaned up worker with no jobs", "worker", workerID)
-		return
+		return true
 	}
 
 	// Requeue jobs and process them
@@ -2323,6 +2347,9 @@ func (node *Node) cleanupWorker(ctx context.Context, workerID string) {
 					"dispatch",
 					dispatchID,
 				)
+				if !processKey(key) {
+					continue
+				}
 				processed++
 				continue
 			}
@@ -2331,13 +2358,16 @@ func (node *Node) cleanupWorker(ctx context.Context, workerID string) {
 		if !ok {
 			removed, err := node.removeStaleWorkerJob(ctx, lease, key)
 			if err != nil {
-				node.logger.Error(fmt.Errorf("cleanupWorker: failed to remove stale job from jobs map: %w", err), "job", key, "worker", workerID)
+				node.logger.Error(fmt.Errorf("requeueWorkerJobs: failed to remove stale job from jobs map: %w", err), "job", key, "worker", workerID)
 				continue
 			}
 			if !removed {
 				continue
 			}
-			node.logger.Info("cleanupWorker: removed stale job key with missing payload", "job", key, "worker", workerID)
+			node.logger.Info("requeueWorkerJobs: removed stale job key with missing payload", "job", key, "worker", workerID)
+			if !processKey(key) {
+				continue
+			}
 			processed++
 			continue
 		}
@@ -2351,19 +2381,28 @@ func (node *Node) cleanupWorker(ctx context.Context, workerID string) {
 			continue
 		}
 		if status == 2 {
+			if !processKey(key) {
+				continue
+			}
 			processed++
 			continue
 		}
 		if status == 3 {
 			removed, err := node.removeStaleWorkerJob(ctx, lease, key)
 			if err != nil {
-				node.logger.Error(fmt.Errorf("cleanupWorker: failed to remove stale job from jobs map: %w", err), "job", key, "worker", workerID)
+				node.logger.Error(fmt.Errorf("requeueWorkerJobs: failed to remove stale job from jobs map: %w", err), "job", key, "worker", workerID)
 				continue
 			}
 			if !removed {
 				continue
 			}
+			if !processKey(key) {
+				continue
+			}
 			processed++
+			continue
+		}
+		if !processKey(key) {
 			continue
 		}
 		requeued++
@@ -2371,16 +2410,16 @@ func (node *Node) cleanupWorker(ctx context.Context, workerID string) {
 	}
 	if len(keys) != processed {
 		node.logger.Info("partially processed stale worker jobs", "requeued", requeued, "processed", processed, "jobs", len(keys), "worker", workerID)
-		return
+		return false
 	}
 
 	// Delete worker
 	node.logger.Info("cleaned up worker", "worker", workerID, "requeued", requeued)
 	if err := node.deleteStaleWorker(ctx, lease); err != nil {
-		node.logger.Error(fmt.Errorf("cleanupWorkerJobs: failed to delete worker: %w", err), "worker", workerID)
-		return
+		node.logger.Error(fmt.Errorf("requeueWorkerJobs: failed to delete worker: %w", err), "worker", workerID)
+		return false
 	}
-	complete = true
+	return true
 }
 
 // isWithinTTL checks if a timestamp is within a TTL. If lastSeen is not a valid

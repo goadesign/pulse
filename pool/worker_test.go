@@ -6,7 +6,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,62 +16,6 @@ import (
 	"goa.design/pulse/rmap"
 	ptesting "goa.design/pulse/testing"
 )
-
-func TestAttemptRequeueAccountsForEveryConcurrentHandoff(t *testing.T) {
-	worker := &Worker{
-		requeueTimeout: 30 * time.Millisecond,
-		logger:         pulse.NoopLogger(),
-	}
-	jobs := map[string]*Job{
-		"success": {Key: "success"},
-		"late":    {Key: "late"},
-		"failed":  {Key: "failed"},
-		"blocked": {Key: "blocked"},
-	}
-	started := make(chan string, len(jobs))
-	release := make(chan struct{})
-	var running atomic.Int64
-	send := func(ctx context.Context, job *Job) error {
-		running.Add(1)
-		defer running.Add(-1)
-		started <- job.Key
-		switch job.Key {
-		case "success":
-			<-release
-			return nil
-		case "late":
-			<-release
-			time.Sleep(5 * time.Millisecond)
-			return nil
-		case "failed":
-			<-release
-			return errors.New("injected handoff failure")
-		case "blocked":
-			<-ctx.Done()
-			return ctx.Err()
-		default:
-			panic("unexpected job")
-		}
-	}
-	result := make(chan map[string]*Job, 1)
-	go func() {
-		result <- worker.attemptRequeueWith(context.Background(), jobs, send)
-	}()
-	for range jobs {
-		select {
-		case <-started:
-		case <-time.After(time.Second):
-			require.Fail(t, "handoffs did not start concurrently")
-		}
-	}
-	close(release)
-	remaining := <-result
-	require.Equal(t, map[string]*Job{
-		"failed":  jobs["failed"],
-		"blocked": jobs["blocked"],
-	}, remaining)
-	require.Zero(t, running.Load(), "attempt returned before all handoff goroutines joined")
-}
 
 func TestWorkerRequeueJobs(t *testing.T) {
 	var (

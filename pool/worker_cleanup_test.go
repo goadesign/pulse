@@ -9,6 +9,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"goa.design/pulse/pulse"
+
 	ptesting "goa.design/pulse/testing"
 )
 
@@ -186,6 +188,16 @@ func TestStaleWorkerCannotClaimAfterCleanupFence(t *testing.T) {
 	)
 	require.ErrorContains(t, err, "DISPATCHIDENTITYMISMATCH")
 
+	// The worker classifies the mismatch as a terminal invariant violation,
+	// not a requeue: retrying immutable bytes can never repair it.
+	mismatchWorker := &Worker{ID: workerID, node: node, logger: pulse.NoopLogger()}
+	_, err = mismatchWorker.claimDispatchedStart(ctx, &Job{
+		Key:        "job-identity",
+		Payload:    mutated,
+		dispatchID: "dispatch-identity",
+	})
+	require.ErrorIs(t, err, errDispatchIdentityMismatch)
+
 	// An installed cleanup fence rejects the claim atomically.
 	redisNow, err := rdb.Time(ctx).Result()
 	require.NoError(t, err)
@@ -208,7 +220,7 @@ func TestStaleWorkerCannotClaimAfterCleanupFence(t *testing.T) {
 	require.NoError(t, node.Shutdown(context.Background()))
 }
 
-func TestDeactivateWorkerFencesGracefulRequeue(t *testing.T) {
+func TestGracefulRequeueLeaseArbitratesWithCleanup(t *testing.T) {
 	rdb := ptesting.NewRedisClient(t)
 	defer ptesting.CleanupRedis(t, rdb, false, "")
 	ctx := ptesting.NewTestContext(t)
@@ -217,40 +229,53 @@ func TestDeactivateWorkerFencesGracefulRequeue(t *testing.T) {
 	createdAt := strconv.FormatInt(time.Now().UnixNano(), 10)
 	require.NoError(t, node.setPoolMap(ctx, node.resources.workers, workerID, createdAt))
 
-	won, prev, err := node.deactivateWorker(ctx, workerID)
+	// Graceful self-acquisition wins the lease despite a live heartbeat and
+	// atomically deactivates the registration.
+	_, err := node.updateWorkerHeartbeat(ctx, workerID)
 	require.NoError(t, err)
-	require.True(t, won)
-	require.Equal(t, createdAt, prev)
-
-	won, prev, err = node.deactivateWorker(ctx, workerID)
+	lease, err := node.acquireGracefulRequeue(ctx, workerID)
 	require.NoError(t, err)
-	require.False(t, won, "an inactive worker must not win requeue twice")
-	require.Equal(t, "-", prev)
+	require.NotNil(t, lease)
+	require.Equal(t, "-", rdb.HGet(ctx, rmapContentKey(node.resources.workers), workerID).Val())
 
-	// Cleanup removed the registration: deactivation must not recreate it.
-	require.NoError(t, rdb.HDel(ctx, rmapContentKey(node.resources.workers), workerID).Err())
-	won, prev, err = node.deactivateWorker(ctx, workerID)
+	// While the graceful lease is live, neither a foreign cleanup owner nor a
+	// second graceful attempt can win.
+	foreign, err := node.acquireWorkerCleanup(ctx, workerID)
 	require.NoError(t, err)
-	require.False(t, won)
-	require.Equal(t, "absent", prev)
-	require.False(t, rdb.HExists(ctx, rmapContentKey(node.resources.workers), workerID).Val())
+	require.Nil(t, foreign, "foreign cleanup must not steal a live graceful lease")
+	second, err := node.acquireGracefulRequeue(ctx, workerID)
+	require.NoError(t, err)
+	require.Nil(t, second, "a second graceful attempt must not win a live lease")
 
-	// An installed cleanup fence cedes requeue to the cleanup owner.
-	require.NoError(t, node.setPoolMap(ctx, node.resources.workers, workerID, createdAt))
+	// After the graceful owner disappears (lease expired, heartbeat stale),
+	// foreign cleanup recovers the half-requeued worker: the deactivated
+	// registration is not a shield against takeover.
 	redisNow, err := rdb.Time(ctx).Result()
 	require.NoError(t, err)
 	require.NoError(t, rdb.HSet(
 		ctx,
+		rmapContentKey(node.resources.workerKeepAlive),
+		workerID,
+		strconv.FormatInt(redisNow.Add(-2*node.workerTTL).UnixNano(), 10),
+	).Err())
+	require.NoError(t, rdb.HSet(
+		ctx,
 		rmapContentKey(node.resources.workerCleanup),
 		workerID,
-		fmt.Sprintf("owner|1|%d", redisNow.Add(time.Minute).UnixMilli()),
+		fmt.Sprintf("%s|%s|0", lease.owner, lease.fence),
 	).Err())
-	won, prev, err = node.deactivateWorker(ctx, workerID)
+	foreign, err = node.acquireWorkerCleanup(ctx, workerID)
 	require.NoError(t, err)
-	require.False(t, won)
-	require.Equal(t, "cleanup", prev)
-	require.Equal(t, createdAt, rdb.HGet(ctx, rmapContentKey(node.resources.workers), workerID).Val())
+	require.NotNil(t, foreign, "expired graceful lease must be recoverable by cleanup")
 
-	require.NoError(t, rdb.HDel(ctx, rmapContentKey(node.resources.workerCleanup), workerID).Err())
+	// Once cleanup deleted the registration, graceful acquisition refuses and
+	// never recreates it.
+	require.NoError(t, node.releaseWorkerCleanup(ctx, foreign, true))
+	require.NoError(t, rdb.HDel(ctx, rmapContentKey(node.resources.workers), workerID).Err())
+	late, err := node.acquireGracefulRequeue(ctx, workerID)
+	require.NoError(t, err)
+	require.Nil(t, late)
+	require.False(t, rdb.HExists(ctx, rmapContentKey(node.resources.workers), workerID).Val())
+
 	require.NoError(t, node.Shutdown(context.Background()))
 }

@@ -72,12 +72,6 @@ type (
 		dispatchID string
 	}
 
-	// requeueResult reports one concurrent handoff attempt.
-	requeueResult struct {
-		key string
-		err error
-	}
-
 	// JobHandler starts and stops jobs.
 	JobHandler interface {
 		// Start starts a job.
@@ -111,7 +105,15 @@ type (
 	}
 )
 
-var errJobNotOwned = errors.New("job not owned by worker")
+var (
+	errJobNotOwned = errors.New("job not owned by worker")
+
+	// errDispatchIdentityMismatch reports that a start event's payload
+	// diverged from the admitted dispatch record. The identity is derived
+	// from immutable event bytes, so this is an invariant violation that no
+	// retry can repair: the event must be acknowledged with a terminal error.
+	errDispatchIdentityMismatch = errors.New("dispatch payload identity mismatch")
+)
 
 // newWorker creates a new worker.
 func newWorker(ctx context.Context, node *Node, h JobHandler) (*Worker, error) {
@@ -391,6 +393,11 @@ func (w *Worker) startJob(ctx context.Context, job *Job) error {
 	if job.dispatchID != "" {
 		claimed, err := w.claimDispatchedStart(ctx, job)
 		if err != nil {
+			if errors.Is(err, errDispatchIdentityMismatch) {
+				// Invariant violation: fail the event terminally instead of
+				// redelivering bytes that can never match their admission.
+				return err
+			}
 			return errors.Join(ErrRequeue, err)
 		}
 		if !claimed {
@@ -456,6 +463,9 @@ func (w *Worker) claimDispatchedStart(ctx context.Context, job *Job) (bool, erro
 		identity,
 	).Int64()
 	if err != nil {
+		if redis.HasErrorPrefix(err, "DISPATCHIDENTITYMISMATCH") {
+			return false, fmt.Errorf("%w: job %q dispatch %q", errDispatchIdentityMismatch, job.Key, job.dispatchID)
+		}
 		return false, fmt.Errorf("claim dispatched start for job %q: %w", job.Key, err)
 	}
 	return result == 1, nil
@@ -698,19 +708,20 @@ func (w *Worker) rebalance(ctx context.Context, activeWorkers []string) {
 	}
 }
 
-// requeueJobs requeues the jobs handled by the worker.
-// This should be done after the worker is stopped.
+// requeueJobs requeues the jobs handled by the worker during graceful
+// shutdown. It self-acquires the worker requeue lease — the same capability
+// stale-worker cleanup uses — so exactly one party republishes the jobs, and
+// every publication flows through the lease-fenced stable dedup records. When
+// this worker loses the lease, the winning cleanup owner owns the requeue.
 func (w *Worker) requeueJobs(ctx context.Context) error {
-	jobsToRequeue := make(map[string]*Job)
 	var unsettled []string
 	jobCount := 0
-	w.jobs.Range(func(key, value any) bool {
+	w.jobs.Range(func(_, value any) bool {
 		job := value.(*Job)
 		if job.dispatchID != "" {
 			unsettled = append(unsettled, job.dispatchID)
 			return true
 		}
-		jobsToRequeue[key.(string)] = job
 		jobCount++
 		return true
 	})
@@ -724,124 +735,53 @@ func (w *Worker) requeueJobs(ctx context.Context) error {
 	}
 	w.logger.Debug("requeueJobs: requeuing", "jobs", jobCount)
 
-	// Mark the worker inactive behind the cleanup fence so requeued jobs are
-	// not assigned to this worker and exactly one party requeues: losing
-	// deactivation means stale-worker cleanup owns (or already completed) the
-	// requeue, so this worker must not publish duplicates.
-	won, prev, err := w.node.deactivateWorker(ctx, w.ID)
+	lease, err := w.node.acquireGracefulRequeue(ctx, w.ID)
 	if err != nil {
-		return fmt.Errorf("requeueJobs: failed to mark worker as inactive: %w", err)
+		return fmt.Errorf("requeueJobs: failed to acquire requeue lease: %w", err)
 	}
-	if !won {
-		w.logger.Debug("requeueJobs: requeue owned elsewhere, skipping", "registration", prev)
+	if lease == nil {
+		w.logger.Debug("requeueJobs: requeue owned elsewhere, skipping")
 		return nil
 	}
-	if createdAt := strconv.FormatInt(w.CreatedAt.UnixNano(), 10); prev != createdAt {
-		w.logger.Error(fmt.Errorf("requeueJobs: unexpected worker registration"), "worker", w.ID, "expected", createdAt, "got", prev)
-	}
+	complete := false
+	defer func() {
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+		defer cancel()
+		if err := w.node.releaseWorkerCleanup(releaseCtx, lease, complete); err != nil {
+			w.logger.Error(fmt.Errorf("requeueJobs: release lease: %w", err))
+		}
+	}()
 
-	retryUntil := time.Now().Add(w.workerTTL)
-	for retryUntil.After(time.Now()) {
-		remainingJobs := w.attemptRequeue(ctx, jobsToRequeue)
-		jobsToRequeue = remainingJobs
-		if len(remainingJobs) == 0 {
+	stopLocal := func(key string) error {
+		if _, ok := w.jobs.Load(key); !ok {
+			return nil
+		}
+		if err := w.handler.Stop(key); err != nil {
+			return fmt.Errorf("requeueJobs: failed to stop job %q: %w", key, err)
+		}
+		w.jobs.Delete(key)
+		w.logger.Debug("requeueJobs: stopped", "job", key)
+		return nil
+	}
+	retryUntil := time.Now().Add(w.requeueTimeout)
+	for {
+		complete = w.node.requeueWorkerJobs(ctx, lease, stopLocal)
+		if complete || !retryUntil.After(time.Now()) {
 			break
 		}
-	}
-
-	failedCount := len(jobsToRequeue)
-	w.logger.Info("requeued", "jobs", jobCount, "failed", failedCount)
-	if failedCount > 0 {
-		return fmt.Errorf("requeueJobs: failed to requeue %d/%d jobs after retrying for %v", failedCount, jobCount, w.workerTTL)
-	}
-
-	return nil
-}
-
-// attemptRequeue attempts to requeue the jobs in the given map.
-// It returns any job that failed to be requeued.
-func (w *Worker) attemptRequeue(ctx context.Context, jobsToRequeue map[string]*Job) map[string]*Job {
-	return w.attemptRequeueWith(ctx, jobsToRequeue, w.requeueJob)
-}
-
-// attemptRequeueWith runs every handoff concurrently under one timeout, joins
-// all senders, and removes only jobs whose send completed successfully.
-func (w *Worker) attemptRequeueWith(
-	ctx context.Context,
-	jobsToRequeue map[string]*Job,
-	send func(context.Context, *Job) error,
-) map[string]*Job {
-	var wg sync.WaitGroup
-	resultChan := make(chan requeueResult, len(jobsToRequeue))
-	remainingJobs := make(map[string]*Job, len(jobsToRequeue))
-	for key, job := range jobsToRequeue {
-		remainingJobs[key] = job
-	}
-
-	attemptCtx, cancel := context.WithTimeout(ctx, w.requeueTimeout)
-	defer cancel()
-	wg.Add(len(jobsToRequeue))
-	for key, job := range jobsToRequeue {
-		pulse.Go(w.logger, func() {
-			defer wg.Done()
-			err := send(attemptCtx, job)
-			if err != nil {
-				w.logger.Error(fmt.Errorf("failed to requeue job: %w", err), "job", key)
-			} else {
-				w.logger.Debug("requeueJobs: requeued", "job", key)
-			}
-			resultChan <- requeueResult{key: key, err: err}
-		})
-	}
-
-	timedOut := false
-	for processed := 0; processed < len(jobsToRequeue); processed++ {
+		if err := w.node.renewWorkerCleanup(ctx, lease); err != nil {
+			return fmt.Errorf("requeueJobs: requeue lease lost: %w", err)
+		}
 		select {
-		case res := <-resultChan:
-			if res.err != nil {
-				w.logger.Error(fmt.Errorf("requeueJobs: failed to requeue job %q: %w", res.key, res.err))
-				continue
-			}
-			delete(remainingJobs, res.key)
-			w.logger.Info("requeued", "job", res.key)
-		case <-attemptCtx.Done():
-			timedOut = true
-			cancel()
-			processed = len(jobsToRequeue)
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	wg.Wait()
-	close(resultChan)
-	for res := range resultChan {
-		if res.err == nil {
-			delete(remainingJobs, res.key)
-			w.logger.Info("requeued", "job", res.key)
-		}
+	if !complete {
+		return fmt.Errorf("requeueJobs: failed to requeue %d jobs after retrying for %v", jobCount, w.requeueTimeout)
 	}
-	if timedOut {
-		w.logger.Error(fmt.Errorf("requeueJobs: timeout reached with %d jobs not handed off", len(remainingJobs)))
-	}
-	return remainingJobs
-}
-
-// requeueJob requeues a job.
-func (w *Worker) requeueJob(ctx context.Context, job *Job) error {
-	job.Requeued = true
-	job.dispatchID = ""
-	_, err := w.node.poolStream.Add(ctx, evStartJob, marshalJob(job))
-	if err != nil {
-		return fmt.Errorf("requeueJob: failed to add job to pool stream: %w", err)
-	}
-
-	// Stop locally, but do not touch the replicated job/payload maps: we want the
-	// payload to remain available for distributed recovery until the job is
-	// confirmed running elsewhere.
-	if _, ok := w.jobs.Load(job.Key); ok {
-		if err := w.handler.Stop(job.Key); err != nil {
-			return fmt.Errorf("requeueJob: failed to stop job %q: %w", job.Key, err)
-		}
-		w.jobs.Delete(job.Key)
-	}
+	w.logger.Info("requeued", "jobs", jobCount)
 	return nil
 }
 

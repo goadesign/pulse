@@ -58,41 +58,12 @@ redis.call("PUBLISH", KEYS[5], "set:" .. message)
 return timestamp
 `)
 
-	// deactivateWorkerScript marks one registered worker inactive for graceful
-	// requeue. It refuses while a cleanup fence is installed and never
-	// recreates a registration that stale-worker cleanup already removed, so
-	// exactly one party — the worker or the cleanup owner — requeues its jobs.
-	deactivateWorkerScript = redis.NewScript(`
-if redis.call("HGET", KEYS[1], "state") ~= ARGV[1]
-or redis.call("HGET", KEYS[1], "generation") ~= ARGV[2] then
-    return redis.error_reply("POOLGENERATIONLOST")
-end
-if redis.call("HGET", KEYS[3], ARGV[3]) then
-    return {0, "cleanup"}
-end
-local registration = redis.call("HGET", KEYS[2], ARGV[3])
-if not registration then
-    return {0, "absent"}
-end
-if registration == "-" then
-    return {0, "-"}
-end
-local inactive = "-"
-redis.call("HSET", KEYS[2], ARGV[3], inactive)
-local rev = tostring(redis.call("HINCRBY", KEYS[2], "=rev", 1))
-redis.call("HSET", KEYS[2], "=kind", "set")
-local message = struct.pack(
-    "ic0ic0ic0",
-    string.len(ARGV[3]), ARGV[3],
-    string.len(inactive), inactive,
-    string.len(rev), rev
-)
-redis.call("PUBLISH", KEYS[4], "set:" .. message)
-return {1, registration}
-`)
-
-	// acquireWorkerCleanupScript acquires, renews, or steals an expired cleanup
-	// lease only after atomically proving the authoritative heartbeat expired.
+	// acquireWorkerCleanupScript acquires, renews, or steals an expired
+	// requeue lease. Foreign acquisition must atomically prove the
+	// authoritative heartbeat expired; graceful self-acquisition (ARGV[8])
+	// instead requires the worker's own live registration and atomically
+	// marks it inactive, so the lease is the single fence deciding which
+	// party — the worker or a cleanup owner — requeues the jobs.
 	acquireWorkerCleanupScript = redis.NewScript(`
 if redis.call("HGET", KEYS[1], "state") ~= ARGV[1]
 or redis.call("HGET", KEYS[1], "generation") ~= ARGV[2] then
@@ -101,14 +72,16 @@ end
 local clock = redis.call("TIME")
 local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
 local now_ns = tonumber(clock[1]) * 1000000000 + tonumber(clock[2]) * 1000
-local heartbeat = redis.call("HGET", KEYS[2], ARGV[3])
-if heartbeat then
-    local heartbeat_ns = tonumber(heartbeat)
-    if not heartbeat_ns then
-        return redis.error_reply("WORKERHEARTBEATINVALID")
-    end
-    if heartbeat_ns + tonumber(ARGV[7]) >= now_ns then
-        return {0, "live"}
+if ARGV[8] ~= "1" then
+    local heartbeat = redis.call("HGET", KEYS[2], ARGV[3])
+    if heartbeat then
+        local heartbeat_ns = tonumber(heartbeat)
+        if not heartbeat_ns then
+            return redis.error_reply("WORKERHEARTBEATINVALID")
+        end
+        if heartbeat_ns + tonumber(ARGV[7]) >= now_ns then
+            return {0, "live"}
+        end
     end
 end
 local current = redis.call("HGET", KEYS[3], ARGV[3])
@@ -126,6 +99,23 @@ if current then
             current_owner .. "|" .. current_fence .. "|" .. tostring(now + tonumber(ARGV[5])))
         return {1, current_fence}
     end
+end
+if ARGV[8] == "1" then
+    local registration = redis.call("HGET", KEYS[5], ARGV[3])
+    if not registration or registration == "-" then
+        return {0, "inactive"}
+    end
+    local inactive = "-"
+    redis.call("HSET", KEYS[5], ARGV[3], inactive)
+    local registration_rev = tostring(redis.call("HINCRBY", KEYS[5], "=rev", 1))
+    redis.call("HSET", KEYS[5], "=kind", "set")
+    local registration_message = struct.pack(
+        "ic0ic0ic0",
+        string.len(ARGV[3]), ARGV[3],
+        string.len(inactive), inactive,
+        string.len(registration_rev), registration_rev
+    )
+    redis.call("PUBLISH", KEYS[6], "set:" .. registration_message)
 end
 local fence_field = ARGV[6]
 local fence = tostring(redis.call("HINCRBY", KEYS[3], fence_field, 1))
@@ -365,12 +355,37 @@ return 1
 `)
 )
 
-// acquireWorkerCleanup returns an exact lease or nil while another owner is live.
+// acquireWorkerCleanup returns an exact lease or nil while another owner is
+// live. It proves the worker heartbeat expired before fencing it.
 func (node *Node) acquireWorkerCleanup(
 	ctx context.Context,
 	workerID string,
 ) (*workerCleanupLease, error) {
+	return node.runWorkerCleanupAcquire(ctx, workerID, false)
+}
+
+// acquireGracefulRequeue returns the requeue lease for this worker's own
+// graceful shutdown, atomically marking its registration inactive, or nil
+// when another owner already holds (or completed) the requeue.
+func (node *Node) acquireGracefulRequeue(
+	ctx context.Context,
+	workerID string,
+) (*workerCleanupLease, error) {
+	return node.runWorkerCleanupAcquire(ctx, workerID, true)
+}
+
+// runWorkerCleanupAcquire runs the shared lease acquisition; graceful skips
+// the heartbeat-expiry proof and deactivates the worker's registration.
+func (node *Node) runWorkerCleanupAcquire(
+	ctx context.Context,
+	workerID string,
+	graceful bool,
+) (*workerCleanupLease, error) {
 	owner := node.ID + "-" + ulid.Make().String()
+	self := ""
+	if graceful {
+		self = "1"
+	}
 	raw, err := acquireWorkerCleanupScript.Run(
 		ctx,
 		node.rdb,
@@ -379,6 +394,8 @@ func (node *Node) acquireWorkerCleanup(
 			rmapContentKey(node.resources.workerKeepAlive),
 			rmapContentKey(node.resources.workerCleanup),
 			rmapUpdateChannel(node.resources.workerCleanup),
+			rmapContentKey(node.resources.workers),
+			rmapUpdateChannel(node.resources.workers),
 		},
 		"active",
 		node.resources.generation,
@@ -387,6 +404,7 @@ func (node *Node) acquireWorkerCleanup(
 		strconv.FormatInt(node.workerTTL.Milliseconds(), 10),
 		workerCleanupFenceField(workerID),
 		strconv.FormatInt(node.resources.workerTTL.Nanoseconds(), 10),
+		self,
 	).Slice()
 	if err != nil {
 		return nil, poolBoundaryError(err)
@@ -426,41 +444,6 @@ func (node *Node) updateWorkerHeartbeat(ctx context.Context, workerID string) (s
 		workerID,
 	).Text()
 	return timestamp, poolBoundaryError(err)
-}
-
-// deactivateWorker atomically marks workerID inactive unless stale-worker
-// cleanup already fenced or removed it. It returns true when this caller won
-// deactivation and therefore owns requeueing the worker's jobs, along with the
-// prior registration value for diagnostics.
-func (node *Node) deactivateWorker(ctx context.Context, workerID string) (bool, string, error) {
-	result, err := deactivateWorkerScript.Run(
-		ctx,
-		node.rdb,
-		[]string{
-			fmt.Sprintf("pulse:stream:%s:lifecycle", node.poolStream.Name),
-			rmapContentKey(node.resources.workers),
-			rmapContentKey(node.resources.workerCleanup),
-			rmapUpdateChannel(node.resources.workers),
-		},
-		"active",
-		node.resources.generation,
-		workerID,
-	).Slice()
-	if err != nil {
-		return false, "", poolBoundaryError(err)
-	}
-	if len(result) != 2 {
-		return false, "", fmt.Errorf("deactivate worker returned %d values", len(result))
-	}
-	won, ok := result[0].(int64)
-	if !ok {
-		return false, "", fmt.Errorf("deactivate worker returned invalid status %T", result[0])
-	}
-	prev, ok := result[1].(string)
-	if !ok {
-		return false, "", fmt.Errorf("deactivate worker returned invalid registration %T", result[1])
-	}
-	return won == 1, prev, nil
 }
 
 // renewWorkerCleanup extends the exact stale-worker cleanup lease.

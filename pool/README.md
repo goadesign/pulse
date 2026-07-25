@@ -279,12 +279,15 @@ operation reads the authoritative heartbeat, compares it with immutable
 `WorkerTTL` using Redis time, and installs an exact owner/fence. Heartbeat
 scripts reject that fence, and every mutation a resumed stale process could
 attempt re-verifies liveness at its own Redis linearization point: a worker
-start claim re-checks the worker's registration and cleanup fence, graceful
-requeue deactivation refuses under a fence and never recreates a removed
-registration, and job dispatch plus every scheduler transition and ownership
-script re-check the node's keep-alive registration and node-cleanup field.
-Requeue, dispatch-release, stream destruction, and discovery removal verify
-the same unexpired owner token.
+start claim re-checks the worker's registration and cleanup fence, and job
+dispatch plus every scheduler transition and ownership script re-check the
+node's keep-alive registration and node-cleanup field. Graceful shutdown and
+stale-worker takeover share one requeue lease: a stopping worker self-acquires
+it (atomically deactivating its registration) and republishes through the same
+lease-fenced stable publication records the cleanup owner uses, so exactly one
+party requeues each job and an interrupted graceful requeue is finished by
+takeover after lease expiry. Requeue, dispatch-release, stream destruction,
+and discovery removal verify the same unexpired owner token.
 
 The pool stream generation selects every shared map and stream as one immutable
 resource manifest. The first deployment seen by this version adopts existing
