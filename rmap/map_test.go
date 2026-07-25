@@ -6,40 +6,25 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"goa.design/clue/log"
 	"goa.design/pulse/pulse"
+	ptesting "goa.design/pulse/testing"
 )
 
 var (
-	redisPwd  = "redispassword"
-	redisAddr = "localhost:6379"
-	wf        = time.Second
-	tck       = time.Millisecond
+	wf  = time.Second
+	tck = time.Millisecond
 )
 
-func init() {
-	if p := os.Getenv("REDIS_PASSWORD"); p != "" {
-		redisPwd = p
-	}
-	if a := os.Getenv("REDIS_ADDR"); a != "" {
-		redisAddr = a
-	}
-}
-
 func TestMapLocal(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     redisAddr,
-		Password: redisPwd,
-	})
+	rdb := ptesting.NewRedisClient(t)
 	var buf Buffer
 	ctx := context.Background()
 	ctx = log.Context(ctx, log.WithOutput(&buf))
@@ -144,10 +129,7 @@ func TestMapLocal(t *testing.T) {
 }
 
 func TestMapTTLAbsolute(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     redisAddr,
-		Password: redisPwd,
-	})
+	rdb := ptesting.NewRedisClient(t)
 	ctx := context.Background()
 
 	m, err := Join(ctx, "ttl-absolute", rdb, WithTTL(2*time.Second))
@@ -178,10 +160,7 @@ func TestMapTTLAbsolute(t *testing.T) {
 }
 
 func TestMapTTLSliding(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     redisAddr,
-		Password: redisPwd,
-	})
+	rdb := ptesting.NewRedisClient(t)
 	ctx := context.Background()
 
 	m, err := Join(ctx, "ttl-sliding", rdb, WithSlidingTTL(2*time.Second))
@@ -212,10 +191,7 @@ func TestMapTTLSliding(t *testing.T) {
 }
 
 func TestSetAndWait(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     redisAddr,
-		Password: redisPwd,
-	})
+	rdb := ptesting.NewRedisClient(t)
 	var buf Buffer
 	ctx := context.Background()
 	ctx = log.Context(ctx, log.WithOutput(&buf))
@@ -273,10 +249,7 @@ func TestSetAndWait(t *testing.T) {
 }
 
 func TestReadAfterClose(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     redisAddr,
-		Password: redisPwd,
-	})
+	rdb := ptesting.NewRedisClient(t)
 	var buf Buffer
 	ctx := context.Background()
 	ctx = log.Context(ctx, log.WithOutput(&buf))
@@ -339,7 +312,7 @@ func TestReadAfterClose(t *testing.T) {
 }
 
 func TestWriteEmptyString(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
+	rdb := ptesting.NewRedisClient(t)
 	ctx := context.Background()
 	m, err := Join(ctx, "test", rdb)
 	require.NoError(t, err)
@@ -359,7 +332,7 @@ func TestWriteEmptyString(t *testing.T) {
 }
 
 func TestSetEx(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
+	rdb := ptesting.NewRedisClient(t)
 	ctx := context.Background()
 	m, err := Join(ctx, "test", rdb)
 	require.NoError(t, err)
@@ -394,7 +367,7 @@ func TestSetEx(t *testing.T) {
 }
 
 func TestDeleteEx(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
+	rdb := ptesting.NewRedisClient(t)
 	ctx := context.Background()
 	m, err := Join(ctx, "test", rdb)
 	require.NoError(t, err)
@@ -419,7 +392,7 @@ func TestDeleteEx(t *testing.T) {
 }
 
 func TestTestAndSetEx(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
+	rdb := ptesting.NewRedisClient(t)
 	ctx := context.Background()
 	m, err := Join(ctx, "test", rdb)
 	require.NoError(t, err)
@@ -453,7 +426,7 @@ func TestTestAndSetEx(t *testing.T) {
 }
 
 func TestTestAndDeleteEx(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
+	rdb := ptesting.NewRedisClient(t)
 	ctx := context.Background()
 	m, err := Join(ctx, "test", rdb)
 	require.NoError(t, err)
@@ -487,7 +460,7 @@ func TestTestAndDeleteEx(t *testing.T) {
 }
 
 func TestAppendUniqueValues(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
+	rdb := ptesting.NewRedisClient(t)
 	ctx := context.Background()
 	m, err := Join(ctx, "test", rdb)
 	require.NoError(t, err)
@@ -531,7 +504,7 @@ func TestAppendUniqueValues(t *testing.T) {
 }
 
 func TestTestAndDelete(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
+	rdb := ptesting.NewRedisClient(t)
 	ctx := context.Background()
 	m, err := Join(ctx, "test", rdb)
 	require.NoError(t, err)
@@ -569,7 +542,7 @@ func TestTestAndDelete(t *testing.T) {
 }
 
 func TestTestAndSet(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
+	rdb := ptesting.NewRedisClient(t)
 	ctx := context.Background()
 	m, err := Join(ctx, "test", rdb)
 	require.NoError(t, err)
@@ -594,7 +567,7 @@ func TestTestAndSet(t *testing.T) {
 }
 
 func TestTestAndReset(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
+	rdb := ptesting.NewRedisClient(t)
 	ctx := context.Background()
 	m, err := Join(ctx, "test", rdb)
 	require.NoError(t, err)
@@ -650,7 +623,7 @@ func TestTestAndReset(t *testing.T) {
 }
 
 func TestArrays(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
+	rdb := ptesting.NewRedisClient(t)
 	ctx := context.Background()
 	m, err := Join(ctx, "test", rdb)
 	require.NoError(t, err)
@@ -686,7 +659,7 @@ func TestArrays(t *testing.T) {
 }
 
 func TestIncrement(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
+	rdb := ptesting.NewRedisClient(t)
 	ctx := context.Background()
 	m, err := Join(ctx, "test", rdb)
 	require.NoError(t, err)
@@ -712,7 +685,7 @@ func TestIncrement(t *testing.T) {
 }
 
 func TestLogs(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
+	rdb := ptesting.NewRedisClient(t)
 	var buf Buffer
 	ctx := context.Background()
 	ctx = log.Context(ctx, log.WithOutput(&buf), log.WithDebug(), log.WithFormat(log.FormatText))
@@ -764,7 +737,7 @@ func TestJoinErrors(t *testing.T) {
 }
 
 func TestSetErrors(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
+	rdb := ptesting.NewRedisClient(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -782,7 +755,7 @@ func TestSetErrors(t *testing.T) {
 }
 
 func TestAppendValuesErrors(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
+	rdb := ptesting.NewRedisClient(t)
 	ctx := context.Background()
 
 	m, err := Join(ctx, "test", rdb)
@@ -798,7 +771,7 @@ func TestAppendValuesErrors(t *testing.T) {
 }
 
 func TestRemoveValuesErrors(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
+	rdb := ptesting.NewRedisClient(t)
 	ctx := context.Background()
 
 	m, err := Join(ctx, "test", rdb)
@@ -816,7 +789,7 @@ func TestRemoveValuesErrors(t *testing.T) {
 }
 
 func TestReconnect(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
+	rdb := ptesting.NewRedisClient(t)
 	ctx := context.Background()
 	var buf Buffer
 	ctx = log.Context(ctx, log.WithOutput(&buf))
@@ -852,7 +825,7 @@ func TestReconnect(t *testing.T) {
 }
 
 func TestDestroyAllowsReuse(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
+	rdb := ptesting.NewRedisClient(t)
 	ctx := context.Background()
 
 	m, err := Join(ctx, "destroy-reuse", rdb)
@@ -894,7 +867,7 @@ func TestApplyMessageLockedRejectsDestroyWithoutRevision(t *testing.T) {
 }
 
 func TestReconnectPreservesResetEvent(t *testing.T) {
-	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
+	rdb := ptesting.NewRedisClient(t)
 	ctx := context.Background()
 
 	observer, err := Join(ctx, "reconnect-reset-event", rdb)

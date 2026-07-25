@@ -14,7 +14,7 @@ import (
 // Note: the example below does not handle errors for brevity.
 func main() {
 	// Create Redis client
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: os.Getenv("REDIS_PASSWORD")})
+	rdb := redis.NewClient(&redis.Options{Addr: os.Getenv("REDIS_ADDR"), Password: os.Getenv("REDIS_PASSWORD")})
 	ctx := context.Background()
 
 	// Make sure Redis is up and running and we can connect to it
@@ -29,7 +29,11 @@ func main() {
 	}
 
 	// Don't forget to destroy the stream when done
-	defer stream1.Destroy(ctx)
+	defer func() {
+		if err := stream1.Destroy(ctx); err != nil {
+			panic(err)
+		}
+	}()
 
 	// Create sink
 	sink, err := stream1.NewSink(ctx, "multistreams-sink",
@@ -40,7 +44,11 @@ func main() {
 	}
 
 	// Don't forget to close the sink when done
-	defer sink.Close(ctx)
+	defer func() {
+		if err := sink.Close(ctx); err != nil {
+			panic(err)
+		}
+	}()
 
 	// Subscribe to events
 	c := sink.Subscribe()
@@ -57,7 +65,11 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	defer stream2.Destroy(ctx)
+	defer func() {
+		if err := stream2.Destroy(ctx); err != nil {
+			panic(err)
+		}
+	}()
 
 	// Add stream to sink
 	err = sink.AddStream(ctx, stream2)

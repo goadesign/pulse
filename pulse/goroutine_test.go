@@ -12,6 +12,15 @@ import (
 	"goa.design/clue/log"
 )
 
+type (
+	// synchronizedBuilder lets panic-recovery tests observe asynchronous logger
+	// output without racing the logger's Write call.
+	synchronizedBuilder struct {
+		lock sync.Mutex
+		buf  strings.Builder
+	}
+)
+
 func TestGo(t *testing.T) {
 	t.Run("executes function without panic", func(t *testing.T) {
 		var wg sync.WaitGroup
@@ -32,7 +41,7 @@ func TestGo(t *testing.T) {
 		var wg sync.WaitGroup
 		wg.Add(1)
 
-		var buf strings.Builder
+		var buf synchronizedBuilder
 		ctx = log.Context(ctx, log.WithOutput(&buf))
 		logger := ClueLogger(ctx)
 
@@ -56,7 +65,7 @@ func TestGo(t *testing.T) {
 		var wg sync.WaitGroup
 		wg.Add(1)
 
-		var buf strings.Builder
+		var buf synchronizedBuilder
 		ctx = log.Context(ctx, log.WithOutput(&buf))
 		logger := ClueLogger(ctx)
 
@@ -72,4 +81,18 @@ func TestGo(t *testing.T) {
 				strings.Contains(logOutput, "goroutine.go")
 		}, 100*time.Millisecond, 10*time.Millisecond, "Log should contain panic message and stack trace")
 	})
+}
+
+// Write serializes logger output writes.
+func (b *synchronizedBuilder) Write(p []byte) (int, error) {
+	b.lock.Lock()
+	defer b.lock.Unlock()
+	return b.buf.Write(p)
+}
+
+// String returns a stable snapshot of logger output.
+func (b *synchronizedBuilder) String() string {
+	b.lock.Lock()
+	defer b.lock.Unlock()
+	return b.buf.String()
 }

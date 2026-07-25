@@ -2,9 +2,9 @@ package streaming
 
 import (
 	"context"
-	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +17,130 @@ import (
 	ptesting "goa.design/pulse/testing"
 )
 
+func TestReaderRejectsInvalidOptions(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx := ptesting.NewTestContext(t)
+	cases := []struct {
+		name string
+		opt  options.Reader
+	}{
+		{name: "max polled", opt: options.WithReaderMaxPolled(0)},
+		{name: "buffer", opt: options.WithReaderBufferSize(-1)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stream, err := NewStream(t.Name(), rdb)
+			require.NoError(t, err)
+			_, err = stream.NewReader(ctx, tc.opt)
+			require.Error(t, err)
+		})
+	}
+	stream, err := NewStream(t.Name()+"-conflicts", rdb)
+	require.NoError(t, err)
+	_, err = stream.NewReader(
+		ctx,
+		options.WithReaderTopic("alarms"),
+		options.WithReaderTopicPattern("alarm.*"),
+	)
+	require.ErrorContains(t, err, "mutually exclusive")
+	_, err = stream.NewReader(
+		ctx,
+		options.WithReaderStartAtNewest(),
+		options.WithReaderStartAtOldest(),
+	)
+	require.ErrorContains(t, err, "reader cursor-start options are mutually exclusive")
+	require.ErrorIs(t, stream.Destroy(ctx), ErrStreamNotFound)
+}
+
+func TestReaderDropsMalformedRedisEventWithoutPanicking(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx := ptesting.NewTestContext(t)
+	stream, err := NewStream(t.Name(), rdb)
+	require.NoError(t, err)
+	require.NoError(t, stream.Open(ctx))
+	reader, err := stream.NewReader(
+		ctx,
+		options.WithReaderStartAtOldest(),
+		options.WithReaderBlockDuration(testBlockDuration),
+	)
+	require.NoError(t, err)
+	events := reader.Subscribe()
+	require.NoError(t, rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: stream.key,
+		Values: map[string]any{payloadKey: "missing name"},
+	}).Err())
+	_, err = stream.Add(ctx, "valid", []byte("payload"))
+	require.NoError(t, err)
+
+	select {
+	case event := <-events:
+		require.Equal(t, "valid", event.EventName)
+		require.Equal(t, stream.Generation(), event.StreamGeneration)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for valid event after malformed entry")
+	}
+	reader.Close()
+	require.NoError(t, stream.Destroy(ctx))
+}
+
+func TestReaderClosingFencesSubscriptionsAndStreamChanges(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx := ptesting.NewTestContext(t)
+	stream, err := NewStream(t.Name()+"-main", rdb)
+	require.NoError(t, err)
+	added, err := NewStream(t.Name()+"-added", rdb)
+	require.NoError(t, err)
+	require.NoError(t, stream.Open(ctx))
+	require.NoError(t, added.Open(ctx))
+	reader, err := stream.NewReader(ctx, options.WithReaderBlockDuration(testBlockDuration))
+	require.NoError(t, err)
+	reader.Subscribe()
+
+	start := make(chan struct{})
+	subscriptions := make(chan (<-chan *Event), 32)
+	results := make(chan error, 64)
+	var wait sync.WaitGroup
+	for range 32 {
+		wait.Add(2)
+		go func() {
+			defer wait.Done()
+			<-start
+			subscriptions <- reader.Subscribe()
+		}()
+		go func() {
+			defer wait.Done()
+			<-start
+			results <- reader.AddStream(ctx, added)
+			results <- reader.RemoveStream(ctx, added)
+		}()
+	}
+	close(start)
+	reader.Close()
+	wait.Wait()
+	close(subscriptions)
+	close(results)
+
+	for result := range results {
+		if result != nil {
+			require.ErrorIs(t, result, ErrReaderClosed)
+		}
+	}
+	for subscription := range subscriptions {
+		_, ok := <-subscription
+		require.False(t, ok)
+	}
+	closed := reader.Subscribe()
+	_, ok := <-closed
+	require.False(t, ok)
+	require.ErrorIs(t, reader.AddStream(ctx, added), ErrReaderClosed)
+	require.ErrorIs(t, reader.RemoveStream(ctx, added), ErrReaderClosed)
+	require.NoError(t, stream.Destroy(ctx))
+	require.NoError(t, added.Destroy(ctx))
+}
+
 func TestNewReader(t *testing.T) {
 	testName := strings.Replace(t.Name(), "/", "_", -1)
 	rdb := ptesting.NewRedisClient(t)
@@ -24,10 +148,12 @@ func TestNewReader(t *testing.T) {
 	ctx := ptesting.NewTestContext(t)
 	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
+	require.NoError(t, s.Open(ctx))
+	defer func() { require.NoError(t, s.Destroy(ctx)) }()
 	reader, err := s.NewReader(ctx, options.WithReaderBlockDuration(testBlockDuration))
 	assert.NoError(t, err)
 	if assert.NotNil(t, reader) {
-		defer cleanupReader(t, ctx, s, reader)
+		defer cleanupReader(t, reader)
 	}
 
 	_, err = s.NewReader(ctx, options.WithReaderTopicPattern("("))
@@ -41,9 +167,11 @@ func TestReaderReadOnce(t *testing.T) {
 	ctx := ptesting.NewTestContext(t)
 	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
+	require.NoError(t, s.Open(ctx))
+	defer func() { require.NoError(t, s.Destroy(ctx)) }()
 	reader, err := s.NewReader(ctx, options.WithReaderStartAtOldest(), options.WithReaderBlockDuration(testBlockDuration))
 	require.NoError(t, err)
-	defer cleanupReader(t, ctx, s, reader)
+	defer cleanupReader(t, reader)
 
 	c := reader.Subscribe()
 	_, err = s.Add(ctx, "event", []byte("payload"))
@@ -60,11 +188,13 @@ func TestReaderReadSinceLastEvent(t *testing.T) {
 	ctx := ptesting.NewTestContext(t)
 	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
+	require.NoError(t, s.Open(ctx))
+	defer func() { require.NoError(t, s.Destroy(ctx)) }()
 
 	// Add and read 2 events consecutively
 	reader, err := s.NewReader(ctx, options.WithReaderStartAtOldest(), options.WithReaderBlockDuration(testBlockDuration))
 	require.NoError(t, err)
-	defer cleanupReader(t, ctx, s, reader)
+	defer cleanupReader(t, reader)
 	c := reader.Subscribe()
 	_, err = s.Add(ctx, "event", []byte("payload"))
 	require.NoError(t, err)
@@ -81,7 +211,7 @@ func TestReaderReadSinceLastEvent(t *testing.T) {
 	// Create new reader with last event ID set to first event and read last event
 	reader2, err := s.NewReader(ctx, options.WithReaderStartAfter(eventID), options.WithReaderBlockDuration(testBlockDuration))
 	require.NoError(t, err)
-	defer cleanupReader(t, ctx, s, reader2)
+	defer cleanupReader(t, reader2)
 	c2 := reader2.Subscribe()
 	read = readOneReaderEvent(t, c2)
 	assert.Equal(t, "event", read.EventName)
@@ -90,7 +220,7 @@ func TestReaderReadSinceLastEvent(t *testing.T) {
 	// Create new reader with last event ID set to 0 and read the 2 events
 	reader3, err := s.NewReader(ctx, options.WithReaderStartAfter("0"), options.WithReaderBlockDuration(testBlockDuration))
 	require.NoError(t, err)
-	defer cleanupReader(t, ctx, s, reader3)
+	defer cleanupReader(t, reader3)
 	c3 := reader3.Subscribe()
 	read = readOneReaderEvent(t, c3)
 	assert.Equal(t, "event", read.EventName)
@@ -107,6 +237,7 @@ func TestCleanupReader(t *testing.T) {
 	ctx := ptesting.NewTestContext(t)
 	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
+	require.NoError(t, s.Open(ctx))
 	reader, err := s.NewReader(ctx, options.WithReaderStartAtOldest(), options.WithReaderBlockDuration(testBlockDuration))
 	require.NoError(t, err)
 
@@ -133,14 +264,15 @@ func TestReaderCloseOnFatalReadError(t *testing.T) {
 	ctx := ptesting.NewTestContext(t)
 	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	require.NoError(t, err)
-	// Simulate a fatal read error (e.g. the underlying stream key being
-	// destroyed) before the read goroutine starts. The read loop reacts to a
-	// fatal error by closing the reader; because Close waits on the read
-	// goroutine, it must run asynchronously or it would deadlock and leak the
-	// reader and its Redis connection.
-	defer func(orig func(*Reader, context.Context) ([]redis.XStream, error)) { xreadFn = orig }(xreadFn)
-	xreadFn = func(*Reader, context.Context) ([]redis.XStream, error) {
-		return nil, fmt.Errorf("stream key no longer exists")
+	require.NoError(t, s.Open(ctx))
+	defer func() { require.NoError(t, s.Destroy(ctx)) }()
+	// Simulate exact-generation destruction before the read goroutine starts.
+	// The read loop reacts by closing the reader; because Close waits on the
+	// read goroutine, it must run asynchronously or it would deadlock and leak
+	// the reader and its Redis connection.
+	defer func(orig func(*Reader, context.Context, []string) ([]redis.XStream, error)) { xreadFn = orig }(xreadFn)
+	xreadFn = func(*Reader, context.Context, []string) ([]redis.XStream, error) {
+		return nil, ErrStreamDestroyed
 	}
 
 	reader, err := s.NewReader(ctx, options.WithReaderBlockDuration(testBlockDuration))
@@ -151,6 +283,50 @@ func TestReaderCloseOnFatalReadError(t *testing.T) {
 		"reader did not close after a fatal read error (Close likely deadlocked on its own read goroutine)")
 }
 
+func TestReaderLifetimeDoesNotUseConstructorContext(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	setupCtx, cancel := context.WithCancel(ptesting.NewTestContext(t))
+	stream, err := NewStream(t.Name(), rdb)
+	require.NoError(t, err)
+	require.NoError(t, stream.Open(setupCtx))
+	reader, err := stream.NewReader(
+		setupCtx,
+		options.WithReaderStartAtOldest(),
+		options.WithReaderBlockDuration(testBlockDuration),
+	)
+	require.NoError(t, err)
+	events := reader.Subscribe()
+	cancel()
+
+	eventID, err := stream.Add(context.Background(), "event", []byte("payload"))
+	require.NoError(t, err)
+	require.Equal(t, eventID, receiveSinkEvent(t, events).ID)
+	reader.Close()
+	require.NoError(t, stream.Destroy(context.Background()))
+}
+
+func TestReaderRejectsRemovingFinalStream(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx := ptesting.NewTestContext(t)
+	stream, err := NewStream(t.Name(), rdb)
+	require.NoError(t, err)
+	require.NoError(t, stream.Open(ctx))
+	reader, err := stream.NewReader(ctx, options.WithReaderBlockDuration(testBlockDuration))
+	require.NoError(t, err)
+
+	unattached, err := NewStream(t.Name()+"-unattached", rdb)
+	require.NoError(t, err)
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	require.NoError(t, reader.RemoveStream(cancelled, unattached))
+	require.Empty(t, unattached.Generation())
+	require.ErrorIs(t, reader.RemoveStream(ctx, stream), ErrLastStream)
+	reader.Close()
+	require.NoError(t, stream.Destroy(ctx))
+}
+
 func TestAddReaderStream(t *testing.T) {
 	testName := strings.Replace(t.Name(), "/", "_", -1)
 	rdb := ptesting.NewRedisClient(t)
@@ -158,14 +334,17 @@ func TestAddReaderStream(t *testing.T) {
 	ctx := ptesting.NewTestContext(t)
 	s, err := NewStream("testAddStream", rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
+	require.NoError(t, s.Open(ctx))
+	defer func() { assert.NoError(t, s.Destroy(ctx)) }()
 	reader, err := s.NewReader(ctx, options.WithReaderStartAtOldest(), options.WithReaderBlockDuration(testBlockDuration))
 	require.NoError(t, err)
 	s2, err := NewStream("testAddStream2", rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
+	require.NoError(t, s2.Open(ctx))
 	assert.NoError(t, reader.AddStream(ctx, s2))
 	assert.NoError(t, reader.AddStream(ctx, s2)) // Make sure it's idempotent
 	defer func() { assert.NoError(t, s2.Destroy(ctx)) }()
-	defer cleanupReader(t, ctx, s, reader)
+	defer cleanupReader(t, reader)
 
 	// Add events to both streams
 	c := reader.Subscribe()
@@ -190,13 +369,16 @@ func TestRemoveReaderStream(t *testing.T) {
 	ctx := ptesting.NewTestContext(t)
 	s, err := NewStream("testRemoveStream", rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
+	require.NoError(t, s.Open(ctx))
+	defer func() { assert.NoError(t, s.Destroy(ctx)) }()
 	s2, err := NewStream("testRemoveStream2", rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	assert.NoError(t, err)
+	require.NoError(t, s2.Open(ctx))
 	reader, err := s.NewReader(ctx, options.WithReaderStartAtOldest(), options.WithReaderBlockDuration(testBlockDuration))
 	require.NoError(t, err)
 	assert.NoError(t, reader.AddStream(ctx, s2))
 	defer func() { assert.NoError(t, s2.Destroy(ctx)) }()
-	defer cleanupReader(t, ctx, s, reader)
+	defer cleanupReader(t, reader)
 
 	// Read events from both streams
 	c := reader.Subscribe()
@@ -227,6 +409,7 @@ func TestReaderCloseWithStalledSubscriber(t *testing.T) {
 	ctx := ptesting.NewTestContext(t)
 	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	require.NoError(t, err)
+	require.NoError(t, s.Open(ctx))
 
 	// Tiny buffer so the read loop's fan-out send blocks after a couple of
 	// events when the subscriber never drains its channel.
@@ -265,6 +448,20 @@ func TestReaderCloseWithStalledSubscriber(t *testing.T) {
 	assert.True(t, reader.IsClosed())
 
 	require.NoError(t, s.Destroy(ctx))
+}
+
+func TestReaderRejectsSubMillisecondBlockDuration(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx := ptesting.NewTestContext(t)
+	stream, err := NewStream(t.Name(), rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
+	require.NoError(t, err)
+	for _, duration := range []time.Duration{0, -time.Second, 500 * time.Microsecond} {
+		reader, err := stream.NewReader(ctx, options.WithReaderBlockDuration(duration))
+		require.Nil(t, reader)
+		require.EqualError(t, err, "reader block duration must be at least 1ms")
+	}
+	require.ErrorIs(t, stream.Destroy(ctx), ErrStreamNotFound)
 }
 
 func TestEventCreatedAt(t *testing.T) {

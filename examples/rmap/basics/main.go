@@ -14,7 +14,7 @@ func main() {
 	ctx := context.Background()
 
 	// Create Redis client
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: os.Getenv("REDIS_PASSWORD")})
+	rdb := redis.NewClient(&redis.Options{Addr: os.Getenv("REDIS_ADDR"), Password: os.Getenv("REDIS_PASSWORD")})
 
 	// Make sure Redis is up and running and we can connect to it
 	if err := rdb.Ping(ctx).Err(); err != nil {

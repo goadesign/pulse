@@ -2,21 +2,37 @@ package streaming
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	redis "github.com/redis/go-redis/v9"
 
+	"goa.design/clue/log"
 	"goa.design/pulse/pulse"
 	"goa.design/pulse/streaming/options"
 )
 
 type (
+	// readRetry bounds the command rate while a long-lived reader or sink waits
+	// for Redis to recover. Successful commands reset the exponential delay.
+	readRetry struct {
+		failures int
+		jitter   func(int64) int64
+	}
+
+	// readerSnapshot is the exact immutable stream set used by one XREAD.
+	readerSnapshot struct {
+		streams map[string]*Stream
+		args    []string
+	}
+
 	// Reader represents a stream reader.
 	Reader struct {
 		// closed is true if Close completed.
@@ -48,13 +64,14 @@ type (
 		closeOnce sync.Once
 		// donechan is the reader donechan channel.
 		donechan chan struct{}
-		// streamschan notifies the reader when streams are added or
-		// removed.
-		streamschan chan struct{}
+		// ctx bounds blocking Redis reads for the reader lifetime.
+		ctx context.Context
+		// cancel interrupts a blocking XREAD when Close begins.
+		cancel context.CancelFunc
 		// wait is the reader cleanup wait group.
 		wait sync.WaitGroup
-		// closing is true if Close was called.
-		closing bool
+		// closing is true from the instant Close begins.
+		closing atomic.Bool
 		// eventFilter is the event filter if any.
 		eventFilter eventFilterFunc
 		// logger is the logger used by the reader.
@@ -74,6 +91,10 @@ type (
 		ID string
 		// StreamName is the name of the stream the event belongs to.
 		StreamName string
+		// StreamGeneration is the immutable stream incarnation that produced the
+		// event. Events fetched before Destroy may still be in process, so
+		// handlers that fence side effects can compare this token explicitly.
+		StreamGeneration string
 		// SinkName is the name of the sink the event belongs to.
 		SinkName string
 		// EventName is the producer-defined event name.
@@ -82,30 +103,33 @@ type (
 		Topic string
 		// Payload is the event payload.
 		Payload []byte
-		// Acker is the redis client used to acknowledge events.
+		// Acker acknowledges events according to their sink recovery contract.
 		Acker Acker
 		// streamKey is the Redis key of the stream.
 		streamKey string
 	}
-
-	// readRetry computes jittered exponential backoff delays for reader and
-	// sink Redis failures. Jitter spans half to full of the current backoff
-	// so replicas that fail together do not retry in lockstep.
-	readRetry struct {
-		backoff time.Duration
-	}
 )
 
 const (
-	// minReadRetryBackoff is the first retry backoff after a Redis failure.
-	minReadRetryBackoff = 50 * time.Millisecond
-	// maxReadRetryBackoff caps the exponential retry backoff.
-	maxReadRetryBackoff = 5 * time.Second
+	readRetryInitialDelay = 100 * time.Millisecond
+	readRetryMaxDelay     = 5 * time.Second
+)
+
+var (
+	// ErrReaderClosed is returned when stream ownership is changed after reader
+	// shutdown begins.
+	ErrReaderClosed = errors.New("pulse streaming: reader is closed")
+	// ErrLastStream is returned when removing a stream would leave a reader or
+	// sink without a valid Redis read set.
+	ErrLastStream = errors.New("pulse streaming: cannot remove final stream")
 )
 
 // newReader creates a new reader.
-func newReader(stream *Stream, opts ...options.Reader) (*Reader, error) {
+func newReader(ctx context.Context, stream *Stream, opts ...options.Reader) (*Reader, error) {
 	o := options.ParseReaderOptions(opts...)
+	if err := validateReaderOptions(o); err != nil {
+		return nil, err
+	}
 	var eventFilter eventFilterFunc
 	if o.Topic != "" {
 		eventFilter = func(e *Event) bool { return e.Topic == o.Topic }
@@ -117,6 +141,9 @@ func newReader(stream *Stream, opts ...options.Reader) (*Reader, error) {
 		eventFilter = func(e *Event) bool { return topicPatternRegexp.MatchString(e.Topic) }
 	}
 
+	logCtx := context.Background()
+	logCtx = log.WithContext(logCtx, ctx)
+	runCtx, cancel := context.WithCancel(logCtx)
 	reader := &Reader{
 		startID:       o.LastEventID,
 		streams:       []*Stream{stream},
@@ -126,7 +153,8 @@ func newReader(stream *Stream, opts ...options.Reader) (*Reader, error) {
 		maxPolled:     o.MaxPolled,
 		bufferSize:    o.BufferSize,
 		donechan:      make(chan struct{}),
-		streamschan:   make(chan struct{}),
+		ctx:           runCtx,
+		cancel:        cancel,
 		eventFilter:   eventFilter,
 		logger:        stream.rootLogger.WithPrefix("reader", stream.Name),
 		rdb:           stream.rdb,
@@ -135,12 +163,17 @@ func newReader(stream *Stream, opts ...options.Reader) (*Reader, error) {
 	return reader, nil
 }
 
-// Subscribe returns a channel that receives events from the stream.
-// The channel is closed when the reader is closed.
+// Subscribe returns a channel that receives events from the stream. The
+// channel is closed when the reader closes; calls made after shutdown starts
+// return an already closed channel.
 func (r *Reader) Subscribe() <-chan *Event {
 	c := make(chan *Event, r.bufferSize)
 	r.lock.Lock()
 	defer r.lock.Unlock()
+	if r.closing.Load() {
+		close(c)
+		return c
+	}
 	r.chans = append(r.chans, c)
 	r.start()
 	return c
@@ -159,43 +192,75 @@ func (r *Reader) Unsubscribe(c <-chan *Event) {
 	}
 }
 
-// AddStream adds the stream to the sink. By default the stream cursor starts at
-// the same timestamp as the sink main stream cursor.  This can be overridden
-// with opts. AddStream does nothing if the stream is already part of the sink.
+// AddStream adds the stream to the reader. By default the stream cursor starts
+// at the same timestamp as the main stream cursor. This can be overridden with
+// opts. AddStream does nothing if the stream is already part of the reader and
+// returns ErrReaderClosed once shutdown starts.
 func (r *Reader) AddStream(ctx context.Context, stream *Stream, opts ...options.AddStream) error {
 	r.lock.Lock()
 	defer r.lock.Unlock()
-	for _, name := range r.streamKeys {
-		if name == stream.Name {
+	if r.closing.Load() {
+		return ErrReaderClosed
+	}
+	o := options.ParseAddStreamOptions(opts...)
+	if err := validateAddStreamOptions(o); err != nil {
+		return err
+	}
+	if err := stream.verifyExistingGeneration(ctx); err != nil {
+		return err
+	}
+	for _, owned := range r.streams {
+		if owned.Name != stream.Name {
+			continue
+		}
+		if owned.generation == stream.generation {
 			return nil
 		}
+		return owned.verifyGeneration(ctx)
 	}
 	startID := r.startID
-	o := options.ParseAddStreamOptions(opts...)
 	if o.LastEventID != "" {
 		startID = o.LastEventID
 	}
 	r.streams = append(r.streams, stream)
 	r.streamKeys = append(r.streamKeys, stream.key)
 	r.streamCursors = append(r.streamCursors, startID)
-	r.notifyStreamChange()
 	r.logger.Info("added", "stream", stream.Name)
 	return nil
 }
 
-// RemoveStream removes the stream from the sink, it is idempotent.
+// RemoveStream removes the stream from the reader. It is idempotent and returns
+// ErrReaderClosed once shutdown starts. Removing the final stream returns
+// ErrLastStream.
 func (r *Reader) RemoveStream(ctx context.Context, stream *Stream) error {
 	r.lock.Lock()
 	defer r.lock.Unlock()
+	if r.closing.Load() {
+		return ErrReaderClosed
+	}
+	index := -1
 	for i, st := range r.streams {
-		if st == stream {
-			r.streams = append(r.streams[:i], r.streams[i+1:]...)
-			r.streamKeys = append(r.streamKeys[:i], r.streamKeys[i+1:]...)
-			r.streamCursors = append(r.streamCursors[:i], r.streamCursors[i+1:]...)
+		if st == stream ||
+			(stream.generation != "" &&
+				st.Name == stream.Name &&
+				st.generation == stream.generation) {
+			index = i
 			break
 		}
 	}
-	r.notifyStreamChange()
+	if index == -1 {
+		return nil
+	}
+	if len(r.streams) == 1 {
+		return ErrLastStream
+	}
+	attached := r.streams[index]
+	if err := attached.verifyExistingGeneration(ctx); err != nil {
+		return err
+	}
+	r.streams = append(r.streams[:index], r.streams[index+1:]...)
+	r.streamKeys = append(r.streamKeys[:index], r.streamKeys[index+1:]...)
+	r.streamCursors = append(r.streamCursors[:index], r.streamCursors[index+1:]...)
 	r.logger.Info("removed", "stream", stream.Name)
 	return nil
 }
@@ -203,17 +268,21 @@ func (r *Reader) RemoveStream(ctx context.Context, stream *Stream) error {
 // Close stops event polling and closes the reader channel. It is safe to call
 // Close multiple times; concurrent callers block until the first Close
 // completes. Close returns only once the read goroutine has stopped and its
-// resources are released, which may take up to one block duration.
+// resources are released. The configured finite block duration bounds shutdown
+// even when the Redis client does not interrupt a blocking read on cancellation.
 func (r *Reader) Close() {
 	r.closeOnce.Do(func() {
+		r.closing.Store(true)
+		r.cancel()
 		// Close donechan first, without holding the lock, so the signal
 		// reaches the read loop even when it is parked on a fan-out send
 		// to a stalled subscriber (which holds the lock). Otherwise Close
 		// would deadlock acquiring the lock the read loop never releases.
 		close(r.donechan)
+		// Synchronize with a Subscribe already inside the admission lock so its
+		// wait-group Add completes before Wait begins. Future subscriptions see
+		// closing and cannot start the read loop.
 		r.lock.Lock()
-		r.closing = true
-		close(r.streamschan)
 		r.lock.Unlock()
 		r.wait.Wait()
 		r.lock.Lock()
@@ -244,29 +313,13 @@ func (r *Reader) start() {
 var xreadFn = (*Reader).xread
 
 // read reads events from the streams and sends them to the reader channel.
-// Transient Redis failures are retried with jittered exponential backoff so
-// reader replicas that fail together do not hammer Redis in lockstep.
 func (r *Reader) read() {
-	ctx := context.Background()
 	defer r.cleanup()
 	var retry readRetry
 	for {
-		streamsEvents, err := xreadFn(r, ctx)
-		if r.isClosing() {
-			return
-		}
+		snapshot, err := r.readSnapshot(r.ctx)
 		if err != nil {
-			if err == redis.Nil {
-				// No event at this time, just loop.
-				retry.reset()
-				continue
-			}
-			if isFatalReaderError(err) {
-				r.logger.Error(fmt.Errorf("fatal error while reading events: %w, stopping", err))
-				// Close waits on this goroutine via wait.Wait, so calling it
-				// synchronously here would deadlock and leak the reader and its
-				// Redis connection. Trigger the shutdown asynchronously and let
-				// this goroutine return so cleanup can release the wait group.
+			if fatal := fatalReadError(err); fatal != nil {
 				pulse.Go(r.logger, r.Close)
 				return
 			}
@@ -275,13 +328,60 @@ func (r *Reader) read() {
 			}
 			continue
 		}
+		streamsEvents, err := xreadFn(r, r.ctx, snapshot.args)
+		if r.isClosing() {
+			return
+		}
+		if err != nil {
+			if err := fatalReadError(err); err != nil {
+				r.logger.Error(fmt.Errorf("fatal error while reading events: %w, stopping", err))
+				// Close waits on this goroutine via wait.Wait, so calling it
+				// synchronously here would deadlock and leak the reader and its
+				// Redis connection. Trigger the shutdown asynchronously and let
+				// this goroutine return so cleanup can release the wait group.
+				pulse.Go(r.logger, r.Close)
+				return
+			}
+			if err == redis.Nil {
+				retry.reset()
+				continue
+			}
+			if !retry.wait(r.donechan, err, r.logger) {
+				return
+			}
+			continue
+		}
 		retry.reset()
 
-		r.lock.Lock()
 		for _, events := range streamsEvents {
-			streamName := events.Stream[len(streamKeyPrefix):]
-			if err := streamEvents(ctx, streamName, events.Stream, "", events.Messages, r.rdb, false, r.eventFilter, r.chans, r.donechan, r.logger); err != nil {
-				r.logger.Error(fmt.Errorf("failed to stream events: %w", err))
+			stream := snapshot.streams[events.Stream]
+			if stream == nil {
+				continue
+			}
+			if verifyErr := stream.verifyGeneration(r.ctx); verifyErr != nil {
+				err = verifyErr
+				break
+			}
+			r.lock.Lock()
+			if !r.ownsStream(stream) {
+				r.lock.Unlock()
+				continue
+			}
+			if err := streamEvents(
+				r.ctx,
+				stream,
+				"",
+				events.Messages,
+				false,
+				r.eventFilter,
+				r.chans,
+				r.donechan,
+				r.rdb,
+				r.logger,
+			); err != nil {
+				r.logger.Error(fmt.Errorf("failed to stream reader events: %w", err))
+				r.lock.Unlock()
+				continue
 			}
 			for i := range r.streamKeys {
 				if r.streamKeys[i] == events.Stream {
@@ -289,19 +389,36 @@ func (r *Reader) read() {
 					break
 				}
 			}
+			r.lock.Unlock()
 		}
-		r.lock.Unlock()
+		if fatal := fatalReadError(err); fatal != nil {
+			pulse.Go(r.logger, r.Close)
+			return
+		}
 	}
 }
 
-func (r *Reader) xread(ctx context.Context) ([]redis.XStream, error) {
-	// copy so no two goroutines can share the memory
+// readSnapshot verifies and captures the exact stream capabilities used by one
+// Redis read.
+func (r *Reader) readSnapshot(ctx context.Context) (readerSnapshot, error) {
 	r.lock.Lock()
-	readStreams := make([]string, len(r.streamKeys))
-	copy(readStreams, r.streamKeys)
-	readStreams = append(readStreams, r.streamCursors...)
-	r.lock.Unlock()
+	defer r.lock.Unlock()
+	snapshot := readerSnapshot{
+		streams: make(map[string]*Stream, len(r.streams)),
+		args:    make([]string, 0, len(r.streamKeys)+len(r.streamCursors)),
+	}
+	for _, stream := range r.streams {
+		if err := stream.verifyGeneration(ctx); err != nil {
+			return readerSnapshot{}, err
+		}
+		snapshot.streams[stream.key] = stream
+	}
+	snapshot.args = append(snapshot.args, r.streamKeys...)
+	snapshot.args = append(snapshot.args, r.streamCursors...)
+	return snapshot, nil
+}
 
+func (r *Reader) xread(ctx context.Context, readStreams []string) ([]redis.XStream, error) {
 	r.logger.Debug("reading", "streams", readStreams, "max", r.maxPolled, "block", r.blockDuration)
 	return r.rdb.XRead(ctx, &redis.XReadArgs{
 		Streams: readStreams,
@@ -310,12 +427,15 @@ func (r *Reader) xread(ctx context.Context) ([]redis.XStream, error) {
 	}).Result()
 }
 
-// notifyStreamChange notifies the reader that the streams have changed.
-func (r *Reader) notifyStreamChange() {
-	select {
-	case r.streamschan <- struct{}{}:
-	default:
+// ownsStream reports whether the current reader still owns the exact snapshot
+// capability after a concurrent RemoveStream.
+func (r *Reader) ownsStream(candidate *Stream) bool {
+	for _, stream := range r.streams {
+		if stream == candidate {
+			return true
+		}
 	}
+	return false
 }
 
 // cleanup removes the consumer from the consumer groups and removes the reader
@@ -333,9 +453,7 @@ func (r *Reader) cleanup() {
 
 // isClosing returns true if the reader is stopping.
 func (r *Reader) isClosing() bool {
-	r.lock.Lock()
-	defer r.lock.Unlock()
-	return r.closing
+	return r.closing.Load()
 }
 
 // CreatedAt returns the event creation time (millisecond precision).
@@ -347,91 +465,66 @@ func (e *Event) CreatedAt() time.Time {
 	return time.Unix(seconds, nanos).UTC()
 }
 
-// reset clears the backoff so the next failure starts from the minimum delay.
-func (r *readRetry) reset() {
-	r.backoff = 0
-}
-
-// wait logs err and sleeps for the next jittered backoff delay. It returns
-// false when done closes during the wait, signaling the caller to stop.
-func (r *readRetry) wait(done <-chan struct{}, err error, logger pulse.Logger) bool {
-	d := r.next()
-	logger.Error(fmt.Errorf("failed to read events: %w, retrying in %v", err, d))
-	select {
-	case <-done:
-		return false
-	case <-time.After(d):
-		return true
-	}
-}
-
-// next returns a delay uniformly distributed in [backoff/2, backoff] and
-// doubles the backoff up to maxReadRetryBackoff.
-func (r *readRetry) next() time.Duration {
-	if r.backoff == 0 {
-		r.backoff = minReadRetryBackoff
-	}
-	d := r.backoff/2 + time.Duration(rand.Int63n(int64(r.backoff/2)+1))
-	r.backoff = min(2*r.backoff, maxReadRetryBackoff)
-	return d
-}
-
-// streamEvents filters and streams the Redis messages as events to the
-// subscriber channels. The caller is responsible for locking chans. For sinks
-// (sinkName non-empty) acker settles events that are never delivered to
-// subscribers so the recovery cursor keeps advancing: filtered events are
-// acknowledged individually, and when autoAck is set the whole batch is
-// settled upfront because delivery is already at-most-once.
+// streamEvents filters and streams Redis messages. Sink events receive a
+// recovery-aware Acker; auto-ack sinks acknowledge each message before it can
+// be exposed to filters or subscribers.
 func streamEvents(
 	ctx context.Context,
-	streamName string,
-	streamKey string,
+	stream *Stream,
 	sinkName string,
 	msgs []redis.XMessage,
-	acker Acker,
 	autoAck bool,
 	eventFilter eventFilterFunc,
 	chans []chan *Event,
 	done <-chan struct{},
+	rdb *redis.Client,
 	logger pulse.Logger,
 ) error {
 	if len(msgs) == 0 {
 		return nil
 	}
-	if autoAck && sinkName != "" {
-		ids := make([]string, len(msgs))
-		for i, msg := range msgs {
-			ids[i] = msg.ID
-		}
-		if err := acker.XAck(ctx, streamKey, sinkName, ids...).Err(); err != nil {
-			return fmt.Errorf("failed to advance recovery cursor for auto-acked events: %w", err)
-		}
-	}
 	for _, event := range msgs {
-		var topic string
-		if t, ok := event.Values[topicKey]; ok {
-			topic = t.(string)
+		name, topic, payload, err := decodeRedisEvent(event)
+		if err != nil {
+			if sinkName != "" {
+				acker := &recoveryAcker{stream: stream}
+				if ackErr := acker.XAck(ctx, stream.key, sinkName, event.ID).Err(); ackErr != nil {
+					return errors.Join(err, fmt.Errorf("acknowledge malformed sink event %s: %w", event.ID, ackErr))
+				}
+			}
+			logger.Error(err, "stream", stream.Name, "id", event.ID)
+			continue
+		}
+		var acker Acker = rdb
+		if sinkName != "" {
+			acker = &recoveryAcker{stream: stream}
 		}
 		ev := &Event{
-			ID:         event.ID,
-			StreamName: streamName,
-			SinkName:   sinkName,
-			EventName:  event.Values[nameKey].(string),
-			Topic:      topic,
-			Payload:    []byte(event.Values[payloadKey].(string)),
-			streamKey:  streamKey,
-			Acker:      acker,
+			ID:               event.ID,
+			StreamName:       stream.Name,
+			StreamGeneration: stream.generation,
+			SinkName:         sinkName,
+			EventName:        name,
+			Topic:            topic,
+			Payload:          payload,
+			streamKey:        stream.key,
+			Acker:            acker,
+		}
+		if autoAck {
+			if err := ev.Acker.XAck(ctx, stream.key, sinkName, event.ID).Err(); err != nil {
+				return err
+			}
 		}
 		if eventFilter != nil && !eventFilter(ev) {
 			if sinkName != "" && !autoAck {
-				if err := acker.XAck(ctx, streamKey, sinkName, ev.ID).Err(); err != nil {
-					return fmt.Errorf("failed to acknowledge filtered event %s: %w", ev.ID, err)
+				if err := ev.Acker.XAck(ctx, stream.key, sinkName, event.ID).Err(); err != nil {
+					return fmt.Errorf("failed to acknowledge filtered sink event %s: %w", event.ID, err)
 				}
 			}
-			logger.Debug("event filtered", "event", ev.EventName, "id", ev.ID, "stream", streamName)
+			logger.Debug("event filtered", "event", ev.EventName, "id", ev.ID, "stream", stream.Name)
 			continue
 		}
-		logger.Debug("event", "stream", streamName, "event", ev.EventName, "id", ev.ID, "channels", len(chans))
+		logger.Debug("event", "stream", stream.Name, "event", ev.EventName, "id", ev.ID, "channels", len(chans))
 		for _, c := range chans {
 			select {
 			case c <- ev:
@@ -449,8 +542,91 @@ func streamEvents(
 	return nil
 }
 
-// isFatalReaderError reports whether the read loop must stop instead of
-// retrying, which happens when the underlying stream key was destroyed.
-func isFatalReaderError(err error) bool {
-	return strings.Contains(err.Error(), "stream key no longer exists")
+// decodeRedisEvent validates the externally writable Redis stream boundary.
+func decodeRedisEvent(event redis.XMessage) (string, string, []byte, error) {
+	name, ok := event.Values[nameKey].(string)
+	if !ok || name == "" {
+		return "", "", nil, fmt.Errorf(
+			"pulse streaming: malformed event %s: required field %q must be a non-empty string",
+			event.ID,
+			nameKey,
+		)
+	}
+	payload, ok := event.Values[payloadKey].(string)
+	if !ok {
+		return "", "", nil, fmt.Errorf(
+			"pulse streaming: malformed event %s: required field %q must be a string",
+			event.ID,
+			payloadKey,
+		)
+	}
+	var topic string
+	if value, exists := event.Values[topicKey]; exists {
+		var valid bool
+		topic, valid = value.(string)
+		if !valid {
+			return "", "", nil, fmt.Errorf(
+				"pulse streaming: malformed event %s: optional field %q must be a string",
+				event.ID,
+				topicKey,
+			)
+		}
+	}
+	return name, topic, []byte(payload), nil
+}
+
+// fatalReadError returns errors that permanently invalidate a reader. All
+// other errors are transient and are retried through readRetry.
+func fatalReadError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrStreamDestroyed) || errors.Is(err, ErrDeadlineElapsed) {
+		return err
+	}
+	return nil
+}
+
+// reset restores the retry delay after Redis processes a read or repairs a
+// missing consumer group.
+func (r *readRetry) reset() {
+	r.failures = 0
+}
+
+// nextDelay returns a half-to-full-jitter exponential delay. The non-zero
+// lower bound prevents a hot loop while randomization avoids fleet-wide retry
+// synchronization.
+func (r *readRetry) nextDelay() time.Duration {
+	limit := readRetryInitialDelay
+	for range r.failures {
+		limit = min(limit*2, readRetryMaxDelay)
+		if limit == readRetryMaxDelay {
+			break
+		}
+	}
+	if limit < readRetryMaxDelay {
+		r.failures++
+	}
+	jitter := r.jitter
+	if jitter == nil {
+		jitter = rand.Int63n
+	}
+	floor := limit / 2
+	return floor + time.Duration(jitter(int64(limit-floor)+1))
+}
+
+// wait applies the next bounded jittered delay. It returns false when shutdown
+// interrupts the wait so Close does not wait for a retry timer.
+func (r *readRetry) wait(done <-chan struct{}, err error, logger pulse.Logger) bool {
+	delay := r.nextDelay()
+	logger.Error(fmt.Errorf("failed to read events: %w", err), "retry_in", delay)
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-done:
+		return false
+	}
 }
