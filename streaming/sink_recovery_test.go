@@ -6,6 +6,7 @@ package streaming
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -349,14 +350,18 @@ func TestSinkConsumerRotationRegistersEveryStreamOrRollsBack(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEqual(t, original, replacement)
 	for _, stream := range []*Stream{mainStream, addedStream} {
-		members, ok := sink.streams[stream.key].consumers.GetValues(sink.Name)
-		require.True(t, ok)
-		require.Contains(t, members, replacement)
+		// Registration writes membership in Redis atomically; the local rmap
+		// replica converges through the update channel, so poll it.
+		require.Eventually(t, func() bool {
+			members, ok := sink.streams[stream.key].consumers.GetValues(sink.Name)
+			return ok && slices.Contains(members, replacement)
+		}, max, delay)
 		consumers, err := rdb.XInfoConsumers(ctx, stream.key, sink.Name).Result()
 		require.NoError(t, err)
 		assert.Contains(t, consumerNames(consumers), replacement)
 	}
 }
+
 
 func TestSinkStreamMutationRollback(t *testing.T) {
 	rdb := ptesting.NewRedisClient(t)
