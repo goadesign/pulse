@@ -362,7 +362,6 @@ func TestSinkConsumerRotationRegistersEveryStreamOrRollsBack(t *testing.T) {
 	}
 }
 
-
 func TestSinkStreamMutationRollback(t *testing.T) {
 	rdb := ptesting.NewRedisClient(t)
 	defer ptesting.CleanupRedis(t, rdb, false, "")

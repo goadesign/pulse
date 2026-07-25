@@ -193,7 +193,22 @@ func ensureConsumerGroup(ctx context.Context, stream *Stream, group, configuredS
 	if err := stream.ensureGeneration(ctx); err != nil {
 		return false, err
 	}
-	absent, err := ensureConsumerGroupScript.Run(
+	absent, err := runEnsureConsumerGroup(ctx, stream, group, configuredStart)
+	if err != nil {
+		lifecycleErr := stream.lifecycleError(err)
+		if !stream.reestablishLostGenesis(ctx, lifecycleErr) {
+			return false, ensureConsumerGroupError(stream, group, lifecycleErr)
+		}
+		if absent, err = runEnsureConsumerGroup(ctx, stream, group, configuredStart); err != nil {
+			return false, ensureConsumerGroupError(stream, group, stream.lifecycleError(err))
+		}
+	}
+	return absent == 1, nil
+}
+
+// runEnsureConsumerGroup executes the fenced group recovery script once.
+func runEnsureConsumerGroup(ctx context.Context, stream *Stream, group, configuredStart string) (int64, error) {
+	return ensureConsumerGroupScript.Run(
 		ctx,
 		stream.rdb,
 		[]string{stream.lifecycleKey, stream.key, recoveryCursorKey(stream)},
@@ -206,16 +221,17 @@ func ensureConsumerGroup(ctx context.Context, stream *Stream, group, configuredS
 		streamPhysicalKey,
 		streamDeadlineKey,
 	).Int64()
-	if err != nil {
-		return false, fmt.Errorf(
-			"failed to ensure Redis consumer group %q for stream %q generation %s: %w",
-			group,
-			stream.Name,
-			stream.generation,
-			stream.lifecycleError(err),
-		)
-	}
-	return absent == 1, nil
+}
+
+// ensureConsumerGroupError wraps group recovery failures with their identity.
+func ensureConsumerGroupError(stream *Stream, group string, err error) error {
+	return fmt.Errorf(
+		"failed to ensure Redis consumer group %q for stream %q generation %s: %w",
+		group,
+		stream.Name,
+		stream.generation,
+		err,
+	)
 }
 
 // XAck atomically acknowledges IDs and advances this generation's shared
