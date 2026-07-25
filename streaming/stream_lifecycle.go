@@ -505,7 +505,6 @@ func (s *Stream) removeEvents(ctx context.Context, ids []string) error {
 	return s.lifecycleError(err)
 }
 
-
 // lifecycleError maps Redis's generation mismatch to the public sentinel.
 func (s *Stream) lifecycleError(err error) error {
 	if err == nil {
