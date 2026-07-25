@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMarshalJob(t *testing.T) {
@@ -41,7 +42,8 @@ func TestMarshalJob(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			marshaled := marshalJob(&tc.job)
-			job := unmarshalJob(marshaled)
+			job, err := unmarshalJob(marshaled)
+			require.NoError(t, err)
 
 			// Compare original and unmarshaled Job structs
 			assert.Equal(t, tc.job.Key, job.Key)
@@ -54,13 +56,14 @@ func TestMarshalJob(t *testing.T) {
 			assert.True(t, bytes.Equal(marshaled, marshaled2))
 
 			// Compare unmarshaled job key
-			key := unmarshalJobKey(marshaled)
+			key, err := unmarshalJobKey(marshalJobKey(tc.job.Key))
+			require.NoError(t, err)
 			assert.Equal(t, tc.job.Key, key)
 		})
 	}
 }
 
-func TestUnmarshalLegacyJob(t *testing.T) {
+func TestUnmarshalJobRejectsLegacyFormats(t *testing.T) {
 	job := &Job{
 		Key:       "test-key",
 		Payload:   []byte("test-payload"),
@@ -69,16 +72,12 @@ func TestUnmarshalLegacyJob(t *testing.T) {
 		Requeued:  true,
 	}
 	marshaled := marshalJob(job)
-	legacy := marshaled[:len(marshaled)-1]
+	legacy := marshaled[:len(marshaled)-5]
 
-	assert.NotPanics(t, func() {
-		decoded := unmarshalJob(legacy)
-		assert.Equal(t, job.Key, decoded.Key)
-		assert.Equal(t, job.Payload, decoded.Payload)
-		assert.Equal(t, job.CreatedAt, decoded.CreatedAt)
-		assert.Equal(t, job.NodeID, decoded.NodeID)
-		assert.False(t, decoded.Requeued)
-	})
+	_, err := unmarshalJob(legacy)
+	require.Error(t, err)
+	_, err = unmarshalJob(marshaled[:len(marshaled)-4])
+	require.Error(t, err)
 }
 
 func TestMarshalKeyedPayload(t *testing.T) {
@@ -86,9 +85,88 @@ func TestMarshalKeyedPayload(t *testing.T) {
 	payload := []byte("test-payload")
 
 	marshaled := marshalKeyedPayload(key, payload)
-	gotKey, gotPayload := unmarshalKeyedPayload(marshaled)
+	gotKey, gotPayload, err := unmarshalKeyedPayload(marshaled)
+	require.NoError(t, err)
 
 	assert.Equal(t, key, gotKey)
 	assert.Equal(t, payload, gotPayload)
-	assert.Equal(t, key, unmarshalJobKey(marshaled))
+	decodedKey, err := unmarshalJobKey(marshalJobKey(key))
+	require.NoError(t, err)
+	assert.Equal(t, key, decodedKey)
+}
+
+func TestPoolDecodersRejectMalformedPayloads(t *testing.T) {
+	job := marshalJob(&Job{Key: "job", CreatedAt: time.Unix(1, 0)})
+	jobKey := marshalJobKey("job")
+	keyed := marshalKeyedPayload("job", []byte("payload"))
+	envelope := marshalEnvelope("node", []byte("payload"))
+	ackPayload := marshalAck(&ack{EventID: "event", JobKey: "job"})
+
+	cases := []struct {
+		name   string
+		decode func([]byte) error
+		data   []byte
+	}{
+		{
+			name: "job truncated",
+			decode: func(data []byte) error {
+				_, err := unmarshalJob(data)
+				return err
+			},
+			data: job[:len(job)-1],
+		},
+		{
+			name: "job trailing",
+			decode: func(data []byte) error {
+				_, err := unmarshalJob(data)
+				return err
+			},
+			data: append(job, 1),
+		},
+		{
+			name: "job key negative length",
+			decode: func(data []byte) error {
+				_, err := unmarshalJobKey(data)
+				return err
+			},
+			data: []byte{0xff, 0xff, 0xff, 0xff},
+		},
+		{
+			name: "job key trailing",
+			decode: func(data []byte) error {
+				_, err := unmarshalJobKey(data)
+				return err
+			},
+			data: append(jobKey, 1),
+		},
+		{
+			name: "keyed payload truncated",
+			decode: func(data []byte) error {
+				_, _, err := unmarshalKeyedPayload(data)
+				return err
+			},
+			data: keyed[:len(keyed)-1],
+		},
+		{
+			name: "envelope trailing",
+			decode: func(data []byte) error {
+				_, _, err := unmarshalEnvelope(data)
+				return err
+			},
+			data: append(envelope, 1),
+		},
+		{
+			name: "ack truncated",
+			decode: func(data []byte) error {
+				_, err := unmarshalAck(data)
+				return err
+			},
+			data: ackPayload[:len(ackPayload)-1],
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Error(t, tc.decode(tc.data))
+		})
+	}
 }

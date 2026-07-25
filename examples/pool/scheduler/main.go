@@ -14,7 +14,7 @@ import (
 func main() {
 	// Setup Redis connection
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
+		Addr:     os.Getenv("REDIS_ADDR"),
 		Password: os.Getenv("REDIS_PASSWORD"),
 	})
 
@@ -65,8 +65,16 @@ func (p *producer) Name() string {
 	return "example"
 }
 
-// Plan is called by the scheduler to determine the next job to start or stop.
+// Plan preserves the v1 producer contract.
 func (p *producer) Plan() (*pool.JobPlan, error) {
+	return p.PlanContext(context.Background())
+}
+
+// PlanContext computes the next jobs and stops promptly when the node closes.
+func (p *producer) PlanContext(ctx context.Context) (*pool.JobPlan, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	p.iter++
 	if p.iter > 10 {
 		log.Infof(p.logctx, "done")

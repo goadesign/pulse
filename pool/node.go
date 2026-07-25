@@ -1,7 +1,10 @@
 package pool
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash"
@@ -27,42 +30,77 @@ import (
 type (
 	// Node is a pool of workers.
 	Node struct {
-		ID                 string
-		PoolName           string
-		poolStream         *streaming.Stream // pool event stream for dispatching jobs
-		poolSink           *streaming.Sink   // pool event sink
-		nodeStream         *streaming.Stream // node event stream for receiving worker events
-		nodeReader         *streaming.Reader // node event reader
-		nodeKeepAliveMap   *rmap.Map         // node keep-alive timestamps indexed by ID
-		nodeShutdownMap    *rmap.Map         // key is node ID that requested shutdown
-		workerMap          *rmap.Map         // worker creation times by ID
-		workerKeepAliveMap *rmap.Map         // worker keep-alive timestamps indexed by ID
-		workerCleanupMap   *rmap.Map         // key is stale worker ID that needs cleanup
-		jobMap             *rmap.Map         // jobs by worker ID
-		jobPendingMap      *rmap.Map         // pending jobs by job key
-		jobPayloadMap      *rmap.Map         // job payloads by job key
-		tickerMap          *rmap.Map         // ticker next tick time indexed by name
-		workerTTL          time.Duration     // Worker considered dead if keep-alive not updated after this duration
-		workerShutdownTTL  time.Duration     // Worker considered dead if not shutdown after this duration
-		ackGracePeriod     time.Duration     // Wait for return status up to this duration
-		clientOnly         bool
-		logger             pulse.Logger
-		h                  hasher
-		stop               chan struct{}  // closed when node is stopped
-		closed             chan struct{}  // closed when node is closed
-		wg                 sync.WaitGroup // allows to wait until all goroutines exit
-		rdb                *redis.Client
+		ID                      string
+		PoolName                string
+		poolStream              *streaming.Stream // pool event stream for dispatching jobs
+		poolSink                *streaming.Sink   // pool event sink
+		nodeStream              *streaming.Stream // node event stream for receiving worker events
+		nodeReader              *streaming.Reader // node event reader
+		nodeKeepAliveMap        *rmap.Map         // node keep-alive timestamps indexed by ID
+		nodeShutdownMap         *rmap.Map         // key is node ID that requested shutdown
+		workerMap               *rmap.Map         // worker creation times by ID
+		workerKeepAliveMap      *rmap.Map         // worker keep-alive timestamps indexed by ID
+		workerCleanupMap        *rmap.Map         // key is stale worker ID that needs cleanup
+		jobMap                  *rmap.Map         // jobs by worker ID
+		jobPendingMap           *rmap.Map         // pending jobs by job key
+		jobPayloadMap           *rmap.Map         // job payloads by job key
+		tickerMap               *rmap.Map         // ticker next tick time indexed by name
+		schedulerJobMap         *rmap.Map         // generation-fenced scheduler-owned jobs
+		workerTTL               time.Duration     // Worker considered dead if keep-alive not updated after this duration
+		requeueTimeout          time.Duration     // Bounds one local worker requeue handoff attempt
+		dispatchTimeout         time.Duration
+		dispatchResultRetention time.Duration
+		recoveryGrace           time.Duration
+		cleanupLease            time.Duration
+		maxQueuedJobs           int
+		clientOnly              bool
+		logger                  pulse.Logger
+		h                       hasher
+		resources               poolResources
+		stop                    chan struct{}  // closed when node is stopped
+		closed                  chan struct{}  // closed when node is closed
+		wg                      sync.WaitGroup // allows to wait until all goroutines exit
+		scheduleCtx             context.Context
+		scheduleCancel          context.CancelFunc
+		scheduleWG              sync.WaitGroup
+		settlements             *dispatchSettlements
+		rdb                     *redis.Client
 
 		localWorkers       sync.Map // workers created by this node
 		workerStreams      sync.Map // worker streams indexed by ID
 		nodeStreams        sync.Map // streams for worker acks indexed by ID
-		pendingJobChannels sync.Map // channels used to send DispatchJob results, nil if event is requeued
+		pendingJobChannels sync.Map // dispatch nonce -> *dispatchWaiter
 		pendingEvents      sync.Map // pending events indexed by sender and event IDs
 		orphanedPayloads   sync.Map // job key -> first time observed orphaned payload (unix nanos)
 
-		lock     sync.RWMutex
-		closing  bool
-		shutdown bool
+		dispatchWaitersLock  sync.Mutex
+		closeLock            sync.Mutex
+		stopOnce             sync.Once
+		shutdownOnce         sync.Once
+		terminalOnce         sync.Once
+		lock                 sync.RWMutex
+		closing              bool
+		closedState          bool
+		shutdown             bool
+		cleanupComplete      bool
+		closeAfterCleanupErr error
+	}
+
+	// dispatchWaiter owns one admitted dispatch until its worker result arrives
+	// or its persisted guard expires.
+	dispatchWaiter struct {
+		done chan struct{}
+		once sync.Once
+		refs atomic.Int64
+	}
+
+	// dispatchRecord is the Redis-owned publication and terminal outcome for
+	// one globally unique dispatch ID.
+	dispatchRecord struct {
+		status  int64
+		eventID string
+		result  string
+		err     string
 	}
 
 	// hasher is the interface implemented by types that can hash keys.
@@ -78,6 +116,9 @@ type (
 )
 
 const (
+	// shutdownErrorPoll bounds how quickly the initiator observes a peer's
+	// authoritative close failure.
+	shutdownErrorPoll = 100 * time.Millisecond
 	// evInit is the event used to initialize a node or worker stream.
 	evInit string = "i"
 	// evStartJob is the event used to send new job to workers.
@@ -90,9 +131,6 @@ const (
 	evStopJob string = "s"
 	// evAck is the worker event used to ack a pool event.
 	evAck string = "a"
-	// evDispatchReturn is the event used to forward the worker start return
-	// status to the node that dispatched the job.
-	evDispatchReturn string = "d"
 )
 
 // pendingEventTTL is the TTL for pending events.
@@ -101,9 +139,97 @@ var pendingEventTTL = 2 * time.Minute
 var (
 	// ErrJobExists is returned when attempting to dispatch a job with a key that already exists.
 	ErrJobExists = errors.New("job already exists")
+	// ErrPoolCapacity is returned when active pending dispatches have reached
+	// the generation's immutable MaxQueuedJobs contract.
+	ErrPoolCapacity = errors.New("pool dispatch capacity reached")
+	// ErrDispatchConflict is returned when a dispatch ID is reused with
+	// different exact job key or payload bytes.
+	ErrDispatchConflict = errors.New("pool dispatch idempotency conflict")
+	// ErrPoolGenerationLost is returned when a node mutates an inactive pool.
+	ErrPoolGenerationLost = errors.New("pool generation lost")
+	// ErrPoolConfigMismatch is returned when node configuration differs from
+	// the active generation's immutable configuration.
+	ErrPoolConfigMismatch = errors.New("pool configuration mismatch")
+	// ErrQuiescenceRequired is returned when legacy resources prove that old
+	// pool writers are still active during a hard upgrade.
+	ErrQuiescenceRequired = errors.New("pool quiescence required")
 
 	errJobAwaitingOwner = errors.New("job awaiting active owner")
 	errJobNotFound      = errors.New("job not found")
+
+	// registerPoolNodeScript linearizes node registration against shutdown and
+	// final cleanup, verifies the exact pool incarnation, and publishes the
+	// keep-alive map update in the same operation.
+	registerPoolNodeScript = redis.NewScript(`
+if redis.call("HGET", KEYS[1], "state") ~= ARGV[3] or
+   redis.call("HGET", KEYS[1], "generation") ~= ARGV[2] then
+    return redis.error_reply("POOLGENERATIONLOST")
+end
+if redis.call("HGET", KEYS[3], ARGV[4]) then
+    return {2}
+end
+for _, state in ipairs(redis.call("HVALS", KEYS[5])) do
+    if state == "finishing" then
+        return {0}
+    end
+end
+if redis.call("HEXISTS", KEYS[2], "shutdown") == 1 then
+    return {0}
+end
+local now = redis.call("TIME")
+local timestamp = now[1] .. string.format("%06d", now[2]) .. "000"
+redis.call("HSET", KEYS[3], ARGV[1], timestamp)
+local rev = tostring(redis.call("HINCRBY", KEYS[3], "=rev", 1))
+redis.call("HSET", KEYS[3], "=kind", "set")
+local msg = struct.pack(
+    "ic0ic0ic0",
+    string.len(ARGV[1]), ARGV[1],
+    string.len(timestamp), timestamp,
+    string.len(rev), rev
+)
+redis.call("PUBLISH", KEYS[4], "set:" .. msg)
+return {1, timestamp}
+`)
+
+	// refreshPoolNodeScript renews an existing node through shutdown but
+	// rejects a stale-node cleanup fence or removed registration.
+	refreshPoolNodeScript = redis.NewScript(`
+if redis.call("HGET", KEYS[1], "state") ~= ARGV[3] or
+   redis.call("HGET", KEYS[1], "generation") ~= ARGV[2] then
+    return redis.error_reply("POOLGENERATIONLOST")
+end
+if redis.call("HGET", KEYS[2], ARGV[4])
+or not redis.call("HGET", KEYS[2], ARGV[1]) then
+    return redis.error_reply("NODECLEANUPLOST")
+end
+local now = redis.call("TIME")
+local timestamp = now[1] .. string.format("%06d", now[2]) .. "000"
+redis.call("HSET", KEYS[2], ARGV[1], timestamp)
+local rev = tostring(redis.call("HINCRBY", KEYS[2], "=rev", 1))
+redis.call("HSET", KEYS[2], "=kind", "set")
+local msg = struct.pack(
+    "ic0ic0ic0",
+    string.len(ARGV[1]), ARGV[1],
+    string.len(timestamp), timestamp,
+    string.len(rev), rev
+)
+redis.call("PUBLISH", KEYS[3], "set:" .. msg)
+return timestamp
+`)
+
+	// publishPoolShutdownScript records the distributed shutdown obligation and
+	// emits the rmap wire notification without depending on a local map handle
+	// that a concurrent Close may already have closed.
+	publishPoolShutdownScript = redis.NewScript(`
+local key = "shutdown"
+local value = ARGV[1]
+redis.call("HSET", KEYS[1], key, value)
+local rev = tostring(redis.call("HINCRBY", KEYS[1], "=rev", 1))
+redis.call("HSET", KEYS[1], "=kind", "set")
+local msg = struct.pack("ic0ic0ic0", string.len(key), key, string.len(value), value, string.len(rev), rev)
+redis.call("PUBLISH", KEYS[2], "set:" .. msg)
+return rev
+`)
 )
 
 // AddNode adds a new node to the pool with the given name and returns it. The
@@ -114,8 +240,11 @@ var (
 // The options WithClientOnly can be used to create a node that can only be used
 // to dispatch jobs. Such a node does not route or process jobs in the
 // background.
-func AddNode(ctx context.Context, poolName string, rdb *redis.Client, opts ...NodeOption) (*Node, error) {
+func AddNode(ctx context.Context, poolName string, rdb *redis.Client, opts ...NodeOption) (_ *Node, resultErr error) {
 	o := parseOptions(opts...)
+	if err := validateNodeOptions(o); err != nil {
+		return nil, fmt.Errorf("AddNode: %w", err)
+	}
 	logger := o.logger
 	nodeID := ulid.Make().String()
 	if logger == nil {
@@ -127,32 +256,67 @@ func AddNode(ctx context.Context, poolName string, rdb *redis.Client, opts ...No
 		"client_only", o.clientOnly,
 		"max_queued_jobs", o.maxQueuedJobs,
 		"worker_ttl", o.workerTTL,
-		"worker_shutdown_ttl", o.workerShutdownTTL,
-		"ack_grace_period", o.ackGracePeriod)
-
-	nsm, err := rmap.Join(ctx, nodeShutdownMapName(poolName), rdb, rmap.WithLogger(logger))
-	if err != nil {
-		return nil, fmt.Errorf("AddNode: failed to join shutdown replicated map %q: %w", nodeShutdownMapName(poolName), err)
-	}
-	if nsm.Len() > 0 {
-		return nil, fmt.Errorf("AddNode: pool %q is shutting down", poolName)
-	}
-
-	nkm, err := rmap.Join(ctx, nodeKeepAliveMapName(poolName), rdb, rmap.WithLogger(logger))
-	if err != nil {
-		return nil, fmt.Errorf("AddNode: failed to join node keep-alive map %q: %w", nodeKeepAliveMapName(poolName), err)
-	}
-	if _, err := nkm.Set(ctx, nodeID, strconv.FormatInt(time.Now().UnixNano(), 10)); err != nil {
-		return nil, fmt.Errorf("AddNode: failed to set initial node keep-alive: %w", err)
-	}
+		"worker_requeue_timeout", o.requeueTimeout,
+		"dispatch_timeout", o.dispatchTimeout,
+		"dispatch_result_retention", o.dispatchResultRetention,
+		"recovery_grace", o.recoveryGrace,
+		"cleanup_lease", o.cleanupLease)
 
 	poolStream, err := streaming.NewStream(poolStreamName(poolName), rdb,
-		options.WithStreamMaxLen(o.maxQueuedJobs),
+		options.WithUnboundedStream(),
 		options.WithStreamLogger(logger))
 	if err != nil {
 		return nil, fmt.Errorf("AddNode: failed to create pool job stream %q: %w", poolStreamName(poolName), err)
 	}
+	if err := resumeExpiredPoolCleanup(ctx, poolName, nodeID, o.cleanupLease, rdb); err != nil {
+		return nil, fmt.Errorf("AddNode: %w", err)
+	}
+	if err := poolStream.Open(ctx); err != nil {
+		return nil, fmt.Errorf("AddNode: failed to open pool job stream %q: %w", poolStreamName(poolName), err)
+	}
+	resources, err := establishPoolResources(
+		ctx,
+		rdb,
+		poolName,
+		poolStream.Generation(),
+		o.maxQueuedJobs,
+		o.workerTTL,
+		o.cleanupLease,
+		o.dispatchResultRetention,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("AddNode: %w", err)
+	}
+	nsm, err := rmap.Join(ctx, resources.nodeShutdown, rdb, rmap.WithLogger(logger))
+	if err != nil {
+		return nil, fmt.Errorf("AddNode: failed to join shutdown replicated map %q: %w", resources.nodeShutdown, err)
+	}
+	shutdownUpdates := nsm.Subscribe()
+	if nsm.Len() > 0 {
+		nsm.Unsubscribe(shutdownUpdates)
+		nsm.Close()
+		return nil, fmt.Errorf("AddNode: pool %q is shutting down", poolName)
+	}
 
+	nkm, err := rmap.Join(ctx, resources.nodeKeepAlive, rdb, rmap.WithLogger(logger))
+	if err != nil {
+		nsm.Unsubscribe(shutdownUpdates)
+		nsm.Close()
+		return nil, fmt.Errorf("AddNode: failed to join node keep-alive map %q: %w", resources.nodeKeepAlive, err)
+	}
+	registered, _, err := registerPoolNode(ctx, rdb, resources, nodeID)
+	if err != nil {
+		nkm.Close()
+		nsm.Unsubscribe(shutdownUpdates)
+		nsm.Close()
+		return nil, fmt.Errorf("AddNode: failed to register node: %w", err)
+	}
+	if !registered {
+		nkm.Close()
+		nsm.Unsubscribe(shutdownUpdates)
+		nsm.Close()
+		return nil, fmt.Errorf("AddNode: pool %q is shutting down", poolName)
+	}
 	var (
 		wm   *rmap.Map
 		jm   *rmap.Map
@@ -160,66 +324,118 @@ func AddNode(ctx context.Context, poolName string, rdb *redis.Client, opts ...No
 		jpem *rmap.Map
 		wkm  *rmap.Map
 		tm   *rmap.Map
+		sjm  *rmap.Map
 		wcm  *rmap.Map
 
-		poolSink   *streaming.Sink
-		nodeStream *streaming.Stream
-		nodeReader *streaming.Reader
-		closed     chan struct{}
+		poolSink         *streaming.Sink
+		nodeStream       *streaming.Stream
+		nodeReader       *streaming.Reader
+		nodeStreamActive bool
+		setupComplete    bool
 	)
+	// Registration is the first externally visible setup step. Every later
+	// failure unwinds local resources and that registration in reverse order.
+	defer func() {
+		if setupComplete {
+			return
+		}
+		var rollbackErr error
+		if nodeReader != nil {
+			nodeReader.Close()
+		}
+		if nodeStreamActive {
+			if err := nodeStream.Destroy(context.WithoutCancel(ctx)); err != nil {
+				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("destroy node stream: %w", err))
+			}
+		}
+		if poolSink != nil {
+			if err := poolSink.Close(context.WithoutCancel(ctx)); err != nil {
+				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("close pool sink: %w", err))
+			}
+		}
+		for _, m := range []*rmap.Map{jpem, wcm, sjm, tm, wkm, jpm, jm, wm} {
+			if m != nil {
+				m.Close()
+			}
+		}
+		if _, err := nkm.Delete(context.WithoutCancel(ctx), nodeID); err != nil {
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("remove node registration: %w", err))
+		}
+		nkm.Close()
+		nsm.Unsubscribe(shutdownUpdates)
+		nsm.Close()
+		if rollbackErr != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("AddNode: rollback failed: %w", rollbackErr))
+		}
+	}()
+	registrationCtx, stopRegistrationLease := context.WithCancel(ctx)
+	registrationLeaseDone := make(chan struct{})
+	pulse.Go(logger, func() {
+		maintainNodeRegistrationLease(registrationCtx, rdb, resources, nodeID, o.workerTTL, logger)
+		close(registrationLeaseDone)
+	})
+	defer func() {
+		stopRegistrationLease()
+		<-registrationLeaseDone
+	}()
 
 	if !o.clientOnly {
-		wm, err = rmap.Join(ctx, workerMapName(poolName), rdb, rmap.WithLogger(logger))
+		wm, err = rmap.Join(ctx, resources.workers, rdb, rmap.WithLogger(logger))
 		if err != nil {
-			return nil, fmt.Errorf("AddNode: failed to join pool workers replicated map %q: %w", workerMapName(poolName), err)
+			return nil, fmt.Errorf("AddNode: failed to join pool workers replicated map %q: %w", resources.workers, err)
 		}
 		workerIDs := wm.Keys()
 		logger.Info("joined", "workers", workerIDs)
 
-		jm, err = rmap.Join(ctx, jobMapName(poolName), rdb, rmap.WithLogger(logger))
+		jm, err = rmap.Join(ctx, resources.jobs, rdb, rmap.WithLogger(logger))
 		if err != nil {
-			return nil, fmt.Errorf("AddNode: failed to join pool jobs replicated map %q: %w", jobMapName(poolName), err)
+			return nil, fmt.Errorf("AddNode: failed to join pool jobs replicated map %q: %w", resources.jobs, err)
 		}
 
-		jpm, err = rmap.Join(ctx, jobPayloadMapName(poolName), rdb, rmap.WithLogger(logger))
+		jpm, err = rmap.Join(ctx, resources.jobPayloads, rdb, rmap.WithLogger(logger))
 		if err != nil {
-			return nil, fmt.Errorf("AddNode: failed to join pool job payloads replicated map %q: %w", jobPayloadMapName(poolName), err)
+			return nil, fmt.Errorf("AddNode: failed to join pool job payloads replicated map %q: %w", resources.jobPayloads, err)
 		}
 
-		wkm, err = rmap.Join(ctx, workerKeepAliveMapName(poolName), rdb, rmap.WithLogger(logger))
+		wkm, err = rmap.Join(ctx, resources.workerKeepAlive, rdb, rmap.WithLogger(logger))
 		if err != nil {
-			return nil, fmt.Errorf("AddNode: failed to join worker keep-alive replicated map %q: %w", workerKeepAliveMapName(poolName), err)
+			return nil, fmt.Errorf("AddNode: failed to join worker keep-alive replicated map %q: %w", resources.workerKeepAlive, err)
 		}
 
-		tm, err = rmap.Join(ctx, tickerMapName(poolName), rdb, rmap.WithLogger(logger))
+		tm, err = rmap.Join(ctx, resources.tickers, rdb, rmap.WithLogger(logger))
 		if err != nil {
-			return nil, fmt.Errorf("AddNode: failed to join pool ticker replicated map %q: %w", tickerMapName(poolName), err)
+			return nil, fmt.Errorf("AddNode: failed to join pool ticker replicated map %q: %w", resources.tickers, err)
 		}
 
-		wcm, err = rmap.Join(ctx, workerCleanupMapName(poolName), rdb, rmap.WithLogger(logger))
+		sjm, err = rmap.Join(ctx, resources.schedulerJobs, rdb, rmap.WithLogger(logger))
 		if err != nil {
-			return nil, fmt.Errorf("AddNode: failed to join pool cleanup replicated map %q: %w", workerCleanupMapName(poolName), err)
+			return nil, fmt.Errorf("AddNode: failed to join scheduler jobs replicated map %q: %w", resources.schedulerJobs, err)
+		}
+
+		wcm, err = rmap.Join(ctx, resources.workerCleanup, rdb, rmap.WithLogger(logger))
+		if err != nil {
+			return nil, fmt.Errorf("AddNode: failed to join pool cleanup replicated map %q: %w", resources.workerCleanup, err)
 		}
 
 		// Initialize and join pending jobs map
-		jpem, err = rmap.Join(ctx, jobPendingMapName(poolName), rdb, rmap.WithLogger(logger))
+		jpem, err = rmap.Join(ctx, resources.jobPending, rdb, rmap.WithLogger(logger))
 		if err != nil {
-			return nil, fmt.Errorf("AddNode: failed to join pending jobs replicated map %q: %w", jobPendingMapName(poolName), err)
+			return nil, fmt.Errorf("AddNode: failed to join pending jobs replicated map %q: %w", resources.jobPending, err)
 		}
 
 		poolSink, err = poolStream.NewSink(ctx, "events",
 			options.WithSinkBlockDuration(o.jobSinkBlockDuration),
-			options.WithSinkAckGracePeriod(o.ackGracePeriod))
+			options.WithSinkAckGracePeriod(o.recoveryGrace))
 		if err != nil {
 			return nil, fmt.Errorf("AddNode: failed to create events sink for stream %q: %w", poolStreamName(poolName), err)
 		}
-		closed = make(chan struct{})
 	}
 
 	nodeStream, err = streaming.NewStream(nodeStreamName(poolName, nodeID), rdb, options.WithStreamLogger(logger))
 	if err != nil {
 		return nil, fmt.Errorf("AddNode: failed to create node event stream %q: %w", nodeStreamName(poolName, nodeID), err)
 	}
+	nodeStreamActive = true
 	if _, err = nodeStream.Add(ctx, evInit, []byte(nodeID)); err != nil {
 		return nil, fmt.Errorf("AddNode: failed to add init event to node event stream %q: %w", nodeStreamName(poolName, nodeID), err)
 	}
@@ -229,62 +445,86 @@ func AddNode(ctx context.Context, poolName string, rdb *redis.Client, opts ...No
 		return nil, fmt.Errorf("AddNode: failed to create node event reader for stream %q: %w", nodeStreamName(poolName, nodeID), err)
 	}
 
+	scheduleCtx, scheduleCancel := context.WithCancel(context.Background())
 	p := &Node{
-		ID:                 nodeID,
-		PoolName:           poolName,
-		nodeKeepAliveMap:   nkm,
-		nodeShutdownMap:    nsm,
-		workerMap:          wm,
-		workerKeepAliveMap: wkm,
-		workerCleanupMap:   wcm,
-		jobMap:             jm,
-		jobPayloadMap:      jpm,
-		jobPendingMap:      jpem,
-		tickerMap:          tm,
-		workerStreams:      sync.Map{},
-		nodeStreams:        sync.Map{},
-		pendingJobChannels: sync.Map{},
-		pendingEvents:      sync.Map{},
-		poolStream:         poolStream,
-		poolSink:           poolSink,
-		nodeStream:         nodeStream,
-		nodeReader:         nodeReader,
-		clientOnly:         o.clientOnly,
-		workerTTL:          o.workerTTL,
-		workerShutdownTTL:  o.workerShutdownTTL,
-		ackGracePeriod:     o.ackGracePeriod,
-		h:                  &jumpHash{h: crc64.New(crc64.MakeTable(crc64.ECMA))},
-		stop:               make(chan struct{}),
-		closed:             closed,
-		rdb:                rdb,
-		logger:             logger,
+		ID:                      nodeID,
+		PoolName:                poolName,
+		nodeKeepAliveMap:        nkm,
+		nodeShutdownMap:         nsm,
+		workerMap:               wm,
+		workerKeepAliveMap:      wkm,
+		workerCleanupMap:        wcm,
+		jobMap:                  jm,
+		jobPayloadMap:           jpm,
+		jobPendingMap:           jpem,
+		tickerMap:               tm,
+		schedulerJobMap:         sjm,
+		workerStreams:           sync.Map{},
+		nodeStreams:             sync.Map{},
+		pendingJobChannels:      sync.Map{},
+		pendingEvents:           sync.Map{},
+		poolStream:              poolStream,
+		poolSink:                poolSink,
+		nodeStream:              nodeStream,
+		nodeReader:              nodeReader,
+		clientOnly:              o.clientOnly,
+		workerTTL:               resources.workerTTL,
+		requeueTimeout:          o.requeueTimeout,
+		dispatchTimeout:         o.dispatchTimeout,
+		dispatchResultRetention: o.dispatchResultRetention,
+		recoveryGrace:           o.recoveryGrace,
+		cleanupLease:            o.cleanupLease,
+		maxQueuedJobs:           o.maxQueuedJobs,
+		resources:               resources,
+		h:                       &jumpHash{h: crc64.New(crc64.MakeTable(crc64.ECMA))},
+		stop:                    make(chan struct{}),
+		closed:                  make(chan struct{}),
+		scheduleCtx:             scheduleCtx,
+		scheduleCancel:          scheduleCancel,
+		settlements:             newDispatchSettlements(),
+		rdb:                     rdb,
+		logger:                  logger,
 	}
 
 	nch := nodeReader.Subscribe()
 
-	if o.clientOnly {
-		logger.Info("client-only")
-		p.wg.Add(3)
-		pulse.Go(logger, func() { p.handleNodeEvents(nch) }) // to handle job acks
-		pulse.Go(logger, func() { p.processInactiveNodes() })
-		pulse.Go(logger, func() { p.updateNodeKeepAlive() })
-		return p, nil
-	}
-
-	// create new logger context for goroutines.
+	// Preserve the caller's logging context for background goroutines.
 	logCtx := context.Background()
 	logCtx = log.WithContext(logCtx, ctx)
 
-	p.wg.Add(8) // Increment for all background goroutines
-	pulse.Go(logger, func() { p.handlePoolEvents(poolSink.Subscribe()) })
-	pulse.Go(logger, func() { p.handleNodeEvents(nch) })
-	pulse.Go(logger, func() { p.watchWorkers(logCtx) })
-	pulse.Go(logger, func() { p.watchShutdown(logCtx) })
-	pulse.Go(logger, func() { p.processInactiveNodes() })
-	pulse.Go(logger, func() { p.processInactiveWorkers(logCtx) })
-	pulse.Go(logger, func() { p.processInactiveJobs(logCtx) })
-	pulse.Go(logger, func() { p.updateNodeKeepAlive() })
+	if o.clientOnly {
+		logger.Info("client-only")
+		p.wg.Add(4)
+		pulse.Go(logger, func() { p.handleNodeEvents(nch) }) // to handle job acks
+		pulse.Go(logger, func() { p.watchShutdown(logCtx, shutdownUpdates) })
+		pulse.Go(logger, func() { p.processInactiveNodes() })
+		pulse.Go(logger, func() { p.updateNodeKeepAlive() })
+	} else {
+		p.wg.Add(7) // Increment for all background goroutines
+		pulse.Go(logger, func() { p.handlePoolEvents(poolSink.Subscribe()) })
+		pulse.Go(logger, func() { p.handleNodeEvents(nch) })
+		pulse.Go(logger, func() { p.watchWorkers(logCtx) })
+		pulse.Go(logger, func() { p.watchShutdown(logCtx, shutdownUpdates) })
+		pulse.Go(logger, func() { p.processInactiveNodes() })
+		pulse.Go(logger, func() { p.processInactiveWorkers(logCtx) })
+		pulse.Go(logger, func() { p.updateNodeKeepAlive() })
+	}
 
+	shuttingDown, err := rdb.HExists(ctx, rmapContentKey(resources.nodeShutdown), "shutdown").Result()
+	if err != nil {
+		if closeErr := p.close(ctx, true); closeErr != nil {
+			return nil, errors.Join(
+				fmt.Errorf("AddNode: failed post-registration shutdown check: %w", err),
+				fmt.Errorf("AddNode: failed to close node after shutdown check: %w", closeErr),
+			)
+		}
+		return nil, fmt.Errorf("AddNode: failed post-registration shutdown check: %w", err)
+	}
+	if shuttingDown {
+		p.ownShutdown(logCtx)
+	}
+
+	setupComplete = true
 	return p, nil
 }
 
@@ -293,11 +533,16 @@ func AddNode(ctx context.Context, poolName string, rdb *redis.Client, opts ...No
 // NotificationHandler and MessageHandler interfaces to handle job-scoped
 // notifications and hash-routed messages.
 func (node *Node) AddWorker(ctx context.Context, handler JobHandler) (*Worker, error) {
-	if node.IsClosed() {
+	node.lock.RLock()
+	defer node.lock.RUnlock()
+	if node.closing {
 		return nil, fmt.Errorf("AddWorker: pool %q is closed", node.PoolName)
 	}
 	if node.clientOnly {
 		return nil, fmt.Errorf("AddWorker: pool %q is client-only", node.PoolName)
+	}
+	if err := node.ensureGenerationActive(ctx); err != nil {
+		return nil, fmt.Errorf("AddWorker: %w", err)
 	}
 	w, err := newWorker(ctx, node, handler)
 	if err != nil {
@@ -311,11 +556,23 @@ func (node *Node) AddWorker(ctx context.Context, handler JobHandler) (*Worker, e
 // RemoveWorker stops the worker, removes it from the pool and requeues all its
 // jobs.
 func (node *Node) RemoveWorker(ctx context.Context, w *Worker) error {
-	w.stop(ctx)
-	if err := w.requeueJobs(ctx); err != nil {
-		node.logger.Error(fmt.Errorf("RemoveWorker: failed to requeue jobs for worker %q: %w", w.ID, err))
+	node.lock.RLock()
+	defer node.lock.RUnlock()
+	if node.closing {
+		return fmt.Errorf("RemoveWorker: pool %q is closed", node.PoolName)
 	}
-	node.removeWorker(ctx, w.ID)
+	if err := w.stop(ctx); err != nil {
+		return fmt.Errorf("RemoveWorker: failed to stop worker %q: %w", w.ID, err)
+	}
+	if err := node.settlements.waitWorker(ctx, w.ID); err != nil {
+		return fmt.Errorf("RemoveWorker: terminal outcomes for worker %q remain unsettled: %w", w.ID, err)
+	}
+	if err := w.requeueJobs(ctx); err != nil {
+		return fmt.Errorf("RemoveWorker: failed to requeue jobs for worker %q: %w", w.ID, err)
+	}
+	if err := node.removeWorker(ctx, w.ID); err != nil {
+		return fmt.Errorf("RemoveWorker: failed to remove worker %q: %w", w.ID, err)
+	}
 	node.localWorkers.Delete(w.ID)
 	node.logger.Info("removed worker", "worker", w.ID)
 	return nil
@@ -360,16 +617,50 @@ func (node *Node) PoolWorkers() []*Worker {
 //
 // The method blocks until one of the above conditions is met.
 func (node *Node) DispatchJob(ctx context.Context, key string, payload []byte) error {
-	job := marshalJob(&Job{Key: key, Payload: payload, CreatedAt: time.Now(), NodeID: node.ID})
-	return node.dispatchJob(ctx, key, job)
+	_, err := node.DispatchJobOnce(ctx, ulid.Make().String(), key, payload)
+	return err
+}
+
+// DispatchJobOnce atomically publishes one start event for dispatchID and
+// waits for its worker result. Retrying the same dispatchID returns the same
+// Redis event ID and never starts a duplicate handler.
+func (node *Node) DispatchJobOnce(
+	ctx context.Context,
+	dispatchID, key string,
+	payload []byte,
+) (string, error) {
+	node.lock.RLock()
+	defer node.lock.RUnlock()
+	if node.closing {
+		return "", fmt.Errorf("DispatchJob: pool %q is closed", node.PoolName)
+	}
+	if err := node.ensureGenerationActive(ctx); err != nil {
+		return "", fmt.Errorf("DispatchJob: %w", err)
+	}
+	if dispatchID == "" {
+		return "", fmt.Errorf("DispatchJob: dispatch ID cannot be empty")
+	}
+	job := &Job{
+		Key:        key,
+		Payload:    payload,
+		CreatedAt:  time.Now(),
+		NodeID:     node.ID,
+		dispatchID: dispatchID,
+	}
+	return node.dispatchJob(ctx, dispatchID, key, job)
 }
 
 // DispatchMessage sends a keyed message to the worker currently assigned by the
 // pool hash ring. Messages do not create job ownership and are intended for
 // fire-and-forget work that should be load-balanced by key.
 func (node *Node) DispatchMessage(ctx context.Context, key string, payload []byte) error {
-	if node.IsClosed() {
+	node.lock.RLock()
+	defer node.lock.RUnlock()
+	if node.closing {
 		return fmt.Errorf("DispatchMessage: pool %q is closed", node.PoolName)
+	}
+	if err := node.ensureGenerationActive(ctx); err != nil {
+		return fmt.Errorf("DispatchMessage: %w", err)
 	}
 	if _, err := node.poolStream.Add(ctx, evMessage, marshalKeyedPayload(key, payload)); err != nil {
 		return fmt.Errorf("DispatchMessage: failed to add message to stream %q: %w", node.poolStream.Name, err)
@@ -378,128 +669,384 @@ func (node *Node) DispatchMessage(ctx context.Context, key string, payload []byt
 	return nil
 }
 
-func (node *Node) dispatchJob(ctx context.Context, key string, job []byte) error {
-	if node.IsClosed() {
-		return fmt.Errorf("DispatchJob: pool %q is closed", node.PoolName)
-	}
+func (node *Node) dispatchJob(ctx context.Context, dispatchID, key string, job *Job) (string, error) {
+	waiter := node.acquireDispatchWaiter(dispatchID)
+	defer node.releaseDispatchWaiter(dispatchID, waiter)
 
-	pendingTS, err := node.claimDispatch(ctx, key)
+	record, err := node.publishDispatchRecord(ctx, key, dispatchID, job.Payload, marshalJob(job))
 	if err != nil {
-		return err
+		return "", err
 	}
-
-	eventID, err := node.poolStream.Add(ctx, evStartJob, job)
+	if record.status == dispatchTerminal {
+		return record.eventID, dispatchTerminalError(record)
+	}
+	identity, err := dispatchIdentity(key, job.Payload)
 	if err != nil {
-		// Clean up pending entry on failure
-		node.releaseDispatchPending(key, pendingTS)
-		return fmt.Errorf("DispatchJob: failed to add job to stream %q: %w", node.poolStream.Name, err)
+		return record.eventID, err
 	}
-
-	cherr := make(chan error, 1)
-	node.pendingJobChannels.Store(eventID, cherr)
-
-	timer := time.NewTimer(2 * node.ackGracePeriod)
-	defer timer.Stop()
-
-	select {
-	case err = <-cherr:
-	case <-timer.C:
-		err = fmt.Errorf("DispatchJob: job %q timed out, TTL: %v", key, 2*node.ackGracePeriod)
-	case <-ctx.Done():
-		err = ctx.Err()
-	}
-
-	node.pendingJobChannels.Delete(eventID)
-	close(cherr)
-
-	// Clean up pending entry
-	node.releaseDispatchPending(key, pendingTS)
-
+	record, err = node.awaitDispatch(ctx, waiter, dispatchID, identity, record)
 	if err != nil {
 		node.logger.Error(fmt.Errorf("DispatchJob: failed to dispatch job: %w", err), "key", key)
-		return err
+		return record.eventID, err
 	}
-
 	node.logger.Info("dispatched", "key", key)
-	return nil
+	return record.eventID, dispatchTerminalError(record)
 }
 
-// claimDispatch atomically decides whether a job key may be dispatched. Redis is
-// the source of truth for both states that matter to singleton admission: a
-// durable payload means the job is already running, and a pending guard means a
-// worker is currently starting it.
-func (node *Node) claimDispatch(ctx context.Context, key string) (string, error) {
+// awaitDispatch treats local completion as a wake-up hint and Redis as the
+// authoritative terminal state. Polling is bounded by DispatchTimeout and each
+// wake, cancellation, or timeout edge performs one final durable read.
+func (node *Node) awaitDispatch(
+	ctx context.Context,
+	waiter *dispatchWaiter,
+	dispatchID string,
+	identity []byte,
+	record dispatchRecord,
+) (dispatchRecord, error) {
+	poll := min(50*time.Millisecond, node.dispatchTimeout)
+	ticker := time.NewTicker(poll)
+	defer ticker.Stop()
+	timer := time.NewTimer(node.dispatchTimeout)
+	defer timer.Stop()
+	for {
+		var edgeErr error
+		select {
+		case <-waiter.done:
+		case <-ticker.C:
+		case <-timer.C:
+			edgeErr = fmt.Errorf(
+				"DispatchJob: dispatch %q timed out after %v",
+				dispatchID,
+				node.dispatchTimeout,
+			)
+		case <-ctx.Done():
+			edgeErr = ctx.Err()
+		}
+		var (
+			current dispatchRecord
+			err     error
+		)
+		if edgeErr != nil {
+			current, err = node.readDispatchRecordAfterEdge(ctx, dispatchID, identity)
+		} else {
+			current, err = node.readDispatchRecord(ctx, dispatchID, identity)
+		}
+		if err != nil {
+			return record, err
+		}
+		record = current
+		if record.status == dispatchTerminal {
+			return record, nil
+		}
+		if edgeErr != nil {
+			return record, edgeErr
+		}
+	}
+}
+
+// readDispatchRecordAfterEdge gives cancellation one bounded authoritative
+// Redis read so a concurrently committed terminal result wins the race.
+func (node *Node) readDispatchRecordAfterEdge(
+	ctx context.Context,
+	dispatchID string,
+	identity []byte,
+) (dispatchRecord, error) {
+	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 100*time.Millisecond)
+	defer cancel()
+	return node.readDispatchRecord(readCtx, dispatchID, identity)
+}
+
+// acquireDispatchWaiter joins all local callers for one dispatch ID to the
+// same completion broadcast without racing the final caller's removal.
+func (node *Node) acquireDispatchWaiter(dispatchID string) *dispatchWaiter {
+	node.dispatchWaitersLock.Lock()
+	defer node.dispatchWaitersLock.Unlock()
+	candidate := &dispatchWaiter{done: make(chan struct{})}
+	value, _ := node.pendingJobChannels.LoadOrStore(dispatchID, candidate)
+	waiter := value.(*dispatchWaiter)
+	waiter.refs.Add(1)
+	return waiter
+}
+
+// releaseDispatchWaiter removes the local completion broadcast only after the
+// final joined caller has stopped waiting.
+func (node *Node) releaseDispatchWaiter(dispatchID string, waiter *dispatchWaiter) {
+	node.dispatchWaitersLock.Lock()
+	defer node.dispatchWaitersLock.Unlock()
+	if waiter.refs.Add(-1) == 0 {
+		node.pendingJobChannels.CompareAndDelete(dispatchID, waiter)
+	}
+}
+
+// publishDispatch atomically admits and appends one generation-fenced start
+// event and durable exact-identity record.
+func (node *Node) publishDispatchRecord(
+	ctx context.Context,
+	key, dispatchID string,
+	jobPayload, eventPayload []byte,
+) (dispatchRecord, error) {
 	if key == "" {
-		return "", fmt.Errorf("DispatchJob: job key cannot be empty")
+		return dispatchRecord{}, fmt.Errorf("DispatchJob: job key cannot be empty")
 	}
 	if strings.Contains(key, "=") {
-		return "", fmt.Errorf("DispatchJob: job key %q cannot contain '='", key)
+		return dispatchRecord{}, fmt.Errorf("DispatchJob: job key %q cannot contain '='", key)
 	}
-	now := time.Now()
-	pendingUntil := strconv.FormatInt(now.Add(2*node.ackGracePeriod).UnixNano(), 10)
-	raw, err := luaClaimDispatch.Run(ctx, node.rdb, []string{
-		rmapContentKey(jobPayloadMapName(node.PoolName)),
-		rmapContentKey(jobPendingMapName(node.PoolName)),
-		rmapUpdateChannel(jobPendingMapName(node.PoolName)),
-	}, key, strconv.FormatInt(now.UnixNano(), 10), pendingUntil).Result()
+	identity, err := dispatchIdentity(key, jobPayload)
 	if err != nil {
-		return "", fmt.Errorf("DispatchJob: failed to claim job %q: %w", key, err)
+		return dispatchRecord{}, err
 	}
-	status, value, err := parseDispatchClaim(raw)
+	raw, err := luaDispatchJob.Run(ctx, node.rdb, []string{
+		fmt.Sprintf("pulse:stream:%s:lifecycle", node.poolStream.Name),
+		rmapContentKey(node.resources.jobPayloads),
+		rmapContentKey(node.resources.jobPending),
+		rmapUpdateChannel(node.resources.jobPending),
+		dispatchRecordKey(node.resources.dispatches, dispatchID),
+		dispatchActiveKey(node.resources.dispatches),
+		rmapContentKey(node.resources.nodeKeepAlive),
+	},
+		key,
+		dispatchID,
+		"active",
+		node.resources.generation,
+		node.maxQueuedJobs,
+		evStartJob,
+		eventPayload,
+		"physical_key",
+		identity,
+		node.ID,
+		nodeCleanupField(node.ID),
+	).Result()
 	if err != nil {
-		return "", fmt.Errorf("DispatchJob: failed to parse claim result for job %q: %w", key, err)
+		if redis.HasErrorPrefix(err, "DISPATCHIDEMPOTENCYCONFLICT") {
+			return dispatchRecord{}, fmt.Errorf("%w: dispatch %q", ErrDispatchConflict, dispatchID)
+		}
+		return dispatchRecord{}, fmt.Errorf("DispatchJob: failed to claim job %q: %w", key, poolBoundaryError(err))
 	}
-	switch status {
-	case dispatchClaimed:
-		return value, nil
+	record, err := parseDispatchRecord(raw)
+	if err != nil {
+		return dispatchRecord{}, fmt.Errorf("DispatchJob: failed to parse claim result for job %q: %w", key, err)
+	}
+	switch record.status {
+	case dispatchClaimed, dispatchTerminal:
+		return record, nil
 	case dispatchAlreadyPending:
 		node.logger.Info("DispatchJob: job already dispatched", "key", key)
-		return "", fmt.Errorf("%w: job %q is already dispatched", ErrJobExists, key)
+		return dispatchRecord{}, fmt.Errorf("%w: job %q is already dispatched", ErrJobExists, key)
 	case dispatchAlreadyRunning:
 		node.logger.Info("DispatchJob: job already exists", "key", key)
-		return "", fmt.Errorf("%w: job %q", ErrJobExists, key)
-	case dispatchMalformedPending:
-		return "", fmt.Errorf("DispatchJob: malformed pending guard for job %q: %q", key, value)
+		return dispatchRecord{}, fmt.Errorf("%w: job %q", ErrJobExists, key)
+	case dispatchCapacityReached:
+		return dispatchRecord{}, fmt.Errorf("%w: maximum %d pending jobs", ErrPoolCapacity, node.maxQueuedJobs)
 	default:
-		return "", fmt.Errorf("DispatchJob: unexpected claim status %d for job %q", status, key)
+		return dispatchRecord{}, fmt.Errorf("DispatchJob: unexpected claim status %d for job %q", record.status, key)
 	}
 }
 
-// releaseDispatchPending clears the pending guard only if this dispatch still
-// owns it. Dispatch callers can time out while another node later claims a
-// stale pending key, so unconditional deletion would erase a newer guard.
-func (node *Node) releaseDispatchPending(key, pendingTS string) {
-	if _, err := luaReleaseDispatch.Run(context.Background(), node.rdb, []string{
-		rmapContentKey(jobPendingMapName(node.PoolName)),
-		rmapUpdateChannel(jobPendingMapName(node.PoolName)),
-	}, key, pendingTS).Result(); err != nil {
-		node.logger.Error(fmt.Errorf("DispatchJob: failed to clean up pending entry for job %q: %w", key, err))
+// publishDispatch admits a marshaled job for focused package tests.
+func (node *Node) publishDispatch(
+	ctx context.Context,
+	key, dispatchID string,
+	eventPayload []byte,
+) (string, error) {
+	job, err := unmarshalJob(eventPayload)
+	if err != nil {
+		return "", err
 	}
+	record, err := node.publishDispatchRecord(ctx, key, dispatchID, job.Payload, eventPayload)
+	return record.eventID, err
 }
 
-// parseDispatchClaim decodes the Lua admission result into its status code and
-// payload. The script owns the result schema so malformed data is a programming
-// error, not a recoverable distributed state.
-func parseDispatchClaim(raw any) (int64, string, error) {
+// settleDispatch durably records one terminal result and settles its exact
+// stream event. Exact retries return the original immutable outcome.
+func (node *Node) settleDispatch(ctx context.Context, key, dispatchID string, resultErr error) (dispatchRecord, error) {
+	errorText := ""
+	if resultErr != nil {
+		errorText = resultErr.Error()
+	}
+	raw, err := luaSettleDispatch.Run(ctx, node.rdb, []string{
+		fmt.Sprintf("pulse:stream:%s:lifecycle", node.poolStream.Name),
+		rmapContentKey(node.resources.jobPending),
+		rmapUpdateChannel(node.resources.jobPending),
+		dispatchRecordKey(node.resources.dispatches, dispatchID),
+		dispatchActiveKey(node.resources.dispatches),
+	}, key, dispatchID, "active", node.resources.generation, "physical_key",
+		"", errorText, "events", node.dispatchResultRetention.Milliseconds()).Result()
+	if err != nil {
+		return dispatchRecord{}, fmt.Errorf("settle dispatch %q: %w", key, poolBoundaryError(err))
+	}
+	record, err := parseTerminalDispatch(raw)
+	if err != nil {
+		return dispatchRecord{}, fmt.Errorf("settle dispatch %q: %w", key, err)
+	}
+	node.dispatchWaitersLock.Lock()
+	if value, ok := node.pendingJobChannels.Load(dispatchID); ok {
+		waiter := value.(*dispatchWaiter)
+		waiter.once.Do(func() {
+			close(waiter.done)
+		})
+	}
+	node.dispatchWaitersLock.Unlock()
+	return record, nil
+}
+
+// readDispatchRecord returns the exact Redis-owned status for one dispatch.
+func (node *Node) readDispatchRecord(
+	ctx context.Context,
+	dispatchID string,
+	identity []byte,
+) (dispatchRecord, error) {
+	raw, err := readDispatchRecordScript.Run(
+		ctx,
+		node.rdb,
+		[]string{
+			fmt.Sprintf("pulse:stream:%s:lifecycle", node.poolStream.Name),
+			dispatchRecordKey(node.resources.dispatches, dispatchID),
+		},
+		"active",
+		node.resources.generation,
+		identity,
+	).Result()
+	if err != nil {
+		switch {
+		case redis.HasErrorPrefix(err, "DISPATCHIDEMPOTENCYCONFLICT"):
+			return dispatchRecord{}, fmt.Errorf("%w: dispatch %q", ErrDispatchConflict, dispatchID)
+		case redis.HasErrorPrefix(err, "DISPATCHRECORDNOTFOUND"):
+			return dispatchRecord{}, fmt.Errorf(
+				"DispatchJob: durable record for dispatch %q is unavailable",
+				dispatchID,
+			)
+		default:
+			return dispatchRecord{}, fmt.Errorf(
+				"DispatchJob: read durable dispatch %q: %w",
+				dispatchID,
+				poolBoundaryError(err),
+			)
+		}
+	}
+	record, err := parseDispatchRecord(raw)
+	if err != nil {
+		return dispatchRecord{}, fmt.Errorf("DispatchJob: parse durable dispatch %q: %w", dispatchID, err)
+	}
+	return record, nil
+}
+
+// completeDispatch settles a successful dispatch for focused package tests.
+func (node *Node) completeDispatch(ctx context.Context, key, dispatchID string) error {
+	_, err := node.settleDispatch(ctx, key, dispatchID, nil)
+	return err
+}
+
+// parseDispatchRecord validates the durable admission result boundary.
+func parseDispatchRecord(raw any) (dispatchRecord, error) {
 	values, ok := raw.([]any)
-	if !ok || len(values) != 2 {
-		return 0, "", fmt.Errorf("invalid claim result %T", raw)
+	if !ok || len(values) != 4 {
+		return dispatchRecord{}, fmt.Errorf("invalid dispatch result %T", raw)
 	}
 	status, ok := values[0].(int64)
 	if !ok {
-		return 0, "", fmt.Errorf("invalid claim status %T", values[0])
+		return dispatchRecord{}, fmt.Errorf("invalid dispatch status %T", values[0])
 	}
-	value, ok := values[1].(string)
-	if !ok {
-		return 0, "", fmt.Errorf("invalid claim value %T", values[1])
+	decoded := make([]string, 3)
+	for i := range decoded {
+		value, ok := values[i+1].(string)
+		if !ok {
+			return dispatchRecord{}, fmt.Errorf("invalid dispatch field %d type %T", i, values[i+1])
+		}
+		decoded[i] = value
 	}
-	return status, value, nil
+	return dispatchRecord{status: status, eventID: decoded[0], result: decoded[1], err: decoded[2]}, nil
 }
 
-// StopJob stops the job with the given key.
+// parseTerminalDispatch validates an atomic settlement result.
+func parseTerminalDispatch(raw any) (dispatchRecord, error) {
+	values, ok := raw.([]any)
+	if !ok || len(values) != 3 {
+		return dispatchRecord{}, fmt.Errorf("invalid terminal dispatch result %T", raw)
+	}
+	decoded := make([]string, len(values))
+	for i, value := range values {
+		text, ok := value.(string)
+		if !ok {
+			return dispatchRecord{}, fmt.Errorf("invalid terminal dispatch field %d type %T", i, value)
+		}
+		decoded[i] = text
+	}
+	return dispatchRecord{
+		status:  dispatchTerminal,
+		eventID: decoded[0],
+		result:  decoded[1],
+		err:     decoded[2],
+	}, nil
+}
+
+// dispatchTerminalError reconstructs the public terminal error text persisted
+// by the worker settlement owner.
+func dispatchTerminalError(record dispatchRecord) error {
+	if record.err == "" {
+		return nil
+	}
+	return errors.New(record.err)
+}
+
+// dispatchIdentity length-prefixes exact key and payload bytes.
+func dispatchIdentity(key string, payload []byte) ([]byte, error) {
+	var identity bytes.Buffer
+	for _, field := range [][]byte{[]byte(key), payload} {
+		if err := binary.Write(&identity, binary.BigEndian, uint64(len(field))); err != nil {
+			return nil, fmt.Errorf("encode dispatch identity: %w", err)
+		}
+		if _, err := identity.Write(field); err != nil {
+			return nil, fmt.Errorf("encode dispatch identity: %w", err)
+		}
+	}
+	return identity.Bytes(), nil
+}
+
+// dispatchRecordToken produces a collision-free Redis hash field namespace.
+func dispatchRecordToken(dispatchID string) string {
+	return hex.EncodeToString([]byte(dispatchID))
+}
+
+// dispatchRecordKey returns one generation-qualified per-dispatch Redis hash.
+func dispatchRecordKey(resource, dispatchID string) string {
+	return fmt.Sprintf(
+		"pulse:pool:dispatch:%s:%s",
+		hex.EncodeToString([]byte(resource)),
+		dispatchRecordToken(dispatchID),
+	)
+}
+
+// dispatchActiveKey indexes only unsettled records for exact cleanup.
+func dispatchActiveKey(resource string) string {
+	return fmt.Sprintf("pulse:pool:dispatch:%s:active", hex.EncodeToString([]byte(resource)))
+}
+
+// poolBoundaryError maps Redis-owned pool contracts to typed public errors.
+func poolBoundaryError(err error) error {
+	switch {
+	case redis.HasErrorPrefix(err, "POOLGENERATIONLOST"):
+		return fmt.Errorf("%w: %v", ErrPoolGenerationLost, err)
+	case redis.HasErrorPrefix(err, "NODECLEANUPLOST"):
+		return fmt.Errorf("%w: %v", ErrPoolGenerationLost, err)
+	case redis.HasErrorPrefix(err, "POOLCONFIGMISMATCH"):
+		return fmt.Errorf("%w: %v", ErrPoolConfigMismatch, err)
+	case redis.HasErrorPrefix(err, "POOLQUIESCENCEREQUIRED"):
+		return fmt.Errorf("%w: %v", ErrQuiescenceRequired, err)
+	default:
+		return err
+	}
+}
+
+// StopJob durably publishes a stop request for the job with the given key.
+// Success means Redis accepted the request, not that the handler has completed.
 func (node *Node) StopJob(ctx context.Context, key string) error {
-	if node.IsClosed() {
+	node.lock.RLock()
+	defer node.lock.RUnlock()
+	if node.closing {
 		return fmt.Errorf("StopJob: pool %q is closed", node.PoolName)
+	}
+	if err := node.ensureGenerationActive(ctx); err != nil {
+		return fmt.Errorf("StopJob: %w", err)
 	}
 	if _, err := node.poolStream.Add(ctx, evStopJob, marshalJobKey(key)); err != nil {
 		return fmt.Errorf("StopJob: failed to add stop job to stream %q: %w", node.poolStream.Name, err)
@@ -540,14 +1087,60 @@ func (node *Node) JobPayload(key string) ([]byte, bool) {
 // NotifyWorker notifies the worker that currently owns the job with the given
 // key.
 func (node *Node) NotifyWorker(ctx context.Context, key string, payload []byte) error {
-	if node.IsClosed() {
+	node.lock.RLock()
+	defer node.lock.RUnlock()
+	if node.closing {
 		return fmt.Errorf("NotifyWorker: pool %q is closed", node.PoolName)
+	}
+	if err := node.ensureGenerationActive(ctx); err != nil {
+		return fmt.Errorf("NotifyWorker: %w", err)
 	}
 	if _, err := node.poolStream.Add(ctx, evNotify, marshalKeyedPayload(key, payload)); err != nil {
 		return fmt.Errorf("NotifyWorker: failed to add notification to stream %q: %w", node.poolStream.Name, err)
 	}
 	node.logger.Info("notification sent", "key", key)
 	return nil
+}
+
+// ensureGenerationActive fences every node-owned mutation against the exact
+// pool stream incarnation. Cleanup invalidates the stream before deleting its
+// maps, so a successful preflight can only race with deletion that follows it;
+// once deletion completes, stale nodes fail before recreating any old key.
+func (node *Node) ensureGenerationActive(ctx context.Context) error {
+	err := node.poolStream.Open(ctx)
+	if err == nil {
+		_, refreshErr := refreshPoolNode(ctx, node.rdb, node.resources, node.ID)
+		if refreshErr == nil {
+			return nil
+		}
+		if strings.Contains(refreshErr.Error(), "NODECLEANUPLOST") {
+			node.stopAfterLifecycleLoss("stale node cleanup fence", false)
+		}
+		return fmt.Errorf("%w: %v", ErrPoolGenerationLost, refreshErr)
+	}
+	if errors.Is(err, streaming.ErrStreamDestroyed) {
+		node.stopAfterLifecycleLoss("pool generation ended", true)
+	}
+	return fmt.Errorf("%w: %v", ErrPoolGenerationLost, err)
+}
+
+// stopAfterLifecycleLoss immediately fences local admission and asynchronously
+// closes the node after a Redis-owned terminal lifecycle transition.
+func (node *Node) stopAfterLifecycleLoss(reason string, shutdown bool) {
+	node.lock.Lock()
+	closing := node.closing
+	node.closing = true
+	node.lock.Unlock()
+	if closing {
+		return
+	}
+	node.terminalOnce.Do(func() {
+		pulse.Go(node.logger, func() {
+			if closeErr := node.closeAfterDistributedLoss(context.Background(), shutdown); closeErr != nil {
+				node.logger.Error(fmt.Errorf("stop node after %s: %w", reason, closeErr))
+			}
+		})
+	})
 }
 
 // Shutdown stops the pool workers gracefully across all nodes. It notifies all
@@ -557,29 +1150,211 @@ func (node *Node) NotifyWorker(ctx context.Context, key string, payload []byte) 
 // discarded. One of Shutdown or Close should be called before the node is
 // garbage collected unless it is client-only.
 func (node *Node) Shutdown(ctx context.Context) error {
-	if node.IsClosed() {
-		return nil
-	}
 	if node.clientOnly {
 		return fmt.Errorf("Shutdown: client-only node cannot shutdown worker pool")
 	}
-
-	// Signal all nodes to shutdown.
-	if _, err := node.nodeShutdownMap.Set(ctx, "shutdown", node.ID); err != nil {
-		node.logger.Error(fmt.Errorf("Shutdown: failed to set shutdown status in shutdown map: %w", err))
+	node.lock.RLock()
+	cleanupComplete := node.cleanupComplete
+	node.lock.RUnlock()
+	if cleanupComplete {
+		return node.closeAfterCleanup(ctx)
 	}
-	<-node.closed // Wait for this node to be closed
-	node.cleanupPool(ctx)
+	cleanupComplete, err := node.poolCleanupComplete(ctx)
+	if err != nil {
+		return err
+	}
+	if cleanupComplete {
+		node.lock.Lock()
+		node.cleanupComplete = true
+		node.lock.Unlock()
+		return node.closeAfterCleanup(ctx)
+	}
+	// Publish through Redis directly because concurrent Close may already have
+	// closed the local shutdown-map replica. The obligation must exist before
+	// this caller joins or resumes the distributed barrier.
+	if err := node.publishShutdown(ctx); err != nil {
+		return err
+	}
+	if err := node.close(ctx, true); err != nil {
+		return fmt.Errorf("Shutdown: failed to close local node: %w", err)
+	}
+	if err := node.waitForPoolNodes(ctx); err != nil {
+		return err
+	}
+	if err := node.cleanupPool(ctx); err != nil {
+		return err
+	}
 
+	node.lock.Lock()
+	node.cleanupComplete = true
+	node.shutdown = true
+	node.lock.Unlock()
 	node.logger.Info("shutdown")
 	return nil
 }
 
-// Close stops the node workers and closes the Redis connection but does
-// not stop workers running in other nodes. It requeues all the jobs run by
-// workers of the node. One of Shutdown or Close should be called before the
-// node is garbage collected unless it is client-only.
+// publishShutdown durably records this node's pool-wide shutdown obligation.
+func (node *Node) publishShutdown(ctx context.Context) error {
+	err := publishPoolShutdownScript.Run(
+		ctx,
+		node.rdb,
+		[]string{
+			rmapContentKey(node.resources.nodeShutdown),
+			rmapUpdateChannel(node.resources.nodeShutdown),
+		},
+		node.ID,
+	).Err()
+	if err != nil {
+		return fmt.Errorf("Shutdown: failed to publish distributed shutdown obligation: %w", err)
+	}
+	return nil
+}
+
+// poolCleanupComplete reads this pool-stream generation's durable completion
+// marker. Local closure and distributed cleanup completion are separate states.
+func (node *Node) poolCleanupComplete(ctx context.Context) (bool, error) {
+	values, err := node.rdb.HMGet(
+		ctx,
+		poolCleanupGenerationsKey(node.PoolName),
+		"state",
+		"generation",
+	).Result()
+	if err != nil {
+		return false, fmt.Errorf("Shutdown: failed to read pool cleanup completion: %w", err)
+	}
+	state, _ := values[0].(string)
+	generation, _ := values[1].(string)
+	return state == poolCleanupCompleteState && generation == node.poolStream.Generation(), nil
+}
+
+// registerPoolNode reserves and publishes the node's authoritative lease only
+// while its exact pool generation is active and shutdown/final cleanup are
+// absent.
+func registerPoolNode(
+	ctx context.Context,
+	rdb *redis.Client,
+	resources poolResources,
+	nodeID string,
+) (bool, string, error) {
+	result, err := registerPoolNodeScript.Run(
+		ctx,
+		rdb,
+		[]string{
+			fmt.Sprintf("pulse:stream:%s:lifecycle", poolStreamName(resources.pool)),
+			rmapContentKey(resources.nodeShutdown),
+			rmapContentKey(resources.nodeKeepAlive),
+			rmapUpdateChannel(resources.nodeKeepAlive),
+			poolCleanupGenerationsKey(resources.pool),
+		},
+		nodeID,
+		resources.generation,
+		"active",
+		nodeCleanupField(nodeID),
+	).Slice()
+	if err != nil {
+		return false, "", err
+	}
+	if len(result) == 0 {
+		return false, "", fmt.Errorf("registration script returned no status")
+	}
+	status, ok := result[0].(int64)
+	if !ok {
+		return false, "", fmt.Errorf("registration script returned invalid status %T", result[0])
+	}
+	if status == 0 {
+		return false, "", nil
+	}
+	if status == 2 {
+		return false, "", errors.New("NODECLEANUPLOST")
+	}
+	if len(result) != 2 {
+		return false, "", fmt.Errorf("registration script returned %d values", len(result))
+	}
+	timestamp, ok := result[1].(string)
+	if !ok {
+		return false, "", fmt.Errorf("registration script returned invalid timestamp %T", result[1])
+	}
+	return true, timestamp, nil
+}
+
+// refreshPoolNode renews an existing node heartbeat without reopening
+// admission during shutdown.
+func refreshPoolNode(
+	ctx context.Context,
+	rdb *redis.Client,
+	resources poolResources,
+	nodeID string,
+) (string, error) {
+	timestamp, err := refreshPoolNodeScript.Run(
+		ctx,
+		rdb,
+		[]string{
+			fmt.Sprintf("pulse:stream:%s:lifecycle", poolStreamName(resources.pool)),
+			rmapContentKey(resources.nodeKeepAlive),
+			rmapUpdateChannel(resources.nodeKeepAlive),
+		},
+		nodeID,
+		resources.generation,
+		"active",
+		nodeCleanupField(nodeID),
+	).Text()
+	return timestamp, err
+}
+
+// maintainNodeRegistrationLease keeps a node visible to the shutdown barrier
+// while AddNode constructs its streams and maps. The regular node heartbeat is
+// running before this temporary lease owner is stopped.
+func maintainNodeRegistrationLease(
+	ctx context.Context,
+	rdb *redis.Client,
+	resources poolResources,
+	nodeID string,
+	ttl time.Duration,
+	logger pulse.Logger,
+) {
+	ticker := time.NewTicker(ttl / 2)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			registered, _, err := registerPoolNode(ctx, rdb, resources, nodeID)
+			if err != nil {
+				logger.Error(fmt.Errorf("AddNode: failed to refresh registration time: %w", err))
+				continue
+			}
+			if !registered {
+				logger.Error(fmt.Errorf("AddNode: pool generation stopped accepting registrations"))
+				return
+			}
+		}
+	}
+}
+
+// Close immediately rejects new node work, stops local workers, requeues their
+// jobs, and detaches the node's Redis-owned resources. It does not close the
+// caller-owned Redis client or stop workers in other nodes. A distributed
+// detach failure is returned without marking the node closed, so Close may be
+// retried with a fresh context. One of Shutdown or Close should be called
+// before the node is garbage collected unless it is client-only.
 func (node *Node) Close(ctx context.Context) error {
+	node.lock.RLock()
+	cleanupComplete := node.cleanupComplete
+	node.lock.RUnlock()
+	if cleanupComplete {
+		return node.closeAfterCleanup(ctx)
+	}
+	cleanupComplete, err := node.poolCleanupComplete(ctx)
+	if err != nil {
+		return err
+	}
+	if cleanupComplete {
+		node.lock.Lock()
+		node.cleanupComplete = true
+		node.lock.Unlock()
+		return node.closeAfterCleanup(ctx)
+	}
 	return node.close(ctx, false)
 }
 
@@ -594,7 +1369,7 @@ func (node *Node) IsShutdown() bool {
 func (node *Node) IsClosed() bool {
 	node.lock.RLock()
 	defer node.lock.RUnlock()
-	return node.closing
+	return node.closedState
 }
 
 // close stops the node and its workers, optionally requeuing jobs. If shutdown
@@ -603,73 +1378,214 @@ func (node *Node) IsClosed() bool {
 // waits for background goroutines to complete, cleans up resources and closes
 // connections. It is idempotent and can be called multiple times safely.
 func (node *Node) close(ctx context.Context, shutdown bool) error {
+	node.closeLock.Lock()
+	defer node.closeLock.Unlock()
+
 	node.lock.Lock()
-	if node.closing {
+	if node.closedState {
 		node.lock.Unlock()
 		return nil
 	}
-	node.closing = true
+	if !node.closing {
+		node.closing = true
+	}
 	node.lock.Unlock()
 
-	// If we're shutting down then stop all the jobs.
+	node.scheduleCancel()
+	node.scheduleWG.Wait()
+
+	var stopJobsErr error
 	if shutdown {
-		node.stopAllJobs(ctx)
+		stopJobsErr = node.stopAllJobs(ctx)
 	}
 
-	// Stop all workers before waiting for goroutines.
-	//
-	// IMPORTANT: do NOT remove workers from the replicated maps here.
-	// Removing the worker deletes the worker->jobs mapping which is what other
-	// nodes use to recover/requeue jobs if this node dies mid-close. We only
-	// remove workers from maps after we've attempted to requeue.
-	var wg sync.WaitGroup
-	node.localWorkers.Range(func(key, value any) bool {
+	var workerStopErr error
+	var workerStopLock sync.Mutex
+	var workerStopWait sync.WaitGroup
+	node.localWorkers.Range(func(_, value any) bool {
 		worker := value.(*Worker)
-		wg.Add(1)
+		workerStopWait.Add(1)
 		pulse.Go(node.logger, func() {
-			defer wg.Done()
-			worker.stop(ctx)
+			defer workerStopWait.Done()
+			if err := worker.stop(ctx); err != nil {
+				workerStopLock.Lock()
+				workerStopErr = errors.Join(workerStopErr, err)
+				workerStopLock.Unlock()
+			}
 		})
 		return true
 	})
-	wg.Wait()
+	workerStopWait.Wait()
 
-	// Stop all goroutines
-	close(node.stop)
+	node.stopOnce.Do(func() {
+		close(node.stop)
+	})
 	node.wg.Wait()
-
-	// Requeue jobs if not shutting down.
-	//
-	// This is done after stopping node goroutines so we don't route any new pool
-	// events to workers that have already been stopped.
-	if !shutdown {
-		if err := node.requeueAllJobs(ctx); err != nil {
-			node.logger.Error(fmt.Errorf("close: failed to requeue jobs: %w", err))
-		}
+	var localTeardownErr error
+	if stopJobsErr != nil {
+		localTeardownErr = errors.Join(
+			localTeardownErr,
+			fmt.Errorf("close: failed to stop jobs: %w", stopJobsErr),
+		)
+	}
+	if workerStopErr != nil {
+		localTeardownErr = errors.Join(
+			localTeardownErr,
+			fmt.Errorf("close: failed to stop workers: %w", workerStopErr),
+		)
+	}
+	if err := node.settlements.waitAll(ctx); err != nil {
+		localTeardownErr = errors.Join(
+			localTeardownErr,
+			fmt.Errorf("close: terminal dispatch outcomes remain unsettled: %w", err),
+		)
+	}
+	if localTeardownErr != nil {
+		return localTeardownErr
 	}
 
-	// Now that we attempted requeue, remove all local workers from pool maps.
+	// Requeue and distributed worker cleanup are retried on every Close attempt.
+	// A worker remains locally discoverable until all of its map records are
+	// removed, so a failed attempt cannot hide incomplete cleanup.
+	if !shutdown {
+		if err := node.requeueAllJobs(ctx); err != nil {
+			return fmt.Errorf("close: failed to requeue jobs: %w", err)
+		}
+	}
+	var workerCleanupErr error
 	node.localWorkers.Range(func(key, value any) bool {
 		worker := value.(*Worker)
-		node.removeWorker(ctx, worker.ID)
+		if err := node.removeWorker(ctx, worker.ID); err != nil {
+			workerCleanupErr = errors.Join(workerCleanupErr, err)
+			return true
+		}
 		node.localWorkers.Delete(key)
 		return true
 	})
+	if workerCleanupErr != nil {
+		return fmt.Errorf("close: failed to remove local workers: %w", workerCleanupErr)
+	}
 
-	// Cleanup resources
-	node.cleanupNode(ctx)
+	// Detach distributed membership before closing the maps needed to retry it.
+	// Local goroutines were stopped above on the first attempt, so subsequent
+	// calls repeat only these idempotent distributed side effects.
+	if node.poolSink != nil {
+		if err := node.poolSink.Close(ctx); err != nil {
+			return fmt.Errorf("close: pending distributed cleanup: failed to detach pool sink: %w", err)
+		}
+	}
+	node.pendingEvents.Range(func(key, _ any) bool {
+		node.pendingEvents.Delete(key)
+		return true
+	})
+	node.pendingJobChannels.Range(func(key, _ any) bool {
+		node.pendingJobChannels.Delete(key)
+		return true
+	})
+	if _, err := node.nodeKeepAliveMap.Delete(ctx, node.ID); err != nil {
+		return fmt.Errorf("close: pending distributed cleanup: failed to detach node from pool: %w", err)
+	}
 
-	// Signal that the node is closed
+	// Local stream destruction is part of distributed cleanup. Keep the maps
+	// open until it succeeds so Close can retry truthfully.
+	if err := node.cleanupNode(ctx); err != nil {
+		return fmt.Errorf("close: pending distributed cleanup: %w", err)
+	}
+
+	// Publish closure and shutdown ownership atomically after all node-owned
+	// side effects complete.
+	node.lock.Lock()
+	node.closedState = true
+	if shutdown {
+		node.shutdown = true
+	}
+	node.lock.Unlock()
 	close(node.closed)
-
 	node.logger.Info("closed")
 	return nil
 }
 
+// closeAfterCleanup performs every local teardown obligation after another
+// process has already destroyed the distributed pool generation. No Redis
+// resource deletion is attempted, but local intake, schedules, workers,
+// readers, settlement goroutines, maps, and public closure state are joined.
+func (node *Node) closeAfterCleanup(ctx context.Context) error {
+	return node.closeAfterDistributedLoss(ctx, true)
+}
+
+// closeAfterDistributedLoss performs complete local teardown after Redis has
+// fenced this node or destroyed its pool generation.
+func (node *Node) closeAfterDistributedLoss(ctx context.Context, shutdown bool) error {
+	node.closeLock.Lock()
+	defer node.closeLock.Unlock()
+
+	node.lock.Lock()
+	if node.closedState {
+		node.shutdown = node.shutdown || shutdown
+		err := node.closeAfterCleanupErr
+		node.lock.Unlock()
+		return err
+	}
+	node.closing = true
+	node.lock.Unlock()
+
+	node.scheduleCancel()
+	node.scheduleWG.Wait()
+	node.localWorkers.Range(func(key, value any) bool {
+		value.(*Worker).stopLocal()
+		node.localWorkers.Delete(key)
+		return true
+	})
+	node.stopOnce.Do(func() {
+		close(node.stop)
+	})
+	if node.nodeReader != nil {
+		node.nodeReader.Close()
+	}
+	node.wg.Wait()
+
+	var teardownErr error
+	if err := node.settlements.waitAll(ctx); err != nil {
+		teardownErr = errors.Join(
+			teardownErr,
+			fmt.Errorf("close after distributed cleanup: local terminal settlements: %w", err),
+		)
+	}
+	if node.poolSink != nil {
+		if err := node.poolSink.Close(ctx); err != nil {
+			teardownErr = errors.Join(teardownErr, fmt.Errorf("close local pool sink: %w", err))
+		}
+	}
+	for _, m := range node.maps() {
+		if m != nil {
+			m.Close()
+		}
+	}
+	node.pendingEvents.Range(func(key, _ any) bool {
+		node.pendingEvents.Delete(key)
+		return true
+	})
+	node.pendingJobChannels.Range(func(key, _ any) bool {
+		node.pendingJobChannels.Delete(key)
+		return true
+	})
+
+	node.lock.Lock()
+	node.closedState = true
+	node.shutdown = shutdown
+	node.closeAfterCleanupErr = teardownErr
+	node.lock.Unlock()
+	close(node.closed)
+	node.logger.Info("closed after distributed lifecycle loss")
+	return teardownErr
+}
+
 // stopAllJobs stops all jobs running on the node.
-func (node *Node) stopAllJobs(ctx context.Context) {
+func (node *Node) stopAllJobs(ctx context.Context) error {
 	var wg sync.WaitGroup
 	var total atomic.Int32
+	var stopErr error
+	var errLock sync.Mutex
 	node.localWorkers.Range(func(key, value any) bool {
 		wg.Add(1)
 		worker := value.(*Worker)
@@ -678,6 +1594,9 @@ func (node *Node) stopAllJobs(ctx context.Context) {
 			for _, job := range worker.Jobs() {
 				if err := worker.stopJob(ctx, job.Key); err != nil {
 					node.logger.Error(fmt.Errorf("Close: failed to stop job %q for worker %q: %w", job.Key, worker.ID, err))
+					errLock.Lock()
+					stopErr = errors.Join(stopErr, err)
+					errLock.Unlock()
 				}
 				total.Add(1)
 			}
@@ -686,6 +1605,7 @@ func (node *Node) stopAllJobs(ctx context.Context) {
 	})
 	wg.Wait()
 	node.logger.Info("stopped all jobs", "total", total.Load())
+	return stopErr
 }
 
 // handlePoolEvents reads events from the pool job stream.
@@ -694,12 +1614,14 @@ func (node *Node) handlePoolEvents(c <-chan *streaming.Event) {
 
 	for {
 		select {
-		case ev := <-c:
+		case ev, ok := <-c:
+			if !ok {
+				return
+			}
 			if err := node.routeWorkerEvent(ev); err != nil {
 				node.logger.Error(fmt.Errorf("handlePoolEvents: failed to route event: %w", err))
 			}
 		case <-node.stop:
-			node.poolSink.Close(context.Background())
 			return
 		}
 	}
@@ -708,17 +1630,36 @@ func (node *Node) handlePoolEvents(c <-chan *streaming.Event) {
 // routeWorkerEvent routes a dispatched event to the proper worker.
 func (node *Node) routeWorkerEvent(ev *streaming.Event) error {
 	// Filter out stale events
-	if time.Since(ev.CreatedAt()) > pendingEventTTL {
-		node.logger.Debug("routeWorkerEvent: stale event, not routing", "event", ev.EventName, "id", ev.ID, "since", time.Since(ev.CreatedAt()), "TTL", pendingEventTTL)
+	now, err := node.rdb.Time(context.Background()).Result()
+	if err != nil {
+		return fmt.Errorf("routeWorkerEvent: read Redis time: %w", err)
+	}
+	age := now.Sub(ev.CreatedAt())
+	if age > pendingEventTTL && ev.EventName != evStartJob {
+		node.logger.Debug("routeWorkerEvent: stale event, not routing", "event", ev.EventName, "id", ev.ID, "since", age, "TTL", pendingEventTTL)
+		settled, err := node.releaseTerminalDispatch(ev, errors.New("pool event expired before routing"))
+		if err != nil {
+			node.logger.Error(err, "event", ev.EventName, "id", ev.ID)
+		}
 		// Ack the sink event so it does not get redelivered.
-		if err := node.poolSink.Ack(context.Background(), ev); err != nil {
+		if !settled {
+			err = node.settlePoolEvent(context.Background(), ev)
+		}
+		if err != nil {
 			node.logger.Error(fmt.Errorf("routeWorkerEvent: failed to ack event: %w", err), "event", ev.EventName, "id", ev.ID)
 		}
 		return nil
 	}
 
 	// Compute the worker ID that will handle the event key.
-	key := unmarshalJobKey(ev.Payload)
+	key, err := poolEventKey(ev)
+	if err != nil {
+		node.logger.Error(fmt.Errorf("routeWorkerEvent: malformed event: %w", err), "event", ev.EventName, "id", ev.ID)
+		if ackErr := node.settlePoolEvent(context.Background(), ev); ackErr != nil {
+			return fmt.Errorf("routeWorkerEvent: acknowledge malformed event %s: %w", ev.ID, ackErr)
+		}
+		return nil
+	}
 	wid, err := node.workerForEvent(ev.EventName, key)
 	if err != nil {
 		if errors.Is(err, errJobAwaitingOwner) {
@@ -726,7 +1667,7 @@ func (node *Node) routeWorkerEvent(ev *streaming.Event) error {
 			return nil
 		}
 		if errors.Is(err, errJobNotFound) {
-			if ackErr := node.poolSink.Ack(context.Background(), ev); ackErr != nil {
+			if ackErr := node.settlePoolEvent(context.Background(), ev); ackErr != nil {
 				node.logger.Error(fmt.Errorf("routeWorkerEvent: failed to ack event for missing job: %w", ackErr), "event", ev.EventName, "id", ev.ID)
 			}
 			return nil
@@ -743,12 +1684,68 @@ func (node *Node) routeWorkerEvent(ev *streaming.Event) error {
 	if err != nil {
 		return fmt.Errorf("routeWorkerEvent: failed to add event %s to worker stream %q: %w", ev.EventName, workerStreamName(wid), err)
 	}
+	if eventID == "" {
+		settled, settleErr := node.releaseTerminalDispatch(ev, errors.New("no worker accepted dispatch"))
+		if settleErr != nil {
+			return settleErr
+		}
+		if !settled {
+			if err := node.settlePoolEvent(context.Background(), ev); err != nil {
+				return fmt.Errorf("routeWorkerEvent: failed to acknowledge unroutable event %s: %w", ev.ID, err)
+			}
+		}
+		return nil
+	}
 	node.logger.Debug("routed", "event", ev.EventName, "id", ev.ID, "worker", wid, "worker-event-id", eventID)
 
 	// Record the event in the pending events map for future ack.
 	node.pendingEvents.Store(pendingEventKey(wid, eventID), ev)
 
 	return nil
+}
+
+// releaseTerminalDispatch clears singleton admission when routing has
+// definitively discarded a start event before any worker could process it.
+func (node *Node) releaseTerminalDispatch(event *streaming.Event, cause error) (bool, error) {
+	if event.EventName != evStartJob {
+		return false, nil
+	}
+	job, err := unmarshalJob(event.Payload)
+	if err != nil {
+		return false, fmt.Errorf("release terminal dispatch: decode start job: %w", err)
+	}
+	if job.dispatchID != "" {
+		_, err := node.settleDispatch(context.Background(), job.Key, job.dispatchID, cause)
+		return err == nil, err
+	}
+	return false, nil
+}
+
+// poolEventKey decodes the exact wire shape selected by the event kind and
+// rejects trailing or incompatible data before routing.
+func poolEventKey(event *streaming.Event) (string, error) {
+	switch event.EventName {
+	case evStartJob:
+		job, err := unmarshalJob(event.Payload)
+		if err != nil {
+			return "", fmt.Errorf("decode start job: %w", err)
+		}
+		return job.Key, nil
+	case evMessage, evNotify:
+		key, _, err := unmarshalKeyedPayload(event.Payload)
+		if err != nil {
+			return "", fmt.Errorf("decode keyed event: %w", err)
+		}
+		return key, nil
+	case evStopJob:
+		key, err := unmarshalJobKey(event.Payload)
+		if err != nil {
+			return "", fmt.Errorf("decode stop job: %w", err)
+		}
+		return key, nil
+	default:
+		return "", fmt.Errorf("unknown pool event %q", event.EventName)
+	}
 }
 
 // handleNodeEvents reads events from the node event stream and acks the pending
@@ -758,7 +1755,10 @@ func (node *Node) handleNodeEvents(c <-chan *streaming.Event) {
 
 	for {
 		select {
-		case ev := <-c:
+		case ev, ok := <-c:
+			if !ok {
+				return
+			}
 			node.processNodeEvent(ev)
 		case <-node.stop:
 			node.nodeReader.Close()
@@ -777,19 +1777,22 @@ func (node *Node) processNodeEvent(ev *streaming.Event) {
 		// Event sent by worker to ack a dispatched job.
 		node.logger.Debug("handleNodeEvents: received ack", "event", ev.EventName, "id", ev.ID)
 		node.ackWorkerEvent(ev)
-	case evDispatchReturn:
-		// Event sent by pool node to node that originally dispatched the job.
-		node.logger.Debug("handleNodeEvents: received dispatch return", "event", ev.EventName, "id", ev.ID)
-		node.returnDispatchStatus(ev)
 	}
 }
 
-// ackWorkerEvent acks the pending event that corresponds to the acked job.  If
-// the event was a dispatched job then it sends a dispatch return event to the
-// node that dispatched the job.
+// ackWorkerEvent removes the routing node's local tracking after the worker has
+// durably settled the corresponding pool event.
 func (node *Node) ackWorkerEvent(ev *streaming.Event) {
-	workerID, payload := unmarshalEnvelope(ev.Payload)
-	ack := unmarshalAck(payload)
+	workerID, payload, err := unmarshalEnvelope(ev.Payload)
+	if err != nil {
+		node.dropMalformedNodeEvent(ev, fmt.Errorf("decode worker acknowledgement envelope: %w", err))
+		return
+	}
+	ack, err := unmarshalAck(payload)
+	if err != nil {
+		node.dropMalformedNodeEvent(ev, fmt.Errorf("decode worker acknowledgement: %w", err))
+		return
+	}
 	key := pendingEventKey(workerID, ack.EventID)
 	val, ok := node.pendingEvents.Load(key)
 	if !ok {
@@ -798,62 +1801,71 @@ func (node *Node) ackWorkerEvent(ev *streaming.Event) {
 	}
 	pending := val.(*streaming.Event)
 	ctx := context.Background()
+	dispatchSettled := false
 
 	// If a dispatched job then send a return event to the node that
 	// dispatched the job.
 	if pending.EventName == evStartJob {
-		_, nodeID := unmarshalJobKeyAndNodeID(pending.Payload)
-		stream, err := node.getNodeStream(nodeID)
+		job, err := unmarshalJob(pending.Payload)
 		if err != nil {
-			node.logger.Error(fmt.Errorf("ackWorkerEvent: failed to create node event stream %q: %w", nodeStreamName(node.PoolName, nodeID), err))
+			node.logger.Error(fmt.Errorf(
+				"ackWorkerEvent: decode pending start event %s: %w",
+				pending.ID,
+				err,
+			))
+			if ackErr := node.settlePoolEvent(context.Background(), pending); ackErr != nil {
+				node.logger.Error(fmt.Errorf("ackWorkerEvent: drop malformed pending event: %w", ackErr))
+				return
+			}
+			node.pendingEvents.Delete(key)
 			return
 		}
-		ack.EventID = pending.ID
-		if _, err := stream.Add(ctx, evDispatchReturn, marshalAck(ack), options.WithOnlyIfStreamExists()); err != nil {
-			node.logger.Error(fmt.Errorf("ackWorkerEvent: failed to dispatch return to stream %q: %w", nodeStreamName(node.PoolName, nodeID), err))
+		if !job.Requeued {
+			ack.JobKey = job.Key
+			if job.dispatchID != "" {
+				var resultErr error
+				if ack.Error != "" {
+					resultErr = errors.New(ack.Error)
+				}
+				if _, err := node.settleDispatch(ctx, job.Key, job.dispatchID, resultErr); err != nil {
+					node.logger.Error(err)
+					return
+				}
+				dispatchSettled = true
+			}
 		}
 	}
 
 	// Ack the sink event so it does not get redelivered.
-	if err := node.poolSink.Ack(ctx, pending); err != nil {
+	if !dispatchSettled {
+		err = node.settlePoolEvent(ctx, pending)
+	}
+	if err != nil {
 		node.logger.Error(fmt.Errorf("ackWorkerEvent: failed to ack event: %w", err), "event", pending.EventName, "id", pending.ID)
+		return
 	}
 	node.pendingEvents.Delete(key)
-
-	// Garbage collect stale events.
-	var staleKeys []string
-	node.pendingEvents.Range(func(key, value any) bool {
-		ev := value.(*streaming.Event)
-		if time.Since(ev.CreatedAt()) > pendingEventTTL {
-			staleKeys = append(staleKeys, key.(string))
-			node.logger.Error(fmt.Errorf("ackWorkerEvent: stale event, removing from pending events"), "event", ev.EventName, "id", ev.ID, "since", time.Since(ev.CreatedAt()), "TTL", pendingEventTTL)
-		}
-		return true
-	})
-	for _, key := range staleKeys {
-		node.pendingEvents.Delete(key)
-	}
 }
 
-// returnDispatchStatus returns the start job result to the caller.
-func (node *Node) returnDispatchStatus(ev *streaming.Event) {
-	ack := unmarshalAck(ev.Payload)
-	val, ok := node.pendingJobChannels.Load(ack.EventID)
-	if !ok {
-		node.logger.Error(fmt.Errorf("returnDispatchStatus: received dispatch return for unknown event"), "id", ack.EventID)
-		return
+// settlePoolEvent acknowledges and deletes one terminal pool-stream event.
+// The unbounded pool stream therefore retains only unsettled work.
+func (node *Node) settlePoolEvent(ctx context.Context, event *streaming.Event) error {
+	if err := node.poolSink.Ack(ctx, event); err != nil {
+		return err
 	}
-	node.logger.Debug("dispatch return", "event", ev.EventName, "id", ev.ID, "ack-id", ack.EventID)
-	if val == nil {
-		// Event was requeued, just clean up
-		node.pendingJobChannels.Delete(ack.EventID)
-		return
+	if err := node.poolStream.Remove(ctx, event.ID); err != nil {
+		return fmt.Errorf("delete settled pool event %s: %w", event.ID, err)
 	}
-	var err error
-	if ack.Error != "" {
-		err = errors.New(ack.Error)
+	return nil
+}
+
+// dropMalformedNodeEvent logs and removes a poison entry so the permanent node
+// reader remains live across restarts.
+func (node *Node) dropMalformedNodeEvent(event *streaming.Event, decodeErr error) {
+	node.logger.Error(decodeErr, "event", event.EventName, "id", event.ID)
+	if err := node.nodeStream.Remove(context.Background(), event.ID); err != nil {
+		node.logger.Error(fmt.Errorf("drop malformed node event %s: %w", event.ID, err))
 	}
-	val.(chan error) <- err
 }
 
 // workerForEvent returns the worker that should receive a pool event. Start and
@@ -890,7 +1902,7 @@ func (node *Node) workerForEvent(eventName, key string) (string, error) {
 // jobPayloadExists reads the durable job record from Redis, which is the source
 // of truth when the local ownership map has no active owner during handoff.
 func (node *Node) jobPayloadExists(ctx context.Context, key string) (bool, error) {
-	exists, err := node.rdb.HExists(ctx, rmapContentKey(jobPayloadMapName(node.PoolName)), key).Result()
+	exists, err := node.rdb.HExists(ctx, rmapContentKey(node.resources.jobPayloads), key).Result()
 	if err != nil {
 		return false, fmt.Errorf("routeWorkerEvent: failed to check job payload %q: %w", key, err)
 	}
@@ -952,6 +1964,10 @@ func (node *Node) handleWorkerMapUpdate(ctx context.Context) {
 	if node.IsClosed() {
 		return
 	}
+	if err := node.ensureGenerationActive(ctx); err != nil {
+		node.logger.Error(err)
+		return
+	}
 	// First cleanup the local workers that are no longer active.
 	node.localWorkers.Range(func(key, value any) bool {
 		worker := value.(*Worker)
@@ -962,7 +1978,10 @@ func (node *Node) handleWorkerMapUpdate(ctx context.Context) {
 			if err := node.deleteWorker(worker.ID); err != nil {
 				node.logger.Error(fmt.Errorf("handleWorkerMapUpdate: failed to delete inactive worker %q: %w", worker.ID, err), "worker", worker.ID)
 			}
-			worker.stop(ctx)
+			if err := worker.stop(ctx); err != nil {
+				node.logger.Error(fmt.Errorf("handleWorkerMapUpdate: failed to stop inactive worker %q: %w", worker.ID, err))
+				return true
+			}
 			node.localWorkers.Delete(key)
 			return true
 		}
@@ -981,39 +2000,86 @@ func (node *Node) handleWorkerMapUpdate(ctx context.Context) {
 	})
 }
 
-// watchShutdown monitors the pool shutdown map and initiates node shutdown when updated.
-func (node *Node) watchShutdown(ctx context.Context) {
+// watchShutdown monitors the subscription established before node registration,
+// so a shutdown concurrent with AddNode cannot be missed.
+func (node *Node) watchShutdown(ctx context.Context, updates <-chan rmap.EventKind) {
 	defer node.wg.Done()
+	defer node.nodeShutdownMap.Unsubscribe(updates)
 	for {
 		select {
 		case <-node.stop:
 			return
-		case <-node.nodeShutdownMap.Subscribe():
+		case _, ok := <-updates:
+			if !ok {
+				return
+			}
+			if _, shutdown := node.nodeShutdownMap.Get("shutdown"); !shutdown {
+				continue
+			}
 			node.logger.Debug("watchShutdown: shutdown map updated")
-			// Handle shutdown in a separate goroutine to allow this one to exit
-			pulse.Go(node.logger, func() { node.handleShutdown(ctx) })
+			node.ownShutdown(ctx)
 		}
 	}
 }
 
-// handleShutdown closes the node.
-func (node *Node) handleShutdown(ctx context.Context) {
-	if node.IsClosed() {
-		return
-	}
-	sm := node.nodeShutdownMap.Map()
-	var requestingNode string
-	for _, node := range sm {
-		// There is only one value in the map
-		requestingNode = node
-	}
-	node.logger.Debug("handleShutdown: shutting down", "requested-by", requestingNode)
-	node.close(ctx, true)
+// ownShutdown starts exactly one peer-shutdown owner.
+func (node *Node) ownShutdown(ctx context.Context) {
+	node.shutdownOnce.Do(func() {
+		pulse.Go(node.logger, func() { node.handleShutdown(ctx) })
+	})
+}
 
-	node.lock.Lock()
-	node.shutdown = true
-	node.lock.Unlock()
-	node.logger.Info("shutdown", "requested-by", requestingNode)
+// handleShutdown retries local cleanup within one node lease and publishes each
+// failure in the shutdown map so the initiating node can return it immediately.
+func (node *Node) handleShutdown(ctx context.Context) {
+	requestingNode, _ := node.nodeShutdownMap.Get("shutdown")
+	node.logger.Debug("handleShutdown: shutting down", "requested-by", requestingNode)
+	failureKey := shutdownErrorKey(node.ID)
+	deadline := time.NewTimer(node.workerTTL)
+	defer deadline.Stop()
+	for {
+		err := node.close(ctx, true)
+		if err == nil {
+			node.lock.Lock()
+			node.shutdown = true
+			node.lock.Unlock()
+			if err := node.rdb.HDel(
+				ctx,
+				rmapContentKey(node.resources.nodeShutdown),
+				failureKey,
+			).Err(); err != nil {
+				node.logger.Error(fmt.Errorf("handleShutdown: failed to clear shutdown error: %w", err))
+				if waitForShutdownRetry(ctx, deadline.C, node.workerTTL) {
+					continue
+				}
+				return
+			}
+			node.logger.Info("shutdown", "requested-by", requestingNode)
+			return
+		}
+		if setErr := node.setPoolMap(ctx, node.resources.nodeShutdown, failureKey, err.Error()); setErr != nil {
+			node.logger.Error(fmt.Errorf("handleShutdown: failed to publish shutdown error: %w", setErr))
+		}
+		node.logger.Error(fmt.Errorf("handleShutdown: failed to close node: %w", err))
+		if !waitForShutdownRetry(ctx, deadline.C, node.workerTTL) {
+			return
+		}
+	}
+}
+
+// waitForShutdownRetry spaces peer cleanup attempts while respecting the
+// caller context and the node lease deadline.
+func waitForShutdownRetry(ctx context.Context, deadline <-chan time.Time, ttl time.Duration) bool {
+	retry := time.NewTimer(min(100*time.Millisecond, ttl))
+	defer retry.Stop()
+	select {
+	case <-retry.C:
+		return true
+	case <-deadline:
+		return false
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // processInactiveNodes periodically checks for inactive nodes and destroys their streams.
@@ -1035,26 +2101,28 @@ func (node *Node) processInactiveNodes() {
 // cleanupInactiveNodes checks for inactive nodes, destroys their streams and
 // removes them from the keep-alive map.
 func (node *Node) cleanupInactiveNodes() {
-	nodeMap := node.nodeKeepAliveMap.Map()
-	for nodeID, lastSeen := range nodeMap {
-		if nodeID == node.ID || node.isWithinTTL(lastSeen, node.workerTTL) {
+	if err := node.ensureGenerationActive(context.Background()); err != nil {
+		node.logger.Error(err)
+		return
+	}
+	for nodeID := range node.nodeKeepAliveMap.Map() {
+		if nodeID == node.ID || strings.HasPrefix(nodeID, "=") {
 			continue
 		}
-
-		node.logger.Info("cleaning up inactive node", "node", nodeID)
-
-		// Clean up node's stream
 		ctx := context.Background()
-		stream := nodeStreamName(node.PoolName, nodeID)
-		if s, err := streaming.NewStream(stream, node.rdb, options.WithStreamLogger(node.logger)); err == nil {
-			if err := s.Destroy(ctx); err != nil {
-				node.logger.Error(fmt.Errorf("cleanupInactiveNodes: failed to destroy stream: %w", err))
-			}
+		cleaned, err := cleanupStalePoolNode(
+			ctx,
+			node.rdb,
+			node.resources,
+			nodeID,
+			node.ID,
+		)
+		if err != nil {
+			node.logger.Error(fmt.Errorf("cleanupInactiveNodes: failed to clean node: %w", err))
+			continue
 		}
-
-		// Remove from keep-alive map
-		if _, err := node.nodeKeepAliveMap.Delete(ctx, nodeID); err != nil {
-			node.logger.Error(fmt.Errorf("cleanupInactiveNodes: failed to delete node: %w", err))
+		if cleaned {
+			node.logger.Info("cleaned up inactive node", "node", nodeID)
 		}
 	}
 }
@@ -1087,13 +2155,12 @@ func (node *Node) processInactiveWorkers(ctx context.Context) {
 // lock acquisition. Jobs are requeued and will be reassigned to active workers
 // through consistent hashing.
 func (node *Node) cleanupInactiveWorkers(ctx context.Context) {
-	active := node.activeWorkers()
-	activeMap := make(map[string]struct{})
-	for _, id := range active {
-		activeMap[id] = struct{}{}
+	if err := node.ensureGenerationActive(ctx); err != nil {
+		node.logger.Error(err)
+		return
 	}
-
-	// Get all workers that need cleanup (either in jobMap or workerMap)
+	// Discovery may be eventually replicated, but the cleanup decision is made
+	// only by acquireWorkerCleanup against the authoritative Redis heartbeat.
 	workersToCheck := make(map[string]struct{})
 	for _, workerID := range node.jobMap.Keys() {
 		workersToCheck[workerID] = struct{}{}
@@ -1102,23 +2169,7 @@ func (node *Node) cleanupInactiveWorkers(ctx context.Context) {
 		workersToCheck[workerID] = struct{}{}
 	}
 
-	// Check each worker
 	for workerID := range workersToCheck {
-		// Skip active workers
-		if _, ok := activeMap[workerID]; ok {
-			continue
-		}
-
-		// Skip workers being cleaned up
-		if cleanupTS, exists := node.workerCleanupMap.Get(workerID); exists {
-			if node.isWithinTTL(cleanupTS, node.workerTTL) {
-				node.logger.Debug("cleanupInactiveWorkers: worker already being cleaned up", "worker", workerID)
-				continue
-			}
-		}
-
-		// Worker needs cleanup
-		node.logger.Info("cleanupInactiveWorkers: found inactive worker", "worker", workerID)
 		node.cleanupWorker(ctx, workerID)
 	}
 
@@ -1149,8 +2200,8 @@ func (node *Node) requeueOrphanedPayloads(ctx context.Context) {
 	// Use a short grace period: we want recovery to be fast under churn,
 	// but still avoid requeuing during brief map inconsistencies.
 	grace := 2 * node.workerTTL
-	if grace < node.ackGracePeriod {
-		grace = node.ackGracePeriod
+	if grace < node.recoveryGrace {
+		grace = node.recoveryGrace
 	}
 
 	now := time.Now()
@@ -1158,6 +2209,29 @@ func (node *Node) requeueOrphanedPayloads(ctx context.Context) {
 		if _, ok := existingJobs[key]; ok {
 			node.orphanedPayloads.Delete(key)
 			continue
+		}
+		dispatchID, err := node.activeDispatchID(ctx, key)
+		if err != nil {
+			node.logger.Error(err, "key", key)
+			continue
+		}
+		if dispatchID != "" {
+			released, err := node.releaseCrashedDispatchStart(ctx, nil, key, dispatchID)
+			if err != nil {
+				node.logger.Error(err, "key", key, "dispatch", dispatchID)
+				continue
+			}
+			if released {
+				node.orphanedPayloads.Delete(key)
+				node.logger.Info(
+					"released orphaned exact dispatch for stream recovery",
+					"key",
+					key,
+					"dispatch",
+					dispatchID,
+				)
+				continue
+			}
 		}
 
 		firstAny, ok := node.orphanedPayloads.Load(key)
@@ -1189,18 +2263,35 @@ func (node *Node) requeueOrphanedPayloads(ctx context.Context) {
 // cleanupWorker requeues the jobs assigned to the worker and deletes it from
 // the pool.
 func (node *Node) cleanupWorker(ctx context.Context, workerID string) {
-	// Try to acquire or clear stale cleanup lock
-	if !node.acquireCleanupLock(ctx, workerID) {
+	if err := node.ensureGenerationActive(ctx); err != nil {
+		node.logger.Error(err)
 		return
 	}
+	lease, err := node.acquireWorkerCleanup(ctx, workerID)
+	if err != nil {
+		node.logger.Error(fmt.Errorf("cleanupWorker: acquire lease: %w", err), "worker", workerID)
+		return
+	}
+	if lease == nil {
+		return
+	}
+	complete := false
+	defer func() {
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+		defer cancel()
+		if err := node.releaseWorkerCleanup(releaseCtx, lease, complete); err != nil {
+			node.logger.Error(fmt.Errorf("cleanupWorker: release lease: %w", err), "worker", workerID)
+		}
+	}()
 
 	// Get the worker's jobs
 	keys, ok := node.jobMap.GetValues(workerID)
 	if !ok || len(keys) == 0 {
-		// Worker has no jobs, just delete it
-		if err := node.deleteWorker(workerID); err != nil {
+		if err := node.deleteStaleWorker(ctx, lease); err != nil {
 			node.logger.Error(fmt.Errorf("cleanupWorkerJobs: failed to delete worker: %w", err), "worker", workerID)
+			return
 		}
+		complete = true
 		node.logger.Info("cleaned up worker with no jobs", "worker", workerID)
 		return
 	}
@@ -1211,14 +2302,39 @@ func (node *Node) cleanupWorker(ctx context.Context, workerID string) {
 		processed int // jobs that were either requeued or cleaned up as stale
 	)
 	for _, key := range keys {
+		dispatchID, err := node.activeDispatchID(ctx, key)
+		if err != nil {
+			node.logger.Error(err, "job", key, "worker", workerID)
+			continue
+		}
+		if dispatchID != "" {
+			released, err := node.releaseCrashedDispatchStart(ctx, lease, key, dispatchID)
+			if err != nil {
+				node.logger.Error(err, "job", key, "worker", workerID, "dispatch", dispatchID)
+				continue
+			}
+			if released {
+				node.logger.Info(
+					"released crashed exact dispatch for stream recovery",
+					"job",
+					key,
+					"worker",
+					workerID,
+					"dispatch",
+					dispatchID,
+				)
+				processed++
+				continue
+			}
+		}
 		payload, ok := node.JobPayload(key)
 		if !ok {
-			// The job key can remain in the jobs map even if the payload has already
-			// been removed (e.g. the job was stopped, or another node already handled
-			// the requeue). Treat it as a stale entry and remove it so future cleanup
-			// attempts don't keep looping on it.
-			if _, _, err := node.jobMap.RemoveValues(ctx, workerID, key); err != nil {
+			removed, err := node.removeStaleWorkerJob(ctx, lease, key)
+			if err != nil {
 				node.logger.Error(fmt.Errorf("cleanupWorker: failed to remove stale job from jobs map: %w", err), "job", key, "worker", workerID)
+				continue
+			}
+			if !removed {
 				continue
 			}
 			node.logger.Info("cleanupWorker: removed stale job key with missing payload", "job", key, "worker", workerID)
@@ -1229,8 +2345,25 @@ func (node *Node) cleanupWorker(ctx context.Context, workerID string) {
 		// Requeue by adding an event back to the pool stream.
 		// We intentionally do not wait for the job to start (which can time out
 		// under heavy churn) - the pool sink will retry routing until it is acked.
-		if _, err := node.poolStream.Add(ctx, evStartJob, marshalJob(job)); err != nil {
+		status, err := node.publishWorkerRequeue(ctx, lease, job)
+		if err != nil {
 			node.logger.Error(fmt.Errorf("requeueWorkerJobs: failed to requeue job: %w", err), "job", job.Key, "worker", workerID)
+			continue
+		}
+		if status == 2 {
+			processed++
+			continue
+		}
+		if status == 3 {
+			removed, err := node.removeStaleWorkerJob(ctx, lease, key)
+			if err != nil {
+				node.logger.Error(fmt.Errorf("cleanupWorker: failed to remove stale job from jobs map: %w", err), "job", key, "worker", workerID)
+				continue
+			}
+			if !removed {
+				continue
+			}
+			processed++
 			continue
 		}
 		requeued++
@@ -1243,93 +2376,35 @@ func (node *Node) cleanupWorker(ctx context.Context, workerID string) {
 
 	// Delete worker
 	node.logger.Info("cleaned up worker", "worker", workerID, "requeued", requeued)
-	if err := node.deleteWorker(workerID); err != nil {
+	if err := node.deleteStaleWorker(ctx, lease); err != nil {
 		node.logger.Error(fmt.Errorf("cleanupWorkerJobs: failed to delete worker: %w", err), "worker", workerID)
+		return
 	}
-}
-
-// processInactiveJobs periodically checks for and removes stale entries in the pending jobs map.
-func (node *Node) processInactiveJobs(ctx context.Context) {
-	defer node.wg.Done()
-	ticker := time.NewTicker(node.ackGracePeriod) // Run at ackGracePeriod frequency since pending jobs expire after 2*ackGracePeriod
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-node.stop:
-			return
-		case <-ticker.C:
-			node.cleanupStalePendingJobs(ctx)
-		}
-	}
-}
-
-// cleanupStalePendingJobs checks for and removes stale entries in the pending jobs map.
-// An entry is considered stale if its timestamp has expired.
-func (node *Node) cleanupStalePendingJobs(ctx context.Context) {
-	for key, pendingTS := range node.jobPendingMap.Map() {
-		if _, err := strconv.ParseInt(pendingTS, 10, 64); err != nil {
-			node.logger.Error(fmt.Errorf("cleanupStalePendingJobs: malformed pending timestamp for job %q: %w", key, err))
-			continue
-		}
-		if node.isWithinTTL(pendingTS, 0) {
-			continue
-		}
-		prev, err := node.jobPendingMap.TestAndDelete(ctx, key, pendingTS)
-		if err != nil {
-			node.logger.Error(fmt.Errorf("cleanupStalePendingJobs: failed to delete stale pending entry: %w", err))
-		}
-		if prev == pendingTS {
-			node.logger.Info("cleanupStalePendingJobs: removed stale pending entry", "key", key)
-		}
-	}
-}
-
-// acquireCleanupLock tries to acquire the cleanup lock for a worker.
-// It returns true if the lock was acquired, false if another node holds the lock.
-// It will clear any stale or invalid locks it finds.
-func (node *Node) acquireCleanupLock(ctx context.Context, workerID string) bool {
-	// Check for existing lock
-	if existingTS, exists := node.workerCleanupMap.Get(workerID); exists {
-		if !node.isWithinTTL(existingTS, node.workerTTL) {
-			// Invalid or stale lock, delete it
-			if _, err := node.workerCleanupMap.Delete(ctx, workerID); err != nil {
-				node.logger.Error(fmt.Errorf("cleanupWorkerJobs: failed to delete stale cleanup timestamp: %w", err), "worker", workerID)
-				return false
-			}
-			node.logger.Info("cleanupWorkerJobs: cleared stale cleanup lock", "worker", workerID, "ts", existingTS, "ttl", node.workerTTL)
-		} else {
-			// Lock is still valid
-			node.logger.Debug("cleanupWorkerJobs: cleanup already in progress", "worker", workerID)
-			return false
-		}
-	}
-
-	// Try to acquire lock
-	now := strconv.FormatInt(time.Now().UnixNano(), 10)
-	ok, err := node.workerCleanupMap.SetIfNotExists(ctx, workerID, now)
-	if err != nil {
-		node.logger.Error(fmt.Errorf("cleanupWorkerJobs: failed to set cleanup timestamp: %w", err), "worker", workerID)
-		return false
-	}
-	if !ok {
-		node.logger.Debug("cleanupWorkerJobs: cleanup already in progress", "worker", workerID)
-		return false
-	}
-
-	return true
+	complete = true
 }
 
 // isWithinTTL checks if a timestamp is within a TTL. If lastSeen is not a valid
 // timestamp, false is returned. lastSeen is a string representation of a unix
 // timestamp in nanoseconds.
 func (node *Node) isWithinTTL(lastSeen string, ttl time.Duration) bool {
+	now, err := node.rdb.Time(context.Background()).Result()
+	if err != nil {
+		node.logger.Error(fmt.Errorf("isWithinTTL: failed to read Redis time: %w", err))
+		return false
+	}
+	return node.isWithinTTLAt(lastSeen, ttl, now)
+}
+
+// isWithinTTLAt compares one persisted timestamp to an already-read Redis
+// clock value so callers evaluating a set do not issue one TIME command per
+// member.
+func (node *Node) isWithinTTLAt(lastSeen string, ttl time.Duration, now time.Time) bool {
 	lsi, err := strconv.ParseInt(lastSeen, 10, 64)
 	if err != nil {
 		node.logger.Error(fmt.Errorf("isWithinTTL: failed to parse last seen timestamp: %w", err))
 		return false
 	}
-	return time.Since(time.Unix(0, lsi)) <= ttl
+	return now.Sub(time.Unix(0, lsi)) <= ttl
 }
 
 // Keep node alive
@@ -1344,9 +2419,18 @@ func (node *Node) updateNodeKeepAlive() {
 		case <-node.stop:
 			return
 		case <-ticker.C:
-			if _, err := node.nodeKeepAliveMap.Set(ctx, node.ID,
-				strconv.FormatInt(time.Now().UnixNano(), 10)); err != nil {
+			if err := node.ensureGenerationActive(ctx); err != nil {
+				node.logger.Error(err)
+				return
+			}
+			_, err := refreshPoolNode(ctx, node.rdb, node.resources, node.ID)
+			if err != nil {
 				node.logger.Error(fmt.Errorf("updateNodeKeepAlive: failed to update timestamp: %w", err))
+				if strings.Contains(err.Error(), "NODECLEANUPLOST") {
+					node.stopAfterLifecycleLoss("stale node cleanup fence", false)
+					return
+				}
+				continue
 			}
 		}
 	}
@@ -1354,6 +2438,11 @@ func (node *Node) updateNodeKeepAlive() {
 
 // activeWorkers returns the IDs of the active workers in the pool.
 func (node *Node) activeWorkers() []string {
+	now, err := node.rdb.Time(context.Background()).Result()
+	if err != nil {
+		node.logger.Error(fmt.Errorf("activeWorkers: failed to read Redis time: %w", err))
+		return nil
+	}
 	workers := node.workerMap.Map()
 	workerCreatedAtByID := make(map[string]int64)
 	var sortedIDs []string
@@ -1362,10 +2451,15 @@ func (node *Node) activeWorkers() []string {
 			continue // worker is in the process of being removed
 		}
 
-		// Skip workers that are being cleaned up
-		if cleanupTS, exists := node.workerCleanupMap.Get(id); exists {
-			if node.isWithinTTL(cleanupTS, node.workerTTL) {
-				continue // Skip workers being actively cleaned up
+		// Skip workers under an exact unexpired Redis-time cleanup lease.
+		if cleanupLease, exists := node.workerCleanupMap.Get(id); exists {
+			active, err := workerCleanupLeaseActive(cleanupLease, now)
+			if err != nil {
+				node.logger.Error(err, "worker", id)
+				continue
+			}
+			if active {
+				continue
 			}
 		}
 		cai, err := strconv.ParseInt(createdAt, 10, 64)
@@ -1391,7 +2485,7 @@ func (node *Node) activeWorkers() []string {
 			// the workers map deletion.
 			continue
 		}
-		if !node.isWithinTTL(ls, node.workerTTL) {
+		if !node.isWithinTTLAt(ls, node.workerTTL, now) {
 			continue
 		}
 		activeIDs = append(activeIDs, id)
@@ -1405,38 +2499,39 @@ func (node *Node) deleteWorker(id string) error {
 	ctx := context.Background()
 	node.logger.Debug("deleteWorker: deleting worker", "worker", id)
 
-	// Remove from all maps including cleanup map
-	node.removeWorkerFromMaps(ctx, id)
-
-	// Destroy the worker's stream
+	// Destroy before removing the records that make failed cleanup discoverable.
 	stream, err := node.getWorkerStream(id)
 	if err != nil {
 		return fmt.Errorf("deleteWorker: failed to retrieve worker stream for %q: %w", id, err)
 	}
 	if err := stream.Destroy(ctx); err != nil {
-		node.logger.Error(fmt.Errorf("deleteWorker: failed to delete worker stream: %w", err))
+		return fmt.Errorf("deleteWorker: failed to delete worker stream: %w", err)
 	}
-	return nil
+	return node.removeWorkerFromMaps(ctx, id)
 }
 
 // removeWorker removes a worker that was created by this node.
 // This is used during graceful shutdown or explicit worker removal.
-func (node *Node) removeWorker(ctx context.Context, id string) {
-	node.removeWorkerFromMaps(ctx, id)
+func (node *Node) removeWorker(ctx context.Context, id string) error {
+	if err := node.removeWorkerFromMaps(ctx, id); err != nil {
+		return err
+	}
 	node.workerStreams.Delete(id)
+	return nil
 }
 
 // removeWorkerFromMaps removes the worker from all tracking maps.
 // This is the common cleanup needed for both local and remote worker removal.
-func (node *Node) removeWorkerFromMaps(ctx context.Context, id string) {
-	if _, err := node.workerMap.Delete(ctx, id); err != nil {
-		node.logger.Error(fmt.Errorf("removeWorkerFromMaps: failed to remove worker %s from worker map: %w", id, err))
+func (node *Node) removeWorkerFromMaps(ctx context.Context, id string) error {
+	var cleanupErr error
+	if err := node.deletePoolMap(ctx, node.resources.workers, id); err != nil {
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove worker %s from worker map: %w", id, err))
 	}
-	if _, err := node.workerKeepAliveMap.Delete(ctx, id); err != nil {
-		node.logger.Error(fmt.Errorf("removeWorkerFromMaps: failed to remove worker %s from keep-alive map: %w", id, err))
+	if err := node.deletePoolMap(ctx, node.resources.workerKeepAlive, id); err != nil {
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove worker %s from keep-alive map: %w", id, err))
 	}
-	if _, err := node.workerCleanupMap.Delete(ctx, id); err != nil {
-		node.logger.Error(fmt.Errorf("removeWorkerFromMaps: failed to remove cleanup timestamp: %w", err), "worker", id)
+	if err := node.deletePoolMap(ctx, node.resources.workerCleanup, id); err != nil {
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove worker %s cleanup timestamp: %w", id, err))
 	}
 	// NOTE: Do not delete job payloads here.
 	//
@@ -1447,9 +2542,10 @@ func (node *Node) removeWorkerFromMaps(ctx context.Context, id string) {
 	//
 	// Payloads are deleted when jobs stop (see Worker.stopJob) and any remaining
 	// orphaned payloads are eventually collected by cleanupOrphanedJobPayloads.
-	if _, err := node.jobMap.Delete(ctx, id); err != nil {
-		node.logger.Error(fmt.Errorf("removeWorkerFromMaps: failed to remove worker %s from jobs map: %w", id, err))
+	if err := node.deletePoolMap(ctx, node.resources.jobs, id); err != nil {
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove worker %s from jobs map: %w", id, err))
 	}
+	return cleanupErr
 }
 
 // getWorkerStream retrieves the stream for a worker. It caches the result in the
@@ -1513,30 +2609,154 @@ func (node *Node) requeueAllJobs(ctx context.Context) error {
 	return nil
 }
 
-// cleanupPool removes the pool resources from Redis.
-func (node *Node) cleanupPool(ctx context.Context) {
-	for _, m := range node.maps() {
-		if m != nil {
-			if err := m.Destroy(ctx); err != nil {
-				node.logger.Error(fmt.Errorf("cleanupPool: failed to destroy map: %w", err))
-			}
-		}
+// cleanupPool completes the takeover-owned cleanup claimed by
+// waitForPoolNodes. The persisted owner and lease make every destructive step
+// retryable by another process after interruption.
+func (node *Node) cleanupPool(ctx context.Context) error {
+	complete, err := node.poolCleanupComplete(ctx)
+	if err != nil {
+		return err
 	}
-	if err := node.poolStream.Destroy(ctx); err != nil {
-		node.logger.Error(fmt.Errorf("cleanupPool: failed to destroy pool stream: %w", err))
+	if complete {
+		return nil
+	}
+	err = cleanupPoolResources(
+		ctx,
+		node.rdb,
+		node.PoolName,
+		node.poolStream.Generation(),
+		node.ID,
+		node.cleanupLease,
+	)
+	if err != nil {
+		return fmt.Errorf("cleanupPool: %w", err)
+	}
+	return nil
+}
+
+// waitForPoolNodes reaps crashed-node leases and blocks until every live node
+// detaches. Redis TIME is the sole lease clock, so host clock skew cannot hold
+// or prematurely pass the destructive cleanup barrier.
+func (node *Node) waitForPoolNodes(ctx context.Context) error {
+	nodes, err := rmap.Join(
+		ctx,
+		node.resources.nodeKeepAlive,
+		node.rdb,
+		rmap.WithLogger(node.logger),
+	)
+	if err != nil {
+		return fmt.Errorf("Shutdown: failed to join node shutdown barrier: %w", err)
+	}
+	defer nodes.Close()
+	updates := nodes.Subscribe()
+	defer nodes.Unsubscribe(updates)
+	for {
+		now, err := node.rdb.Time(ctx).Result()
+		if err != nil {
+			return fmt.Errorf("Shutdown: failed to read Redis time for node barrier: %w", err)
+		}
+		shutdownState, err := node.rdb.HGetAll(
+			ctx,
+			rmapContentKey(node.resources.nodeShutdown),
+		).Result()
+		if err != nil {
+			return fmt.Errorf("Shutdown: failed to read peer shutdown state: %w", err)
+		}
+		nextExpiry := node.workerTTL
+		active := 0
+		activeNodes := make(map[string]struct{})
+		heartbeats, err := node.rdb.HGetAll(
+			ctx,
+			rmapContentKey(node.resources.nodeKeepAlive),
+		).Result()
+		if err != nil {
+			return fmt.Errorf("Shutdown: failed to read authoritative node heartbeats: %w", err)
+		}
+		for nodeID, timestamp := range heartbeats {
+			if strings.HasPrefix(nodeID, "=") {
+				continue
+			}
+			lastSeen, err := strconv.ParseInt(timestamp, 10, 64)
+			if err != nil {
+				return fmt.Errorf("Shutdown: invalid node keep-alive for %q: %w", nodeID, err)
+			}
+			remaining := node.workerTTL - now.Sub(time.Unix(0, lastSeen))
+			if remaining <= 0 {
+				cleaned, err := cleanupStalePoolNode(
+					ctx,
+					node.rdb,
+					node.resources,
+					nodeID,
+					node.ID,
+				)
+				if err != nil {
+					return fmt.Errorf("Shutdown: failed to reap stale node %q: %w", nodeID, err)
+				}
+				if cleaned {
+					continue
+				}
+				remaining = shutdownErrorPoll
+			}
+			active++
+			activeNodes[nodeID] = struct{}{}
+			nextExpiry = min(nextExpiry, remaining)
+		}
+		for key, message := range shutdownState {
+			if !strings.HasPrefix(key, "error:") {
+				continue
+			}
+			nodeID := strings.TrimPrefix(key, "error:")
+			if _, active := activeNodes[nodeID]; !active {
+				continue
+			}
+			return fmt.Errorf("Shutdown: node %q failed to close: %s", nodeID, message)
+		}
+		if active == 0 {
+			status, err := claimPoolCleanup(
+				ctx,
+				node.rdb,
+				node.PoolName,
+				node.poolStream.Generation(),
+				node.ID,
+				node.cleanupLease,
+			)
+			if err != nil {
+				return fmt.Errorf("Shutdown: failed to claim pool cleanup: %w", err)
+			}
+			if status == poolCleanupClaimed || status == poolCleanupAlreadyComplete {
+				return nil
+			}
+			active = 1
+		}
+		nextExpiry = min(nextExpiry, shutdownErrorPoll)
+		timer := time.NewTimer(nextExpiry)
+		select {
+		case <-updates:
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return fmt.Errorf("Shutdown: waiting for pool nodes to close: %w", ctx.Err())
+		}
 	}
 }
 
-// cleanupNode closes the node resources.
-func (node *Node) cleanupNode(ctx context.Context) {
+// cleanupNode destroys the node stream before closing maps. A destruction
+// failure leaves map handles open and is returned so Close can be retried.
+func (node *Node) cleanupNode(ctx context.Context) error {
+	if err := node.nodeStream.Destroy(ctx); err != nil {
+		return fmt.Errorf("failed to destroy node stream: %w", err)
+	}
 	for _, m := range node.maps() {
 		if m != nil {
 			m.Close()
 		}
 	}
-	if err := node.nodeStream.Destroy(ctx); err != nil {
-		node.logger.Error(fmt.Errorf("cleanupNode: failed to destroy node stream: %w", err))
-	}
+	return nil
 }
 
 // maps returns the maps managed by the node.
@@ -1551,6 +2771,7 @@ func (node *Node) maps() []*rmap.Map {
 		node.jobPendingMap,
 		node.jobPayloadMap,
 		node.tickerMap,
+		node.schedulerJobMap,
 	}
 }
 
@@ -1595,6 +2816,16 @@ func nodeShutdownMapName(pool string) string {
 	return fmt.Sprintf("%s:shutdown", pool)
 }
 
+// shutdownErrorKey identifies one peer's authoritative close failure.
+func shutdownErrorKey(nodeID string) string {
+	return fmt.Sprintf("error:%s", nodeID)
+}
+
+// poolCleanupGenerationsKey records completed pool-stream generations.
+func poolCleanupGenerationsKey(pool string) string {
+	return fmt.Sprintf("pulse:pool:%s:cleanup-generations", pool)
+}
+
 // workerMapName returns the name of the replicated map used to store the
 // worker creation timestamps.
 func workerMapName(pool string) string {
@@ -1625,6 +2856,11 @@ func jobPendingMapName(poolName string) string {
 	return poolName + ":pending-jobs"
 }
 
+// dispatchMapName returns the generation-owned durable dispatch record map.
+func dispatchMapName(pool string) string {
+	return fmt.Sprintf("%s:dispatches", pool)
+}
+
 // jobPayloadMapName returns the name of the replicated map used to store the
 // job payloads by job key.
 func jobPayloadMapName(pool string) string {
@@ -1645,6 +2881,11 @@ func rmapUpdateChannel(name string) string {
 // ticks.
 func tickerMapName(pool string) string {
 	return fmt.Sprintf("%s:tickers", pool)
+}
+
+// schedulerJobMapName returns the pre-generation scheduler ownership map name.
+func schedulerJobMapName(pool string) string {
+	return fmt.Sprintf("%s:scheduler-jobs", pool)
 }
 
 // poolStreamName returns the name of the stream used by pool events.

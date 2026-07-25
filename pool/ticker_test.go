@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -10,7 +11,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"goa.design/clue/log"
 	"goa.design/pulse/pulse"
-	"goa.design/pulse/rmap"
 
 	ptesting "goa.design/pulse/testing"
 )
@@ -35,7 +35,8 @@ func TestNewTicker(t *testing.T) {
 
 	// Verify next tick time and duration
 	ticker.lock.Lock()
-	nextTickTime, tickerDuration := deserialize(ticker.next)
+	nextTickTime, tickerDuration, err := deserialize(ticker.next)
+	require.NoError(t, err)
 	ticker.lock.Unlock()
 	assert.WithinDuration(t, startTime.Add(tickDuration), nextTickTime, time.Second, "Next tick time should be approximately one tick duration from start")
 	assert.Equal(t, tickDuration, tickerDuration, "Ticker duration should match the specified duration")
@@ -51,6 +52,23 @@ func TestNewTicker(t *testing.T) {
 
 	// Cleanup
 	assert.NoError(t, node.Shutdown(ctx), "Failed to shutdown node")
+}
+
+func TestDeserializeTickerStateRejectsMalformedValues(t *testing.T) {
+	for _, value := range []string{
+		"",
+		"1",
+		"not-a-time|1s",
+		"1|not-a-duration",
+		"1|0s",
+		"1|500us",
+		"1|1s|extra",
+	} {
+		t.Run(value, func(t *testing.T) {
+			_, _, err := deserialize(value)
+			require.Error(t, err)
+		})
+	}
 }
 
 func TestReplaceTickerTimer(t *testing.T) {
@@ -71,7 +89,8 @@ func TestReplaceTickerTimer(t *testing.T) {
 	require.NotNil(t, ticker1)
 
 	// Verify first ticker properties
-	nextTick, tickDuration := deserialize(ticker1.next)
+	nextTick, tickDuration, err := deserialize(ticker1.next)
+	require.NoError(t, err)
 	assert.WithinDuration(t, now.Add(shortDuration), nextTick, time.Second, "First ticker: invalid next tick time")
 	assert.Equal(t, shortDuration, tickDuration, "First ticker: invalid duration")
 
@@ -82,7 +101,8 @@ func TestReplaceTickerTimer(t *testing.T) {
 
 	// Verify second ticker properties
 	ticker2.lock.Lock()
-	nextTick, tickDuration = deserialize(ticker2.next)
+	nextTick, tickDuration, err = deserialize(ticker2.next)
+	require.NoError(t, err)
 	ticker2.lock.Unlock()
 	assert.WithinDuration(t, now.Add(longDuration), nextTick, time.Second, "Second ticker: invalid next tick time")
 	assert.Equal(t, longDuration, tickDuration, "Second ticker: invalid duration")
@@ -105,20 +125,25 @@ func TestHandleTickRetriesAfterMapWriteError(t *testing.T) {
 	ctx := log.Context(ptesting.NewTestContext(t), log.WithOutput(io.Discard))
 	testName := strings.Replace(t.Name(), "/", "_", -1)
 
-	tickerMap, err := rmap.Join(ctx, "ticker-map-"+testName, rdb)
-	require.NoError(t, err)
+	hook := &ambiguousDispatchHook{
+		err:        errors.New("ticker write failed"),
+		scriptHash: testAndSetPoolMapScript.Hash(),
+	}
+	rdb.AddHook(hook)
+	node := newTestNode(t, ctx, rdb, testName)
+	require.NoError(t, testAndSetPoolMapScript.Load(ctx, rdb).Err())
 
 	tickDuration := 10 * time.Millisecond
 	next := serialize(time.Now().Add(tickDuration), tickDuration)
-	_, err = tickerMap.Set(ctx, testName, next)
-	require.NoError(t, err)
+	require.NoError(t, node.setPoolMap(ctx, node.resources.tickers, testName, next))
 
 	c := make(chan time.Time, 1)
 	ticker := &Ticker{
 		C:         c,
 		c:         c,
 		name:      testName,
-		tickerMap: tickerMap,
+		node:      node,
+		tickerMap: node.tickerMap,
 		next:      next,
 		timer:     time.NewTimer(time.Hour),
 		logger:    pulse.NoopLogger(),
@@ -127,8 +152,7 @@ func TestHandleTickRetriesAfterMapWriteError(t *testing.T) {
 		ticker.timer.Stop()
 	})
 
-	tickerMap.Close()
-
+	hook.fail.Store(true)
 	start := time.Now()
 	ticker.handleTick()
 

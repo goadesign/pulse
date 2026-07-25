@@ -5,7 +5,7 @@ This example shows how to use the pool package to create a pool of workers. It h
 1. The `worker` process registers a worker with the node and waits for jobs.
 2. The `producer` process starts and stops two jobs. It also notifies the worker
    that owns the second job.
-3. The `scheduler` process starts runs a schedule that starts and stops jobs alternately.
+3. The `scheduler` process runs a schedule that starts and stops jobs alternately.
 
 ## Running the example
 
@@ -24,8 +24,8 @@ $ source .env
 $ go run examples/pool/worker/main.go
 ```
 
-The above start two workers that wait for jobs. Then, in separate terminals, run
-the following commands:
+The above starts two workers that wait for jobs. Then, in a separate terminal,
+run the following command:
 
 ```bash
 $ source .env

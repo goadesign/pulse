@@ -10,7 +10,7 @@ fi
 
 # Load environment variables from .env file in the Git root
 if [ -f "$git_root/.env" ]; then
-  export $(grep -v '^#' "$git_root/.env" | xargs)
+  source "$git_root/.env"
 fi
 
 # Update file paths to use absolute paths from Git root
@@ -36,15 +36,15 @@ args=(
   "--write"
 )
 
-# Pool worker can take up to 15 seconds to shutdown
-timeout_sec=20
+# Worker and pool readers use independent finite blocking reads during shutdown.
+timeout_sec=40
 
 run_example() {
   local file=$1
   shift
   local args=("$@")
   echo "Running: $file ${args[*]}"
-  output=$(cd "$git_root" && timeout "$timeout_sec" go run -v "$file" "${args[@]}" 2>&1)
+  output=$(cd "$git_root" && TIMEOUT=5s timeout "$timeout_sec" go run -v "$file" "${args[@]}" 2>&1)
   local exit_status=$?
   if [[ $exit_status -ne 0 ]]; then
     echo "Example '${file}' exited with an error or exceeded the timeout:"
