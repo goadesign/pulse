@@ -22,13 +22,15 @@ type (
 	Stream struct {
 		// Name of the stream.
 		Name string
-		// MaxLen is the maximum retained event count requested at construction
-		// and, after Open, the active generation's canonical bound. It remains
-		// exported for v1 source compatibility. Mutating it after construction
-		// is unsupported; operations use the immutable private snapshot.
+		// MaxLen is the maximum retained event count requested at
+		// construction. It is immutable after NewStream and remains exported
+		// for v1 source compatibility; the generation's canonical bound is
+		// tracked privately so concurrent readers of this field never race
+		// with binding.
 		MaxLen int
-		// maxLen is the immutable maximum retained event count. Zero means the
-		// stream is explicitly unbounded.
+		// maxLen is the canonical maximum retained event count adopted from
+		// the bound generation. Zero means the stream is explicitly
+		// unbounded.
 		maxLen int
 		// ttl configures an expiry for the Redis key backing the stream.
 		ttl time.Duration

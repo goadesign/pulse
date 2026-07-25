@@ -435,23 +435,6 @@ func (s *Sink) deleteStreamStaleConsumers(
 	return nil
 }
 
-// rollbackStreamRegistration detaches membership added by an AddStream that
-// failed before local ownership was published. Empty Redis consumer metadata,
-// membership, and keepalive state are removed atomically; shared group and
-// cursor state remain owned by Stream.Destroy.
-func (s *Sink) rollbackStreamRegistration(ctx context.Context, state *sinkStream) error {
-	_, err := detachSinkConsumer(ctx, state, s.Name, s.consumer)
-	if err != nil {
-		return fmt.Errorf(
-			"failed to roll back consumer %s for stream %s: %w",
-			s.consumer,
-			state.stream.Name,
-			err,
-		)
-	}
-	return nil
-}
-
 // newConsumer creates one replacement consumer across every owned stream. No
 // stream observes local ownership unless all Redis consumers, memberships, and
 // the shared keep-alive are established; failures roll back the full prefix.

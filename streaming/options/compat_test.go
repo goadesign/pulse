@@ -7,10 +7,12 @@
 package options_test
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"goa.design/pulse/pulse"
 	"goa.design/pulse/streaming/options"
@@ -52,4 +54,30 @@ func TestOptionStructsKeepV1Fields(t *testing.T) {
 	assert.Equal(t, "42-0", addStream.LastEventID)
 	assert.Equal(t, 1000, stream.MaxLen)
 	assert.True(t, addEvent.OnlyIfStreamExists)
+}
+
+// TestV1FieldsFormStableOrderedPrefix pins the v1 fields to the leading
+// positions of every exported option struct, in v1 order. Keyed literals
+// cannot detect reordering, so this is the check that enforces the stable
+// prefix the package documents.
+func TestV1FieldsFormStableOrderedPrefix(t *testing.T) {
+	assertFieldPrefix(t, options.ReaderOptions{},
+		"BlockDuration", "MaxPolled", "Topic", "TopicPattern", "BufferSize", "LastEventID")
+	assertFieldPrefix(t, options.SinkOptions{},
+		"BlockDuration", "MaxPolled", "Topic", "TopicPattern", "BufferSize", "LastEventID",
+		"NoAck", "AckGracePeriod")
+	assertFieldPrefix(t, options.AddStreamOptions{}, "LastEventID")
+	assertFieldPrefix(t, options.StreamOptions{}, "MaxLen", "Logger", "TTL", "TTLSliding")
+	assertFieldPrefix(t, options.AddEventOptions{}, "Topic", "OnlyIfStreamExists")
+}
+
+// assertFieldPrefix asserts that the struct's leading fields carry exactly
+// the given names in order.
+func assertFieldPrefix(t *testing.T, v any, names ...string) {
+	t.Helper()
+	typ := reflect.TypeOf(v)
+	require.GreaterOrEqual(t, typ.NumField(), len(names), typ.Name())
+	for i, name := range names {
+		assert.Equal(t, name, typ.Field(i).Name, "%s field %d", typ.Name(), i)
+	}
 }

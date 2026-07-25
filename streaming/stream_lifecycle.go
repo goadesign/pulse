@@ -718,7 +718,6 @@ func (s *Stream) applyRetentionConfig(config string) error {
 		return fmt.Errorf("invalid stream retention mode %q", mode)
 	}
 	s.maxLen = maxLen
-	s.MaxLen = maxLen
 	s.retention = config
 	return nil
 }

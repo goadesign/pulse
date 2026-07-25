@@ -526,7 +526,8 @@ func TestDefaultHandlesAdoptWriterRetention(t *testing.T) {
 	reader, err := readerHandle.NewReader(ctx)
 	require.NoError(t, err)
 	reader.Close()
-	require.Equal(t, 50_000, readerHandle.MaxLen)
+	require.Equal(t, 50_000, readerHandle.maxLen)
+	require.Equal(t, 1000, readerHandle.MaxLen, "exported MaxLen stays the construction value")
 	require.Equal(t, time.Minute, readerHandle.ttl)
 	require.True(t, readerHandle.ttlSliding)
 
