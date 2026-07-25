@@ -5,6 +5,7 @@ package streaming
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -178,6 +179,34 @@ if deadline then
     if now_ms >= tonumber(deadline) then
         return redis.error_reply("DEADLINEELAPSED")
     end
+end
+return 1
+`)
+
+	// reestablishGenesisScript re-creates a lifecycle record that Redis lost
+	// entirely, exactly as the flat generation-one identity the caller still
+	// holds. It writes nothing when any record exists: a concurrent
+	// re-establishment converges on the same values and a destroy tombstone
+	// stays terminal, both decided by the retried operation's own fence.
+	//
+	// KEYS: [1]=lifecycle
+	// ARGV: [1]=active state [2]=physical field [3]=flat key [4]=config field
+	//	[5]=retention [6]=deadline field [7]=deadline ms [8]=ttl-owned field
+	//	[9]=ttl owned
+	reestablishGenesisScript = redis.NewScript(`
+if redis.call("EXISTS", KEYS[1]) == 1 then
+    return 0
+end
+redis.call("HSET", KEYS[1],
+    "state", ARGV[1],
+    "generation", "1",
+    ARGV[2], ARGV[3],
+    ARGV[4], ARGV[5])
+if ARGV[7] ~= "" then
+    redis.call("HSET", KEYS[1], ARGV[6], ARGV[7])
+end
+if ARGV[9] == "1" then
+    redis.call("HSET", KEYS[1], ARGV[8], "1")
 end
 return 1
 `)
@@ -397,7 +426,16 @@ func (s *Stream) verifyGeneration(ctx context.Context) error {
 	if err := s.ensureGeneration(ctx); err != nil {
 		return err
 	}
-	err := verifyStreamScript.Run(
+	err := s.lifecycleError(s.runVerifyGeneration(ctx))
+	if err == nil || !s.reestablishLostGenesis(ctx, err) {
+		return err
+	}
+	return s.lifecycleError(s.runVerifyGeneration(ctx))
+}
+
+// runVerifyGeneration executes the exact-generation fence once.
+func (s *Stream) runVerifyGeneration(ctx context.Context) error {
+	return verifyStreamScript.Run(
 		ctx,
 		s.rdb,
 		[]string{s.lifecycleKey},
@@ -409,7 +447,52 @@ func (s *Stream) verifyGeneration(ctx context.Context) error {
 		streamConfigKey,
 		s.retention,
 	).Err()
-	return s.lifecycleError(err)
+}
+
+// reestablishLostGenesis re-asserts the lifecycle record for the flat
+// generation-one identity this bound handle already holds after Redis lost
+// the record entirely (state loss, not Destroy: a destroy tombstone still
+// exists and stays terminal). Only the genesis identity can prove continuity
+// — the flat key is generation one by construction, so every concurrent
+// re-establishment converges on the identical record — while later
+// generations cannot and remain destroyed. It reports whether the failed
+// operation is worth one retry.
+func (s *Stream) reestablishLostGenesis(ctx context.Context, opErr error) bool {
+	if !errors.Is(opErr, ErrStreamDestroyed) {
+		return false
+	}
+	if s.generation != "1" || s.key != streamKey(s.Name) {
+		return false
+	}
+	deadline := ""
+	if !s.deadline.IsZero() {
+		deadline = strconv.FormatInt(s.deadline.UnixMilli(), 10)
+	}
+	created, err := reestablishGenesisScript.Run(
+		ctx,
+		s.rdb,
+		[]string{s.lifecycleKey},
+		streamStateActive,
+		streamPhysicalKey,
+		s.key,
+		streamConfigKey,
+		s.retention,
+		streamDeadlineKey,
+		deadline,
+		streamTTLOwnedKey,
+		boolString(s.ttl > 0),
+	).Int64()
+	if err != nil {
+		s.logger.Error(fmt.Errorf("re-establish stream lifecycle after state loss: %w", err))
+		return false
+	}
+	if created == 1 {
+		s.logger.Info("re-established stream lifecycle after Redis state loss")
+	}
+	// A record now exists either way: re-created here, re-established by a
+	// concurrent genesis holder, or a terminal tombstone. The retried
+	// operation's fence decides.
+	return true
 }
 
 // verifyExistingGeneration loads without creating, then verifies the exact
@@ -438,33 +521,15 @@ func (s *Stream) addEvent(
 	if err != nil {
 		return "", err
 	}
-	topicPresent := topic != ""
-	result, err := addStreamEventScript.Run(
-		ctx,
-		s.rdb,
-		[]string{
-			s.lifecycleKey,
-			s.key,
-			recoveryCursorKey(s),
-			streamResourceRegistryKey(s),
-		},
-		streamStateActive,
-		s.generation,
-		strconv.Itoa(s.maxLen),
-		name,
-		payload,
-		boolString(onlyIfExists),
-		boolString(topicPresent),
-		topic,
-		strconv.FormatInt(s.ttl.Milliseconds(), 10),
-		boolString(s.ttlSliding),
-		streamPhysicalKey,
-		streamDeadlineKey,
-		streamConfigKey,
-		s.retention,
-	).Slice()
+	result, err := s.runAddEvent(ctx, name, payload, onlyIfExists, topic)
 	if err != nil {
-		return "", s.lifecycleError(err)
+		addErr := s.lifecycleError(err)
+		if !s.reestablishLostGenesis(ctx, addErr) {
+			return "", addErr
+		}
+		if result, err = s.runAddEvent(ctx, name, payload, onlyIfExists, topic); err != nil {
+			return "", s.lifecycleError(err)
+		}
 	}
 	if len(result) == 0 {
 		return "", fmt.Errorf("add stream event script returned no status")
@@ -484,6 +549,40 @@ func (s *Stream) addEvent(
 		return "", fmt.Errorf("add stream event script returned invalid event ID %T", result[1])
 	}
 	return id, nil
+}
+
+// runAddEvent executes the fenced publication script once.
+func (s *Stream) runAddEvent(
+	ctx context.Context,
+	name string,
+	payload []byte,
+	onlyIfExists bool,
+	topic string,
+) ([]any, error) {
+	return addStreamEventScript.Run(
+		ctx,
+		s.rdb,
+		[]string{
+			s.lifecycleKey,
+			s.key,
+			recoveryCursorKey(s),
+			streamResourceRegistryKey(s),
+		},
+		streamStateActive,
+		s.generation,
+		strconv.Itoa(s.maxLen),
+		name,
+		payload,
+		boolString(onlyIfExists),
+		boolString(topic != ""),
+		topic,
+		strconv.FormatInt(s.ttl.Milliseconds(), 10),
+		boolString(s.ttlSliding),
+		streamPhysicalKey,
+		streamDeadlineKey,
+		streamConfigKey,
+		s.retention,
+	).Slice()
 }
 
 // removeEvents atomically verifies this generation and deletes event IDs.
