@@ -10,30 +10,34 @@ To run the examples, follow these steps:
 
 2. Open a terminal or command prompt.
 
+   The examples read `REDIS_ADDR` and `REDIS_PASSWORD`; from the repository
+   root, `source .env` selects the default local Redis configuration.
+
 3. Clone the `goadesign/pulse` repository by running the following command:
-   ```
+   ```bash
    git clone https://github.com/goadesign/pulse.git
    ```
 
 4. Change into the example directory (e.g. `examples/streaming/single-reader`):
-   ```
+   ```bash
    cd pulse/examples/streaming/single-reader
    ```
-   ```
 
-5. Install the required dependencies by running the following command:
-   ```
-   go get github.com/redis/go-redis/v9 goa.design/pulse/rmap
+5. Download the repository's pinned dependencies:
+   ```bash
+   go mod download
    ```
 
 6. Build the Go program by executing the following command:
-   ```
+   ```bash
    go build
    ```
 
 7. Run the program using the following command:
-   ```
+   ```bash
    ./single-reader
    ```
 
 This will execute the program and demonstrate the basic operations on streaming.
+The [`exact-publication`](exact-publication/main.go) example shows
+deadline-owned `AddOnce` retries and read-only snapshots.

@@ -9,8 +9,14 @@ type (
 	// AddStream is an option for adding a stream to a sink.
 	AddStream func(*AddStreamOptions)
 
+	// AddStreamOptions keeps its v1 field first; new fields are only ever
+	// appended so existing keyed construction remains source-compatible.
 	AddStreamOptions struct {
+		// LastEventID is the ID after which delivery starts for this stream.
 		LastEventID string
+		// startOptions counts applied start-position options to reject
+		// conflicting combinations.
+		startOptions int
 	}
 )
 
@@ -21,6 +27,7 @@ type (
 func WithAddStreamStartAtNewest() AddStream {
 	return func(o *AddStreamOptions) {
 		o.LastEventID = "$"
+		o.startOptions++
 	}
 }
 
@@ -31,6 +38,7 @@ func WithAddStreamStartAtNewest() AddStream {
 func WithAddStreamStartAtOldest() AddStream {
 	return func(o *AddStreamOptions) {
 		o.LastEventID = "0"
+		o.startOptions++
 	}
 }
 
@@ -41,6 +49,7 @@ func WithAddStreamStartAtOldest() AddStream {
 func WithAddStreamStartAfter(id string) AddStream {
 	return func(o *AddStreamOptions) {
 		o.LastEventID = id
+		o.startOptions++
 	}
 }
 
@@ -51,6 +60,7 @@ func WithAddStreamStartAfter(id string) AddStream {
 func WithAddStreamStartAt(startAt time.Time) AddStream {
 	return func(o *AddStreamOptions) {
 		o.LastEventID = fmt.Sprintf("%d-0", startAt.UnixMilli())
+		o.startOptions++
 	}
 }
 
@@ -61,6 +71,13 @@ func ParseAddStreamOptions(opts ...AddStream) AddStreamOptions {
 		o(&options)
 	}
 	return options
+}
+
+// HasConflictingStartOptions reports whether more than one cursor-start option
+// was supplied. AddStream rejects this instead of silently accepting the last
+// option.
+func (o AddStreamOptions) HasConflictingStartOptions() bool {
+	return o.startOptions > 1
 }
 
 // defaultAddStreamOptions returns the default options.

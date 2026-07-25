@@ -11,6 +11,7 @@ import (
 )
 
 func TestStreamOptions(t *testing.T) {
+	deadline := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
 	cases := []struct {
 		name string
 		opts []Stream
@@ -29,9 +30,19 @@ func TestStreamOptions(t *testing.T) {
 			name: "maxlen",
 			opts: []Stream{WithStreamMaxLen(10)},
 			want: StreamOptions{
-				MaxLen: 10,
-				Logger: pulse.NoopLogger(),
-				TTL:    0,
+				MaxLen:    10,
+				MaxLenSet: true,
+				Logger:    pulse.NoopLogger(),
+				TTL:       0,
+			},
+		},
+		{
+			name: "unbounded",
+			opts: []Stream{WithUnboundedStream()},
+			want: StreamOptions{
+				MaxLen:    1000,
+				Unbounded: true,
+				Logger:    pulse.NoopLogger(),
 			},
 		},
 		{
@@ -50,6 +61,7 @@ func TestStreamOptions(t *testing.T) {
 				MaxLen:     1000,
 				Logger:     pulse.NoopLogger(),
 				TTL:        10 * time.Second,
+				TTLSet:     true,
 				TTLSliding: false,
 			},
 		},
@@ -60,7 +72,18 @@ func TestStreamOptions(t *testing.T) {
 				MaxLen:     1000,
 				Logger:     pulse.NoopLogger(),
 				TTL:        10 * time.Second,
+				TTLSet:     true,
 				TTLSliding: true,
+			},
+		},
+		{
+			name: "deadline",
+			opts: []Stream{WithStreamDeadline(deadline)},
+			want: StreamOptions{
+				MaxLen:      1000,
+				Logger:      pulse.NoopLogger(),
+				Deadline:    deadline,
+				DeadlineSet: true,
 			},
 		},
 	}
@@ -152,6 +175,7 @@ func TestReaderOptions(t *testing.T) {
 				MaxPolled:     1000,
 				BufferSize:    1000,
 				LastEventID:   "foo",
+				startOptions:  1,
 			},
 		},
 	}
@@ -251,6 +275,7 @@ func TestSinkOptions(t *testing.T) {
 				BufferSize:     1000,
 				LastEventID:    "foo",
 				AckGracePeriod: 20 * time.Second,
+				startOptions:   1,
 			},
 		},
 		{
@@ -262,6 +287,7 @@ func TestSinkOptions(t *testing.T) {
 				BufferSize:     1000,
 				LastEventID:    fmt.Sprintf("%d-0", date.UnixMilli()),
 				AckGracePeriod: 20 * time.Second,
+				startOptions:   1,
 			},
 		},
 		{
@@ -318,14 +344,16 @@ func TestAddStreamOptions(t *testing.T) {
 			name: "last event ID",
 			opts: []AddStream{WithAddStreamStartAfter("foo")},
 			want: AddStreamOptions{
-				LastEventID: "foo",
+				LastEventID:  "foo",
+				startOptions: 1,
 			},
 		},
 		{
 			name: "start at",
 			opts: []AddStream{WithAddStreamStartAt(date)},
 			want: AddStreamOptions{
-				LastEventID: fmt.Sprintf("%d-0", date.UnixMilli()),
+				LastEventID:  fmt.Sprintf("%d-0", date.UnixMilli()),
+				startOptions: 1,
 			},
 		},
 	}

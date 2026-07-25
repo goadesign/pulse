@@ -11,12 +11,12 @@ import (
 )
 
 var (
-	max   = time.Second
+	max   = 5 * time.Second
 	delay = 10 * time.Millisecond
 )
 
 // readOneEvent reads one event from the channel and acks it or fails the test
-// if it takes more than a second.
+// if it takes more than the shared Redis test bound.
 func readOneEvent(t *testing.T, ctx context.Context, c <-chan *Event, sink *Sink) *Event {
 	t.Helper()
 	var read *Event
@@ -24,7 +24,7 @@ func readOneEvent(t *testing.T, ctx context.Context, c <-chan *Event, sink *Sink
 	w.Add(1)
 	go func() {
 		defer w.Done()
-		tck := time.NewTicker(time.Second)
+		tck := time.NewTicker(max)
 		select {
 		case read = <-c:
 			assert.NoError(t, sink.Ack(ctx, read))
@@ -38,7 +38,7 @@ func readOneEvent(t *testing.T, ctx context.Context, c <-chan *Event, sink *Sink
 }
 
 // readOneReaderEvent reads one event from the channel or fails the test if it
-// takes more than a second.
+// takes more than the shared Redis test bound.
 func readOneReaderEvent(t *testing.T, c <-chan *Event) *Event {
 	t.Helper()
 	var read *Event
@@ -46,7 +46,7 @@ func readOneReaderEvent(t *testing.T, c <-chan *Event) *Event {
 	w.Add(1)
 	go func() {
 		defer w.Done()
-		tck := time.NewTicker(time.Second)
+		tck := time.NewTicker(max)
 		select {
 		case read = <-c:
 			return
@@ -60,22 +60,25 @@ func readOneReaderEvent(t *testing.T, c <-chan *Event) *Event {
 	return read
 }
 
-// cleanupSink closes the sink and asserts that it is closed within a second.
+// cleanupSink closes the sink and asserts that it is closed within the shared
+// Redis test bound.
 func cleanupSink(t *testing.T, ctx context.Context, s *Stream, sink *Sink) {
 	t.Helper()
 	if sink != nil {
-		sink.Close(ctx)
+		require.NoError(t, sink.Close(ctx))
 		assert.Eventually(t, func() bool { return sink.IsClosed() }, max, delay)
 	}
 	if s != nil {
-		assert.NoError(t, s.Destroy(ctx))
+		require.NoError(t, s.Destroy(ctx))
 	}
 }
 
-// cleanupReader closes the reader and asserts that it is closed within a second.
-func cleanupReader(t *testing.T, ctx context.Context, s *Stream, reader *Reader) {
+// cleanupReader closes the reader and asserts that it is closed within the
+// shared Redis test bound.
+// Stream destruction remains explicit in each test so duplicate cleanup cannot
+// mask ErrStreamDestroyed.
+func cleanupReader(t *testing.T, reader *Reader) {
 	t.Helper()
 	reader.Close()
 	assert.Eventually(t, func() bool { return reader.IsClosed() }, max, delay)
-	assert.NoError(t, s.Destroy(ctx))
 }

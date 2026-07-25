@@ -1,17 +1,11 @@
-// Tests for lossless consumer group recovery, the destroy lifecycle fence,
-// fenced leases, close semantics, and failure-atomic stream ownership
-// changes. All tests run against a live Redis instance.
+// Package streaming tests consumer-group recovery against real Redis. The
+// cases focus on delivery safety, shared replica state, lifecycle boundaries,
+// and compensation when a multi-step ownership change fails.
 package streaming
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
-	"net"
-	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,706 +14,730 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"goa.design/pulse/pulse"
+	"goa.design/pulse/rmap"
 	"goa.design/pulse/streaming/options"
 	ptesting "goa.design/pulse/testing"
 )
 
-// TestSinkRecoversGroupAfterExternalDestroy is the core lossless recovery
-// scenario: publish events, ack some, force XGROUP DESTROY, and verify the
-// group is recreated at the recovery cursor so every unacked event is
-// redelivered exactly once and no acked event is redelivered.
-func TestSinkRecoversGroupAfterExternalDestroy(t *testing.T) {
-	testName := strings.Replace(t.Name(), "/", "_", -1)
+type (
+	// recordingAcker proves Sink.Ack preserves Event's public acknowledgement
+	// boundary instead of bypassing it with the sink's Redis client.
+	recordingAcker struct {
+		streamKey string
+		group     string
+		ids       []string
+	}
+)
+
+func TestSinkAdoptsFlatStreamWithQueuedAndPendingEvents(t *testing.T) {
 	rdb := ptesting.NewRedisClient(t)
-	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
 	ctx := ptesting.NewTestContext(t)
-	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
+	key := streamKey(t.Name())
+
+	firstID, err := rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: key,
+		Values: map[string]any{nameKey: "first", payloadKey: "one"},
+	}).Result()
 	require.NoError(t, err)
-	sink, err := s.NewSink(ctx, "sink",
+	secondID, err := rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: key,
+		Values: map[string]any{nameKey: "second", payloadKey: "two"},
+	}).Result()
+	require.NoError(t, err)
+	require.NoError(t, rdb.XGroupCreate(ctx, key, "sink", "0").Err())
+	legacy, err := rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group:    "sink",
+		Consumer: "legacy",
+		Streams:  []string{key, ">"},
+		Count:    1,
+	}).Result()
+	require.NoError(t, err)
+	require.Equal(t, firstID, legacy[0].Messages[0].ID)
+
+	stream, err := NewStream(t.Name(), rdb)
+	require.NoError(t, err)
+	require.Empty(t, stream.Generation())
+	sink, err := stream.NewSink(
+		ctx,
+		"sink",
 		options.WithSinkStartAtOldest(),
-		options.WithSinkBlockDuration(testBlockDuration))
+		options.WithSinkAckGracePeriod(50*time.Millisecond),
+		options.WithSinkBlockDuration(testBlockDuration),
+	)
 	require.NoError(t, err)
-	defer cleanupSink(t, ctx, s, sink)
+	events := sink.Subscribe()
 
-	c := sink.Subscribe()
-	ids := make([]string, 5)
-	for i := range ids {
-		ids[i], err = s.Add(ctx, fmt.Sprintf("event%d", i), []byte("payload"))
-		require.NoError(t, err)
-	}
-	events := make([]*Event, 5)
-	for i := range events {
-		events[i] = receiveEvent(t, c)
-	}
-	require.NoError(t, sink.Ack(ctx, events[0]))
-	require.NoError(t, sink.Ack(ctx, events[1]))
-	// Acks advance the recovery cursor synchronously.
-	assert.Equal(t, ids[1], recoveryCursor(t, ctx, rdb, s, "sink"))
-
-	// Simulate Redis consumer group state loss.
-	require.NoError(t, rdb.XGroupDestroy(ctx, s.key, "sink").Err())
-	futureID, err := s.Add(ctx, "future", []byte("payload"))
-	require.NoError(t, err)
-
-	// Every unacked event and the new event must be redelivered exactly once.
-	var redelivered []string
-	for range 4 {
-		ev := receiveEvent(t, c)
-		redelivered = append(redelivered, ev.ID)
-		require.NoError(t, sink.Ack(ctx, ev))
-	}
-	assert.Equal(t, []string{ids[2], ids[3], ids[4], futureID}, redelivered)
-	select {
-	case ev := <-c:
-		t.Errorf("unexpected redelivery of event %s", ev.ID)
-	case <-time.After(4 * testBlockDuration):
-	}
-	groups, err := rdb.XInfoGroups(ctx, s.key).Result()
-	require.NoError(t, err)
-	require.Len(t, groups, 1)
-	assert.Equal(t, "sink", groups[0].Name)
-}
-
-// TestSinkRecoveryCursorIsSharedAcrossReplicas verifies that sink replicas
-// share one durable recovery cursor per stream and group so whichever replica
-// recovers first resumes from the same acknowledged position.
-func TestSinkRecoveryCursorIsSharedAcrossReplicas(t *testing.T) {
-	testName := strings.Replace(t.Name(), "/", "_", -1)
-	rdb := ptesting.NewRedisClient(t)
-	defer ptesting.CleanupRedis(t, rdb, true, testName)
-	ctx := ptesting.NewTestContext(t)
-	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
-	require.NoError(t, err)
-	sink1, err := s.NewSink(ctx, "sink",
-		options.WithSinkStartAtOldest(),
-		options.WithSinkBlockDuration(testBlockDuration))
-	require.NoError(t, err)
-	defer cleanupSink(t, ctx, s, sink1)
-	sink2, err := s.NewSink(ctx, "sink",
-		options.WithSinkStartAtOldest(),
-		options.WithSinkBlockDuration(testBlockDuration))
-	require.NoError(t, err)
-	defer sink2.Close(ctx)
-
-	c1, c2 := sink1.Subscribe(), sink2.Subscribe()
-	ids := make([]string, 2)
-	for i := range ids {
-		ids[i], err = s.Add(ctx, fmt.Sprintf("event%d", i), []byte("payload"))
-		require.NoError(t, err)
-	}
-	for range ids {
+	received := map[string]*Event{}
+	for len(received) < 2 {
 		select {
-		case ev := <-c1:
-			require.NoError(t, sink1.Ack(ctx, ev))
-		case ev := <-c2:
-			require.NoError(t, sink2.Ack(ctx, ev))
+		case event := <-events:
+			received[event.ID] = event
 		case <-time.After(max):
-			t.Fatal("timeout waiting for event")
+			t.Fatalf("timed out waiting for upgraded events; received %v", received)
 		}
 	}
-	assert.Equal(t, ids[1], recoveryCursor(t, ctx, rdb, s, "sink"))
-
-	require.NoError(t, rdb.XGroupDestroy(ctx, s.key, "sink").Err())
-	futureID, err := s.Add(ctx, "future", []byte("payload"))
+	require.Contains(t, received, firstID)
+	require.Contains(t, received, secondID)
+	pending, err := rdb.XPending(ctx, key, "sink").Result()
 	require.NoError(t, err)
+	require.EqualValues(t, 2, pending.Count)
+	require.Equal(t, "1", stream.Generation())
+	require.Equal(t, key, stream.key)
+	require.Equal(t, key, rdb.HGet(ctx, stream.lifecycleKey, streamPhysicalKey).Val())
 
-	// Whichever replica recovers, only the new event is delivered.
-	select {
-	case ev := <-c1:
-		assert.Equal(t, futureID, ev.ID)
-		require.NoError(t, sink1.Ack(ctx, ev))
-	case ev := <-c2:
-		assert.Equal(t, futureID, ev.ID)
-		require.NoError(t, sink2.Ack(ctx, ev))
-	case <-time.After(max):
-		t.Fatal("timeout waiting for post-recovery event")
-	}
-	select {
-	case ev := <-c1:
-		t.Errorf("unexpected redelivery of event %s", ev.ID)
-	case ev := <-c2:
-		t.Errorf("unexpected redelivery of event %s", ev.ID)
-	case <-time.After(4 * testBlockDuration):
-	}
+	require.NoError(t, sink.Ack(ctx, received[firstID]))
+	require.NoError(t, sink.Ack(ctx, received[secondID]))
+	require.NoError(t, sink.Close(ctx))
+	require.NoError(t, stream.Destroy(ctx))
 }
 
-// TestEnsureGroupRestoresTTLOnBusyGroup verifies that ensuring an existing
-// consumer group (BUSYGROUP path) restores the stream TTL and that recovery
-// metadata itself never carries a TTL.
-func TestEnsureGroupRestoresTTLOnBusyGroup(t *testing.T) {
-	testName := strings.Replace(t.Name(), "/", "_", -1)
+func TestSinkAcknowledgesFilteredEvents(t *testing.T) {
 	rdb := ptesting.NewRedisClient(t)
-	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
 	ctx := ptesting.NewTestContext(t)
-	s, err := NewStream(testName, rdb,
-		options.WithStreamLogger(pulse.ClueLogger(ctx)),
-		options.WithStreamTTL(time.Hour))
+	stream, err := NewStream(t.Name(), rdb)
 	require.NoError(t, err)
-	sink, err := s.NewSink(ctx, "sink",
+	sink, err := stream.NewSink(
+		ctx,
+		"sink",
 		options.WithSinkStartAtOldest(),
-		options.WithSinkBlockDuration(testBlockDuration))
+		options.WithSinkTopic("wanted"),
+		options.WithSinkBlockDuration(testBlockDuration),
+	)
 	require.NoError(t, err)
-	defer cleanupSink(t, ctx, s, sink)
+	events := sink.Subscribe()
 
-	_, err = s.Add(ctx, "event", []byte("payload"))
+	filteredID, err := stream.Add(ctx, "filtered", []byte("filtered"), options.WithTopic("other"))
 	require.NoError(t, err)
-	require.NoError(t, rdb.Persist(ctx, s.key).Err())
-	require.Equal(t, time.Duration(-1), rdb.PTTL(ctx, s.key).Val())
+	wantedID, err := stream.Add(ctx, "wanted", []byte("wanted"), options.WithTopic("wanted"))
+	require.NoError(t, err)
+	wanted := receiveSinkEvent(t, events)
+	require.Equal(t, wantedID, wanted.ID)
 
-	created, _, err := ensureConsumerGroup(ctx, s, "sink", "$", false)
-	require.NoError(t, err)
-	assert.False(t, created, "group must already exist")
-	assert.Positive(t, rdb.PTTL(ctx, s.key).Val(), "stream TTL must be restored on BUSYGROUP")
-	assert.Equal(t, time.Duration(-1), rdb.PTTL(ctx, cursorsKey(s.key)).Val(),
-		"recovery cursors must outlive the event TTL")
-}
-
-// TestSinkRecoveryAfterEventStreamExpires verifies that when the Redis key
-// backing a TTL stream expires (deleting the consumer group with it), the
-// sink recreates the group from the durable recovery cursor and delivers
-// events published afterwards.
-func TestSinkRecoveryAfterEventStreamExpires(t *testing.T) {
-	testName := strings.Replace(t.Name(), "/", "_", -1)
-	rdb := ptesting.NewRedisClient(t)
-	defer ptesting.CleanupRedis(t, rdb, true, testName)
-	ctx := ptesting.NewTestContext(t)
-	s, err := NewStream(testName, rdb,
-		options.WithStreamLogger(pulse.ClueLogger(ctx)),
-		options.WithStreamTTL(500*time.Millisecond))
-	require.NoError(t, err)
-	sink, err := s.NewSink(ctx, "sink",
-		options.WithSinkStartAtOldest(),
-		options.WithSinkBlockDuration(testBlockDuration))
-	require.NoError(t, err)
-	defer cleanupSink(t, ctx, s, sink)
-
-	c := sink.Subscribe()
-	_, err = s.Add(ctx, "event", []byte("payload"))
-	require.NoError(t, err)
-	require.NoError(t, sink.Ack(ctx, receiveEvent(t, c)))
-
-	// Wait for the stream key (and with it the consumer group) to expire.
 	require.Eventually(t, func() bool {
-		return rdb.Exists(ctx, s.key).Val() == 0
-	}, 2*time.Second, delay)
-
-	futureID, err := s.Add(ctx, "future", []byte("payload"))
+		pending, err := rdb.XPending(ctx, stream.key, sink.Name).Result()
+		return err == nil && pending.Count == 1 && pending.Lower == wantedID
+	}, max, delay)
+	cursor, err := rdb.HGet(ctx, recoveryCursorKey(stream), sink.Name).Result()
 	require.NoError(t, err)
-	ev := receiveEvent(t, c)
-	assert.Equal(t, futureID, ev.ID)
-	require.NoError(t, sink.Ack(ctx, ev))
+	require.Equal(t, filteredID, cursor)
+
+	require.NoError(t, sink.Ack(ctx, wanted))
+	require.NoError(t, sink.Close(ctx))
+	require.NoError(t, stream.Destroy(ctx))
 }
 
-// TestSinkCloseCancelsBlockingRedisRead verifies that Close cancels
-// sink-owned Redis I/O so a blocked XREADGROUP cannot stall shutdown.
-func TestSinkCloseCancelsBlockingRedisRead(t *testing.T) {
-	testName := strings.Replace(t.Name(), "/", "_", -1)
+func TestSinkRecoveryPreservesPendingAndGapEvents(t *testing.T) {
 	rdb := ptesting.NewRedisClient(t)
-	defer ptesting.CleanupRedis(t, rdb, true, testName)
-	ctx := ptesting.NewTestContext(t)
-	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
-	require.NoError(t, err)
-	hook := newRedisCommandHook()
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	hook := &redisCommandHook{}
 	rdb.AddHook(hook)
-	sink, err := s.NewSink(ctx, "sink",
-		options.WithSinkBlockDuration(time.Hour)) // would block Close without cancellation
+	ctx := ptesting.NewTestContext(t)
+	stream, err := NewStream(t.Name(), rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
+	require.NoError(t, err)
+	sink, err := stream.NewSink(
+		ctx,
+		"sink",
+		options.WithSinkStartAtOldest(),
+		options.WithSinkBlockDuration(testBlockDuration),
+	)
+	require.NoError(t, err)
+	defer cleanupSink(t, ctx, stream, sink)
+	events := sink.Subscribe()
+
+	for _, name := range []string{"first", "pending", "out-of-order"} {
+		_, err := stream.Add(ctx, name, []byte(name))
+		require.NoError(t, err)
+	}
+	first := receiveSinkEvent(t, events)
+	pending := receiveSinkEvent(t, events)
+	outOfOrder := receiveSinkEvent(t, events)
+	require.NoError(t, sink.Ack(ctx, first))
+	require.NoError(t, sink.Ack(ctx, outOfOrder))
+
+	cursor, err := rdb.HGet(ctx, recoveryCursorKey(stream), sink.Name).Result()
+	require.NoError(t, err)
+	require.Equal(t, first.ID, cursor)
+
+	readsBeforeDestroy := hook.xreadGroups.Load()
+	require.Eventually(t, func() bool { return hook.xreadGroups.Load() > readsBeforeDestroy }, max, delay)
+	sink.lock.Lock()
+	destroyed, destroyErr := rdb.XGroupDestroy(ctx, stream.key, sink.Name).Result()
+	_, gapErr := stream.Add(ctx, "gap", []byte("gap"))
+	sink.lock.Unlock()
+	require.NoError(t, destroyErr)
+	require.EqualValues(t, 1, destroyed)
+	require.NoError(t, gapErr)
+
+	recovered := []*Event{
+		receiveSinkEvent(t, events),
+		receiveSinkEvent(t, events),
+		receiveSinkEvent(t, events),
+	}
+	assert.Equal(t, []string{"pending", "out-of-order", "gap"}, eventNames(recovered))
+	assert.Equal(t, pending.ID, recovered[0].ID)
+	for _, event := range recovered {
+		require.NoError(t, sink.Ack(ctx, event))
+	}
+}
+
+func TestSinkRecoveryCursorIsSharedAcrossReplicas(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx := ptesting.NewTestContext(t)
+	stream, err := NewStream(t.Name(), rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
+	require.NoError(t, err)
+	sink1, err := stream.NewSink(ctx, "sink", options.WithSinkStartAtOldest(), options.WithSinkBlockDuration(testBlockDuration))
+	require.NoError(t, err)
+	sink2, err := stream.NewSink(ctx, "sink", options.WithSinkStartAtOldest(), options.WithSinkBlockDuration(testBlockDuration))
+	require.NoError(t, err)
+	defer cleanupSink(t, ctx, stream, sink2)
+	events1 := sink1.Subscribe()
+	events2 := sink2.Subscribe()
+
+	eventID, err := stream.Add(ctx, "shared", []byte("shared"))
+	require.NoError(t, err)
+	select {
+	case event := <-events1:
+		require.NoError(t, sink1.Ack(ctx, event))
+	case event := <-events2:
+		require.NoError(t, sink2.Ack(ctx, event))
+	case <-time.After(max):
+		t.Fatal("timed out waiting for shared event")
+	}
+	cursor, err := rdb.HGet(ctx, recoveryCursorKey(stream), sink1.Name).Result()
+	require.NoError(t, err)
+	require.Equal(t, eventID, cursor)
+
+	require.NoError(t, sink1.Close(ctx))
+	require.True(t, sink1.IsClosed())
+	destroyed, err := rdb.XGroupDestroy(ctx, stream.key, sink2.Name).Result()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, destroyed)
+	require.Eventually(t, func() bool {
+		return consumerGroupExists(ctx, rdb, stream.key, sink2.Name)
+	}, max, delay)
+
+	_, err = stream.Add(ctx, "future", []byte("future"))
+	require.NoError(t, err)
+	future := receiveSinkEvent(t, events2)
+	require.Equal(t, "future", future.EventName)
+	require.NoError(t, sink2.Ack(ctx, future))
+}
+
+func TestSinkCloseCancelsBlockingRedisRead(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	hook := &redisCommandHook{
+		readStarted: make(chan struct{}),
+	}
+	hook.blockRead.Store(true)
+	rdb.AddHook(hook)
+	ctx := ptesting.NewTestContext(t)
+	stream, err := NewStream(t.Name(), rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
+	require.NoError(t, err)
+	sink, err := stream.NewSink(ctx, "sink", options.WithSinkBlockDuration(testBlockDuration))
 	require.NoError(t, err)
 
-	hook.blockRead.Store(true)
 	select {
 	case <-hook.readStarted:
 	case <-time.After(max):
-		t.Fatal("read loop never blocked on XREADGROUP")
+		t.Fatal("sink never entered blocking Redis read")
 	}
-
-	done := make(chan struct{})
+	closed := make(chan struct{})
 	go func() {
-		sink.Close(ctx)
-		close(done)
+		require.NoError(t, sink.Close(ctx))
+		close(closed)
 	}()
 	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Close did not cancel the blocked Redis read")
+	case <-closed:
+	case <-time.After(max):
+		t.Fatal("Close did not cancel blocking Redis I/O")
 	}
-	assert.True(t, sink.IsClosed())
-	hook.blockRead.Store(false)
-	require.NoError(t, s.Destroy(ctx))
-}
-
-// TestSinkRejectsStreamMutationAfterClose verifies AddStream and RemoveStream
-// fail with ErrSinkClosed once Close was called.
-func TestSinkRejectsStreamMutationAfterClose(t *testing.T) {
-	testName := strings.Replace(t.Name(), "/", "_", -1)
-	rdb := ptesting.NewRedisClient(t)
-	defer ptesting.CleanupRedis(t, rdb, true, testName)
-	ctx := ptesting.NewTestContext(t)
-	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
-	require.NoError(t, err)
-	sink, err := s.NewSink(ctx, "sink", options.WithSinkBlockDuration(testBlockDuration))
-	require.NoError(t, err)
-	sink.Close(ctx)
 	require.True(t, sink.IsClosed())
-
-	s2, err := NewStream(testName+"2", rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
-	require.NoError(t, err)
-	assert.ErrorIs(t, sink.AddStream(ctx, s2), ErrSinkClosed)
-	assert.ErrorIs(t, sink.RemoveStream(ctx, s), ErrSinkClosed)
-	require.NoError(t, s.Destroy(ctx))
+	require.NoError(t, stream.Destroy(ctx))
 }
 
-// TestSinkAddStreamRollsBackPartialFailure verifies that a failed AddStream
-// compensates the consumer group and cursor it created so no dangling
-// ownership state survives, and that a subsequent AddStream succeeds.
-func TestSinkAddStreamRollsBackPartialFailure(t *testing.T) {
-	testName := strings.Replace(t.Name(), "/", "_", -1)
+func TestSinkCloseRetriesDistributedDetach(t *testing.T) {
 	rdb := ptesting.NewRedisClient(t)
-	defer ptesting.CleanupRedis(t, rdb, true, testName)
-	ctx := ptesting.NewTestContext(t)
-	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
-	require.NoError(t, err)
-	s2, err := NewStream(testName+"2", rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
-	require.NoError(t, err)
-	hook := newRedisCommandHook()
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	failure := errors.New("injected close detach failure")
+	hook := &redisCommandHook{failure: failure}
 	rdb.AddHook(hook)
-	sink, err := s.NewSink(ctx, "sink",
-		options.WithSinkStartAtOldest(),
-		options.WithSinkBlockDuration(testBlockDuration))
+	ctx := ptesting.NewTestContext(t)
+	stream, err := NewStream(t.Name(), rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	require.NoError(t, err)
-	defer cleanupSink(t, ctx, s, sink)
-	defer func() { assert.NoError(t, s2.Destroy(ctx)) }()
-
-	hook.failScript(registerConsumerScript.Hash(), s2.key)
-	require.Error(t, sink.AddStream(ctx, s2))
-	hook.clearFailure()
-
-	sink.lock.Lock()
-	_, owned := sink.streams[s2.key]
-	sink.lock.Unlock()
-	assert.False(t, owned, "failed AddStream must not leave the stream owned")
-	assert.Zero(t, rdb.Exists(ctx, cursorsKey(s2.key)).Val(), "compensation must delete the cursor")
-	groups, err := rdb.XInfoGroups(ctx, s2.key).Result()
+	sink, err := stream.NewSink(ctx, "sink", options.WithSinkBlockDuration(testBlockDuration))
 	require.NoError(t, err)
-	assert.Empty(t, groups, "compensation must delete the consumer group")
 
-	// AddStream succeeds once the failure clears.
-	require.NoError(t, sink.AddStream(ctx, s2))
-	c := sink.Subscribe()
-	_, err = s2.Add(ctx, "event", []byte("payload"))
-	require.NoError(t, err)
-	require.NoError(t, sink.Ack(ctx, receiveEvent(t, c)))
+	hook.failMembershipKey = consumersMapContentKey(stream)
+	hook.failRemove.Store(true)
+	err = sink.Close(ctx)
+	require.ErrorIs(t, err, failure)
+	require.False(t, sink.IsClosed())
+	require.Contains(t, sink.streams, stream.key)
+	hook.failRemove.Store(false)
+
+	require.NoError(t, sink.Close(ctx))
+	require.True(t, sink.IsClosed())
+	require.Empty(t, sink.streams)
+	require.NoError(t, stream.Destroy(ctx))
 }
 
-// TestSinkConsumerRotationRegistersEveryStreamOrRollsBack verifies that
-// replacement consumer creation is failure-atomic across all sink streams:
-// when registration fails for one stream the registrations already made are
-// detached so ownership state never diverges.
+func TestSinkRejectsStreamMutationAfterClose(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx := ptesting.NewTestContext(t)
+	stream, err := NewStream(t.Name(), rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
+	require.NoError(t, err)
+	added, err := NewStream(t.Name()+"-added", rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
+	require.NoError(t, err)
+	defer func() { require.ErrorIs(t, added.Destroy(ctx), ErrStreamNotFound) }()
+	sink, err := stream.NewSink(ctx, "sink", options.WithSinkBlockDuration(testBlockDuration))
+	require.NoError(t, err)
+
+	require.NoError(t, sink.Close(ctx))
+	require.ErrorIs(t, sink.AddStream(ctx, added), ErrSinkClosed)
+	require.ErrorIs(t, sink.RemoveStream(ctx, stream), ErrSinkClosed)
+	require.NoError(t, stream.Destroy(ctx))
+}
+
 func TestSinkConsumerRotationRegistersEveryStreamOrRollsBack(t *testing.T) {
-	testName := strings.Replace(t.Name(), "/", "_", -1)
 	rdb := ptesting.NewRedisClient(t)
-	defer ptesting.CleanupRedis(t, rdb, true, testName)
-	ctx := ptesting.NewTestContext(t)
-	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
-	require.NoError(t, err)
-	s2, err := NewStream(testName+"2", rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
-	require.NoError(t, err)
-	hook := newRedisCommandHook()
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	failure := errors.New("injected replacement consumer failure")
+	hook := &redisCommandHook{failure: failure}
 	rdb.AddHook(hook)
-	sink, err := s.NewSink(ctx, "sink",
-		options.WithSinkStartAtOldest(),
-		options.WithSinkBlockDuration(testBlockDuration))
+	ctx := ptesting.NewTestContext(t)
+	mainStream, err := NewStream(t.Name(), rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	require.NoError(t, err)
-	require.NoError(t, sink.AddStream(ctx, s2))
-	defer cleanupSink(t, ctx, s, sink)
-	defer func() { assert.NoError(t, s2.Destroy(ctx)) }()
+	addedStream, err := NewStream(t.Name()+"-added", rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
+	require.NoError(t, err)
+	defer func() { require.NoError(t, addedStream.Destroy(ctx)) }()
+	sink, err := mainStream.NewSink(ctx, "sink", options.WithSinkBlockDuration(testBlockDuration))
+	require.NoError(t, err)
+	defer cleanupSink(t, ctx, mainStream, sink)
+	require.NoError(t, sink.AddStream(ctx, addedStream))
 	original := sink.consumer
 
-	hook.failScript(registerConsumerScript.Hash(), s2.key)
 	sink.lock.Lock()
+	hook.failCreateConsumerKey = addedStream.key
+	hook.failCreateConsumer.Store(true)
 	_, err = sink.newConsumer(ctx)
+	hook.failCreateConsumer.Store(false)
 	sink.lock.Unlock()
-	require.Error(t, err)
-	hook.clearFailure()
-
-	for _, stream := range []*Stream{s, s2} {
-		assert.Equal(t, []string{original}, memberConsumers(t, ctx, rdb, stream, "sink"),
-			"membership of %s must be unchanged after rollback", stream.Name)
-		assert.Equal(t, []string{original}, groupConsumers(t, ctx, rdb, stream, "sink"),
-			"consumer group of %s must be unchanged after rollback", stream.Name)
+	require.ErrorIs(t, err, failure)
+	require.Equal(t, original, sink.consumer)
+	for _, stream := range []*Stream{mainStream, addedStream} {
+		require.Eventually(t, func() bool {
+			members, ok := sink.streams[stream.key].consumers.GetValues(sink.Name)
+			return ok && assert.ObjectsAreEqual([]string{original}, members)
+		}, max, delay)
+		consumers, err := rdb.XInfoConsumers(ctx, stream.key, sink.Name).Result()
+		require.NoError(t, err)
+		require.Len(t, consumers, 1)
+		require.Equal(t, original, consumers[0].Name)
 	}
 
-	// Rotation succeeds once the failure clears and registers both streams.
 	sink.lock.Lock()
 	replacement, err := sink.newConsumer(ctx)
+	if err == nil {
+		sink.consumer = replacement
+	}
 	sink.lock.Unlock()
 	require.NoError(t, err)
-	for _, stream := range []*Stream{s, s2} {
-		assert.ElementsMatch(t, []string{original, replacement}, memberConsumers(t, ctx, rdb, stream, "sink"))
+	require.NotEqual(t, original, replacement)
+	for _, stream := range []*Stream{mainStream, addedStream} {
+		members, ok := sink.streams[stream.key].consumers.GetValues(sink.Name)
+		require.True(t, ok)
+		require.Contains(t, members, replacement)
+		consumers, err := rdb.XInfoConsumers(ctx, stream.key, sink.Name).Result()
+		require.NoError(t, err)
+		assert.Contains(t, consumerNames(consumers), replacement)
 	}
 }
 
-// TestDestroyFencesSinkMetadataWrites is the P1-A regression test: once
-// Stream.Destroy runs, a live sink (setup paths, replacement-consumer
-// creation, keepalive-driven loops, lease work) must not resurrect any
-// stream-scoped metadata.
-func TestDestroyFencesSinkMetadataWrites(t *testing.T) {
-	testName := strings.Replace(t.Name(), "/", "_", -1)
-	var origCheckIdlePeriod time.Duration
-	origCheckIdlePeriod, checkIdlePeriod = checkIdlePeriod, testCheckIdlePeriod
-	defer func() { checkIdlePeriod = origCheckIdlePeriod }()
-
+func TestSinkStreamMutationRollback(t *testing.T) {
 	rdb := ptesting.NewRedisClient(t)
-	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	failure := errors.New("injected ownership failure")
+	hook := &redisCommandHook{failure: failure}
+	rdb.AddHook(hook)
 	ctx := ptesting.NewTestContext(t)
-	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
+	mainStream, err := NewStream(t.Name(), rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	require.NoError(t, err)
-	sink, err := s.NewSink(ctx, "sink",
-		options.WithSinkStartAtOldest(),
-		options.WithSinkBlockDuration(testBlockDuration),
-		options.WithSinkAckGracePeriod(testAckDuration))
+	addedStream, err := NewStream(t.Name()+"-added", rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
 	require.NoError(t, err)
-	defer sink.Close(ctx)
-
-	c := sink.Subscribe()
-	_, err = s.Add(ctx, "event", []byte("payload"))
+	defer func() { require.NoError(t, addedStream.Destroy(ctx)) }()
+	sink, err := mainStream.NewSink(ctx, "sink", options.WithSinkBlockDuration(testBlockDuration))
 	require.NoError(t, err)
-	require.NoError(t, sink.Ack(ctx, receiveEvent(t, c)))
-	require.Equal(t, int64(1), rdb.Exists(ctx, cursorsKey(s.key)).Val())
+	defer cleanupSink(t, ctx, mainStream, sink)
 
-	// Destroy the stream while the sink keepalive and idle-check loops are
-	// due to run.
-	require.NoError(t, s.Destroy(ctx))
+	hook.failCreateConsumer.Store(true)
+	hook.failCreateConsumerKey = addedStream.key
+	err = sink.AddStream(ctx, addedStream)
+	hook.failCreateConsumer.Store(false)
+	require.ErrorIs(t, err, failure)
+	assert.False(t, sinkOwnsStream(sink, addedStream))
+	assert.NotContains(t, sink.streams, addedStream.key)
+	assert.True(t, consumerGroupExists(ctx, rdb, addedStream.key, sink.Name))
+	assert.True(t, rdb.HExists(ctx, recoveryCursorKey(addedStream), sink.Name).Val())
 
-	// Every fenced metadata write must fail with ErrStreamDestroyed.
-	assert.ErrorIs(t, registerSinkConsumer(ctx, s, "sink", "ghost"), ErrStreamDestroyed)
-	_, _, err = ensureConsumerGroup(ctx, s, "sink", "$", false)
-	assert.ErrorIs(t, err, ErrStreamDestroyed)
-	_, _, err = acquireSinkLease(ctx, s, "sink", "ghost-owner", 1000)
-	assert.ErrorIs(t, err, ErrStreamDestroyed)
-
-	// The sink read loop observes NOGROUP, fails recovery with
-	// ErrStreamDestroyed, and drops the stream instead of resurrecting it.
-	assert.Eventually(t, func() bool {
-		sink.lock.Lock()
-		defer sink.lock.Unlock()
-		return len(sink.streams) == 0
-	}, max, delay, "sink must drop the destroyed stream")
-
-	// Let the periodic keepalive and idle-check loops tick several times,
-	// then verify no stream-scoped metadata was recreated.
-	time.Sleep(5 * testCheckIdlePeriod)
-	assert.Zero(t, rdb.Exists(ctx, s.key).Val(), "event stream must stay deleted")
-	assert.Zero(t, rdb.Exists(ctx, cursorsKey(s.key)).Val(), "recovery cursor must stay deleted")
-	assert.Zero(t, rdb.Exists(ctx, leaseKey(s.key, "sink")).Val(), "lease must stay deleted")
-	content, err := rdb.HGetAll(ctx, membershipContentKey(s.Name)).Result()
+	consumerMap, err := rmap.Join(ctx, consumersMapName(addedStream), rdb)
 	require.NoError(t, err)
-	assert.Equal(t, "destroy", content["=kind"], "membership map must remain a destroy tombstone")
-	assert.NotContains(t, content, "sink", "membership must not be resurrected")
-	assert.Equal(t, "destroyed", rdb.HGet(ctx, lifecycleKey(s.key), "state").Val())
+	assert.NotContains(t, consumerMap.Map(), sink.Name)
+	consumerMap.Close()
+
+	require.NoError(t, sink.AddStream(ctx, addedStream))
+	hook.failMembershipKey = consumersMapContentKey(addedStream)
+	hook.failRemove.Store(true)
+	err = sink.RemoveStream(ctx, addedStream)
+	hook.failRemove.Store(false)
+	require.ErrorIs(t, err, failure)
+	assert.True(t, sinkOwnsStream(sink, addedStream))
+	assert.Contains(t, sink.streams, addedStream.key)
+	assert.True(t, consumerGroupExists(ctx, rdb, addedStream.key, sink.Name))
+
+	require.NoError(t, sink.RemoveStream(ctx, addedStream))
+	assert.False(t, sinkOwnsStream(sink, addedStream))
+	assert.True(t, consumerGroupExists(ctx, rdb, addedStream.key, sink.Name))
+	assert.True(t, rdb.HExists(ctx, recoveryCursorKey(addedStream), sink.Name).Val())
 }
 
-// TestDispatchLeavesRemovedStreamEventsPending verifies that a batch read for
-// a stream removed from this sink concurrently with the read is left pending
-// for the surviving group members instead of being acknowledged undelivered,
-// which would permanently drop the events for the whole group.
-func TestDispatchLeavesRemovedStreamEventsPending(t *testing.T) {
-	testName := strings.Replace(t.Name(), "/", "_", -1)
+func TestSinkRecoveryMetadataOutlivesEventTTL(t *testing.T) {
 	rdb := ptesting.NewRedisClient(t)
-	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
 	ctx := ptesting.NewTestContext(t)
-	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
+	stream, err := NewStream(
+		t.Name(),
+		rdb,
+		options.WithStreamTTL(5*time.Second),
+		options.WithStreamLogger(pulse.ClueLogger(ctx)),
+	)
 	require.NoError(t, err)
-	removed, err := s.NewSink(ctx, "sink",
-		options.WithSinkStartAtOldest(),
-		options.WithSinkBlockDuration(testBlockDuration))
+	sink, err := stream.NewSink(ctx, "sink", options.WithSinkBlockDuration(testBlockDuration))
 	require.NoError(t, err)
-	defer removed.Close(ctx)
-	s2, err := NewStream(testName, ptesting.NewRedisClient(t), options.WithStreamLogger(pulse.ClueLogger(ctx)))
-	require.NoError(t, err)
-	survivor, err := s2.NewSink(ctx, "sink",
-		options.WithSinkStartAtOldest(),
-		options.WithSinkBlockDuration(testBlockDuration))
-	require.NoError(t, err)
-	defer cleanupSink(t, ctx, s2, survivor)
+	defer cleanupSink(t, ctx, stream, sink)
 
-	// Drop the stream from one sink; the group survives through the other
-	// member. Wait out reads issued before the removal so the event below is
-	// deterministically delivered to the survivor's consumer PEL, unacked.
-	c := survivor.Subscribe()
-	require.NoError(t, removed.RemoveStream(ctx, s))
-	time.Sleep(3 * testBlockDuration)
-	id, err := s.Add(ctx, "event", []byte("payload"))
+	require.NoError(t, rdb.Persist(ctx, stream.key).Err())
+	require.NoError(t, rdb.Persist(ctx, recoveryCursorKey(stream)).Err())
+	require.Equal(t, time.Duration(-1), rdb.PTTL(ctx, stream.key).Val())
+	require.Equal(t, time.Duration(-1), rdb.PTTL(ctx, recoveryCursorKey(stream)).Val())
+	sink.lock.Lock()
+	err = sink.recoverConsumerGroups(ctx)
+	sink.lock.Unlock()
 	require.NoError(t, err)
-	ev := receiveEvent(t, c)
-	require.Equal(t, id, ev.ID)
-
-	// Replay the racing batch against the sink that no longer owns the
-	// stream: dispatch must not settle the group's pending entry.
-	require.NoError(t, removed.dispatch([]redis.XStream{{
-		Stream:   s.key,
-		Messages: []redis.XMessage{{ID: id, Values: map[string]any{nameKey: "event", payloadKey: "payload"}}},
-	}}))
-	pending, err := rdb.XPending(ctx, s.key, "sink").Result()
-	require.NoError(t, err)
-	assert.Equal(t, int64(1), pending.Count, "unowned batch must stay pending for surviving members")
-	require.NoError(t, survivor.Ack(ctx, ev))
+	assert.Greater(t, rdb.PTTL(ctx, stream.key).Val(), time.Duration(0))
+	assert.Equal(t, time.Duration(-1), rdb.PTTL(ctx, recoveryCursorKey(stream)).Val())
 }
 
-// TestSinkAcknowledgesFilteredEvents verifies that events dropped by the sink
-// topic filter are acknowledged so they cannot hold back the recovery cursor.
-func TestSinkAcknowledgesFilteredEvents(t *testing.T) {
-	testName := strings.Replace(t.Name(), "/", "_", -1)
+func TestSinkAcknowledgesBatchFromConcurrentlyRemovedSnapshot(t *testing.T) {
 	rdb := ptesting.NewRedisClient(t)
-	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	hook := &redisCommandHook{}
+	rdb.AddHook(hook)
 	ctx := ptesting.NewTestContext(t)
-	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
+	main, err := NewStream(t.Name()+"-main", rdb)
 	require.NoError(t, err)
-	sink, err := s.NewSink(ctx, "sink",
-		options.WithSinkStartAtOldest(),
-		options.WithSinkBlockDuration(testBlockDuration),
-		options.WithSinkTopic("keep"))
+	removed, err := NewStream(t.Name()+"-removed", rdb)
 	require.NoError(t, err)
-	defer cleanupSink(t, ctx, s, sink)
+	sink, err := main.NewSink(ctx, "sink", options.WithSinkBlockDuration(time.Second))
+	require.NoError(t, err)
+	require.NoError(t, sink.AddStream(ctx, removed, options.WithAddStreamStartAtOldest()))
+	events := sink.Subscribe()
+	reads := hook.xreadGroups.Load()
+	require.Eventually(t, func() bool {
+		return hook.xreadGroups.Load() > reads
+	}, max, delay)
 
-	c := sink.Subscribe()
-	_, err = s.Add(ctx, "dropped", []byte("payload"), options.WithTopic("drop"))
+	require.NoError(t, sink.RemoveStream(ctx, removed))
+	eventID, err := removed.Add(ctx, "removed", []byte("payload"))
 	require.NoError(t, err)
-	keepID, err := s.Add(ctx, "kept", []byte("payload"), options.WithTopic("keep"))
-	require.NoError(t, err)
-
-	ev := receiveEvent(t, c)
-	assert.Equal(t, keepID, ev.ID)
-	require.NoError(t, sink.Ack(ctx, ev))
-	assert.Equal(t, keepID, recoveryCursor(t, ctx, rdb, s, "sink"))
-	pending, err := rdb.XPending(ctx, s.key, "sink").Result()
-	require.NoError(t, err)
-	assert.Zero(t, pending.Count, "filtered events must be settled")
-}
-
-// TestSinkNoAckAdvancesRecoveryCursor verifies that NoAck sinks advance the
-// recovery cursor on delivery so recovery never replays delivered events.
-func TestSinkNoAckAdvancesRecoveryCursor(t *testing.T) {
-	testName := strings.Replace(t.Name(), "/", "_", -1)
-	rdb := ptesting.NewRedisClient(t)
-	defer ptesting.CleanupRedis(t, rdb, true, testName)
-	ctx := ptesting.NewTestContext(t)
-	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
-	require.NoError(t, err)
-	sink, err := s.NewSink(ctx, "sink",
-		options.WithSinkStartAtOldest(),
-		options.WithSinkBlockDuration(testBlockDuration),
-		options.WithSinkNoAck())
-	require.NoError(t, err)
-	defer cleanupSink(t, ctx, s, sink)
-
-	c := sink.Subscribe()
-	id, err := s.Add(ctx, "event", []byte("payload"))
-	require.NoError(t, err)
-	ev := receiveEvent(t, c)
-	assert.Equal(t, id, ev.ID)
-	assert.Equal(t, id, recoveryCursor(t, ctx, rdb, s, "sink"))
-
-	require.NoError(t, rdb.XGroupDestroy(ctx, s.key, "sink").Err())
-	futureID, err := s.Add(ctx, "future", []byte("payload"))
-	require.NoError(t, err)
-	ev = receiveEvent(t, c)
-	assert.Equal(t, futureID, ev.ID, "recovery must resume after the delivered event")
+	require.Eventually(t, func() bool {
+		cursor := rdb.HGet(ctx, recoveryCursorKey(removed), sink.Name).Val()
+		pending, pendingErr := rdb.XPending(ctx, removed.key, sink.Name).Result()
+		return pendingErr == nil && pending.Count == 0 && cursor == eventID
+	}, max, delay)
 	select {
-	case ev := <-c:
-		t.Errorf("unexpected redelivery of event %s", ev.ID)
-	case <-time.After(4 * testBlockDuration):
+	case event := <-events:
+		require.NotEqual(t, eventID, event.ID)
+	case <-time.After(2 * testBlockDuration):
 	}
+
+	require.NoError(t, sink.Close(ctx))
+	require.NoError(t, main.Destroy(ctx))
+	require.NoError(t, removed.Destroy(ctx))
 }
 
-// TestEventAckerAdvancesRecoveryCursor verifies the cursor arithmetic of the
-// recovery acker: the cursor is always the entry preceding the oldest pending
-// event, and the group last-delivered-id once the PEL drains, even when
-// events are acknowledged out of order.
-func TestEventAckerAdvancesRecoveryCursor(t *testing.T) {
-	testName := strings.Replace(t.Name(), "/", "_", -1)
+func TestSinkRecoveryAfterEventStreamExpiresDeliversNewEvents(t *testing.T) {
 	rdb := ptesting.NewRedisClient(t)
-	defer ptesting.CleanupRedis(t, rdb, true, testName)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
 	ctx := ptesting.NewTestContext(t)
-	s, err := NewStream(testName, rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
+	stream, err := NewStream(t.Name(), rdb, options.WithStreamTTL(2*time.Second))
 	require.NoError(t, err)
-	sink, err := s.NewSink(ctx, "sink",
+	sink, err := stream.NewSink(
+		ctx,
+		"sink",
 		options.WithSinkStartAtOldest(),
-		options.WithSinkBlockDuration(testBlockDuration))
+		options.WithSinkBlockDuration(testBlockDuration),
+	)
 	require.NoError(t, err)
-	defer cleanupSink(t, ctx, s, sink)
+	events := sink.Subscribe()
+	_, err = stream.Add(ctx, "old", []byte("payload"))
+	require.NoError(t, err)
+	require.NoError(t, sink.Ack(ctx, receiveSinkEvent(t, events)))
+	require.NoError(t, sink.Close(ctx))
+	require.NoError(t, rdb.PExpire(ctx, stream.key, 10*time.Millisecond).Err())
+	require.Eventually(t, func() bool {
+		return rdb.Exists(ctx, stream.key).Val() == 0
+	}, max, delay)
+	require.Equal(t, time.Duration(-1), rdb.PTTL(ctx, recoveryCursorKey(stream)).Val())
 
-	c := sink.Subscribe()
-	ids := make([]string, 3)
-	for i := range ids {
-		ids[i], err = s.Add(ctx, fmt.Sprintf("event%d", i), []byte("payload"))
+	freshID, err := stream.Add(ctx, "fresh", []byte("payload"))
+	require.NoError(t, err)
+	recovered, err := stream.NewSink(
+		ctx,
+		"sink",
+		options.WithSinkStartAtOldest(),
+		options.WithSinkBlockDuration(testBlockDuration),
+	)
+	require.NoError(t, err)
+	fresh := receiveSinkEvent(t, recovered.Subscribe())
+	require.Equal(t, freshID, fresh.ID)
+	require.NoError(t, recovered.Ack(ctx, fresh))
+	require.NoError(t, recovered.Close(ctx))
+	require.NoError(t, stream.Destroy(ctx))
+}
+
+func TestSinkNoAckUsesPendingEntryListBeforeDelivery(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	hook := &redisCommandHook{}
+	rdb.AddHook(hook)
+	ctx := ptesting.NewTestContext(t)
+	stream, err := NewStream(t.Name(), rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
+	require.NoError(t, err)
+	sink, err := stream.NewSink(
+		ctx,
+		"sink",
+		options.WithSinkStartAtOldest(),
+		options.WithSinkNoAck(),
+		options.WithSinkBlockDuration(testBlockDuration),
+	)
+	require.NoError(t, err)
+	defer cleanupSink(t, ctx, stream, sink)
+	events := sink.Subscribe()
+
+	eventID, err := stream.Add(ctx, "at-most-once", []byte("payload"))
+	require.NoError(t, err)
+	event := receiveSinkEvent(t, events)
+	require.Equal(t, eventID, event.ID)
+	require.False(t, hook.usedNoAck.Load(), "sink sent Redis NOACK")
+	pending, err := rdb.XPending(ctx, stream.key, sink.Name).Result()
+	require.NoError(t, err)
+	require.Zero(t, pending.Count)
+	cursor, err := rdb.HGet(ctx, recoveryCursorKey(stream), sink.Name).Result()
+	require.NoError(t, err)
+	require.Equal(t, eventID, cursor)
+
+	require.NoError(t, rdb.XGroupDestroy(ctx, stream.key, sink.Name).Err())
+	require.Eventually(t, func() bool {
+		return consumerGroupExists(ctx, rdb, stream.key, sink.Name)
+	}, max, delay)
+	_, err = stream.Add(ctx, "future", []byte("future"))
+	require.NoError(t, err)
+	require.Equal(t, "future", receiveSinkEvent(t, events).EventName)
+}
+
+func TestEventAckerAdvancesRecoveryCursor(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx := ptesting.NewTestContext(t)
+	stream, err := NewStream(t.Name(), rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
+	require.NoError(t, err)
+	sink, err := stream.NewSink(
+		ctx,
+		"sink",
+		options.WithSinkStartAtOldest(),
+		options.WithSinkBlockDuration(testBlockDuration),
+	)
+	require.NoError(t, err)
+	defer cleanupSink(t, ctx, stream, sink)
+	events := sink.Subscribe()
+
+	eventID, err := stream.Add(ctx, "direct-ack", []byte("payload"))
+	require.NoError(t, err)
+	event := receiveSinkEvent(t, events)
+	acked, err := event.Acker.XAck(ctx, stream.key, sink.Name, event.ID).Result()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, acked)
+	cursor, err := rdb.HGet(ctx, recoveryCursorKey(stream), sink.Name).Result()
+	require.NoError(t, err)
+	require.Equal(t, eventID, cursor)
+}
+
+func TestEventAckerAcknowledgesMultipleIDs(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx := ptesting.NewTestContext(t)
+	stream, err := NewStream(t.Name(), rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
+	require.NoError(t, err)
+	sink, err := stream.NewSink(
+		ctx,
+		"sink",
+		options.WithSinkStartAtOldest(),
+		options.WithSinkBlockDuration(testBlockDuration),
+	)
+	require.NoError(t, err)
+	defer cleanupSink(t, ctx, stream, sink)
+	events := sink.Subscribe()
+	for _, name := range []string{"first", "second"} {
+		_, err := stream.Add(ctx, name, []byte(name))
 		require.NoError(t, err)
 	}
-	events := make(map[string]*Event, 3)
-	for range ids {
-		ev := receiveEvent(t, c)
-		events[ev.ID] = ev
-	}
+	first := receiveSinkEvent(t, events)
+	second := receiveSinkEvent(t, events)
 
-	// Ack out of order: the middle event first.
-	require.NoError(t, sink.Ack(ctx, events[ids[1]]))
-	assert.Equal(t, "0-0", recoveryCursor(t, ctx, rdb, s, "sink"),
-		"oldest pending event is the first entry so nothing is durably settled")
-	require.NoError(t, sink.Ack(ctx, events[ids[0]]))
-	assert.Equal(t, ids[1], recoveryCursor(t, ctx, rdb, s, "sink"),
-		"cursor must jump past the contiguous acknowledged prefix")
-	require.NoError(t, sink.Ack(ctx, events[ids[2]]))
-	assert.Equal(t, ids[2], recoveryCursor(t, ctx, rdb, s, "sink"),
-		"cursor must reach last-delivered-id once the PEL drains")
+	acked, err := first.Acker.XAck(ctx, stream.key, sink.Name, first.ID, second.ID).Result()
+	require.NoError(t, err)
+	require.EqualValues(t, 2, acked)
+	cursor, err := rdb.HGet(ctx, recoveryCursorKey(stream), sink.Name).Result()
+	require.NoError(t, err)
+	require.Equal(t, second.ID, cursor)
 }
 
-// TestReadRetryJitterBounds verifies the retry backoff is jittered between
-// half and full of the current backoff and doubles up to the cap.
+func TestSinkAckDelegatesToEventAcker(t *testing.T) {
+	ctx := context.Background()
+	acker := &recordingAcker{}
+	sink := &Sink{logger: pulse.NoopLogger()}
+	event := &Event{
+		ID:         "1-0",
+		StreamName: "stream",
+		SinkName:   "sink",
+		Acker:      acker,
+		streamKey:  "pulse:stream:stream",
+	}
+
+	require.NoError(t, sink.Ack(ctx, event))
+	require.Equal(t, event.streamKey, acker.streamKey)
+	require.Equal(t, event.SinkName, acker.group)
+	require.Equal(t, []string{event.ID}, acker.ids)
+}
+
+func TestRecoveryCursorsShareOneStreamHash(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx := ptesting.NewTestContext(t)
+	stream, err := NewStream(t.Name(), rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
+	require.NoError(t, err)
+	sink1, err := stream.NewSink(ctx, "first", options.WithSinkBlockDuration(testBlockDuration))
+	require.NoError(t, err)
+	sink2, err := stream.NewSink(ctx, "second", options.WithSinkBlockDuration(testBlockDuration))
+	require.NoError(t, err)
+	defer cleanupSink(t, ctx, stream, sink1)
+	defer func() { require.NoError(t, sink2.Close(ctx)) }()
+
+	cursors, err := rdb.HGetAll(ctx, recoveryCursorKey(stream)).Result()
+	require.NoError(t, err)
+	require.Len(t, cursors, 2)
+	require.Contains(t, cursors, sink1.Name)
+	require.Contains(t, cursors, sink2.Name)
+	legacyKeys, err := rdb.Keys(ctx, stream.key+":sink:*:recovery").Result()
+	require.NoError(t, err)
+	require.Empty(t, legacyKeys)
+}
+
 func TestReadRetryJitterBounds(t *testing.T) {
-	var r readRetry
-	expected := minReadRetryBackoff
+	low := readRetry{jitter: func(int64) int64 { return 0 }}
+	high := readRetry{jitter: func(n int64) int64 { return n - 1 }}
+	limit := readRetryInitialDelay
 	for range 10 {
-		d := r.next()
-		assert.GreaterOrEqual(t, d, expected/2)
-		assert.LessOrEqual(t, d, expected)
-		expected = 2 * expected
-		if expected > maxReadRetryBackoff {
-			expected = maxReadRetryBackoff
-		}
+		assert.Equal(t, limit/2, low.nextDelay())
+		assert.Equal(t, limit, high.nextDelay())
+		limit = min(limit*2, readRetryMaxDelay)
 	}
-	r.reset()
-	d := r.next()
-	assert.GreaterOrEqual(t, d, minReadRetryBackoff/2)
-	assert.LessOrEqual(t, d, minReadRetryBackoff)
 }
 
-// receiveEvent reads one event from the channel without acknowledging it or
-// fails the test after the standard timeout.
-func receiveEvent(t *testing.T, c <-chan *Event) *Event {
+// XAck records the Event acknowledgement invoked by Sink.Ack.
+func (a *recordingAcker) XAck(ctx context.Context, streamKey, group string, ids ...string) *redis.IntCmd {
+	a.streamKey = streamKey
+	a.group = group
+	a.ids = append([]string(nil), ids...)
+	cmd := redis.NewIntCmd(ctx)
+	cmd.SetVal(int64(len(ids)))
+	return cmd
+}
+
+// receiveSinkEvent reads one event without acknowledging it.
+func receiveSinkEvent(t *testing.T, events <-chan *Event) *Event {
 	t.Helper()
 	select {
-	case ev := <-c:
-		require.NotNil(t, ev)
-		return ev
+	case event := <-events:
+		require.NotNil(t, event)
+		return event
 	case <-time.After(max):
-		t.Fatal("timeout waiting for event")
+		t.Fatal("timed out waiting for sink event")
 		return nil
 	}
 }
 
-// recoveryCursor returns the durable recovery cursor stored for the sink on
-// the stream.
-func recoveryCursor(t *testing.T, ctx context.Context, rdb *redis.Client, s *Stream, sink string) string {
-	t.Helper()
-	cursor, err := rdb.HGet(ctx, cursorsKey(s.key), sink).Result()
-	require.NoError(t, err)
-	return cursor
-}
-
-// memberConsumers returns the consumer names recorded for the sink in the
-// stream membership map.
-func memberConsumers(t *testing.T, ctx context.Context, rdb *redis.Client, s *Stream, sink string) []string {
-	t.Helper()
-	raw, err := rdb.HGet(ctx, membershipContentKey(s.Name), sink).Result()
-	require.NoError(t, err)
-	var names []string
-	require.NoError(t, json.Unmarshal([]byte(raw), &names))
+// eventNames projects event names in delivery order.
+func eventNames(events []*Event) []string {
+	names := make([]string, len(events))
+	for i, event := range events {
+		names[i] = event.EventName
+	}
 	return names
 }
 
-// groupConsumers returns the Redis consumer names of the sink group on the
-// stream.
-func groupConsumers(t *testing.T, ctx context.Context, rdb *redis.Client, s *Stream, sink string) []string {
-	t.Helper()
-	consumers, err := rdb.XInfoConsumers(ctx, s.key, sink).Result()
-	require.NoError(t, err)
+// consumerNames projects Redis consumer info for membership assertions.
+func consumerNames(consumers []redis.XInfoConsumer) []string {
 	names := make([]string, len(consumers))
-	for i, c := range consumers {
-		names[i] = c.Name
+	for i, consumer := range consumers {
+		names[i] = consumer.Name
 	}
 	return names
 }
 
-type (
-	// redisCommandHook injects command-specific failures and blocking reads
-	// into the sink Redis client to prove cancellation, bounded retries, and
-	// failure-atomic ownership changes.
-	redisCommandHook struct {
-		// blockRead blocks XREADGROUP calls until their context is canceled.
-		blockRead atomic.Bool
-		// readStarted is closed the first time a read blocks.
-		readStarted chan struct{}
-		// started guards readStarted.
-		started sync.Once
-		// mu guards the failure configuration below.
-		mu sync.Mutex
-		// failHash is the script hash whose EVALSHA calls fail.
-		failHash string
-		// failKey restricts injected failures to invocations naming this key.
-		failKey string
-	}
-)
-
-// errInjected is the transport failure injected by redisCommandHook.
-var errInjected = errors.New("injected redis failure")
-
-// newRedisCommandHook returns a hook with no active failure.
-func newRedisCommandHook() *redisCommandHook {
-	return &redisCommandHook{readStarted: make(chan struct{})}
-}
-
-// failScript makes EVALSHA calls of the script with the given hash fail when
-// their arguments include key.
-func (h *redisCommandHook) failScript(hash, key string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.failHash, h.failKey = hash, key
-}
-
-// clearFailure removes the active script failure.
-func (h *redisCommandHook) clearFailure() {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.failHash, h.failKey = "", ""
-}
-
-// DialHook preserves the client's normal Redis connection behavior.
-func (h *redisCommandHook) DialHook(next redis.DialHook) redis.DialHook {
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return next(ctx, network, addr)
-	}
-}
-
-// ProcessHook blocks reads and injects script failures per the hook
-// configuration.
-func (h *redisCommandHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
-	return func(ctx context.Context, cmd redis.Cmder) error {
-		switch cmd.Name() {
-		case "xreadgroup":
-			if h.blockRead.Load() {
-				h.started.Do(func() { close(h.readStarted) })
-				<-ctx.Done()
-				return ctx.Err()
-			}
-		case "evalsha":
-			h.mu.Lock()
-			hash, key := h.failHash, h.failKey
-			h.mu.Unlock()
-			if hash != "" && len(cmd.Args()) > 1 && cmd.Args()[1] == hash {
-				for _, arg := range cmd.Args() {
-					if s, ok := arg.(string); ok && s == key {
-						return errInjected
-					}
-				}
-			}
+// sinkOwnsStream reports local ownership under the sink lock.
+func sinkOwnsStream(sink *Sink, stream *Stream) bool {
+	sink.lock.Lock()
+	defer sink.lock.Unlock()
+	for _, owned := range sink.streams {
+		if owned.stream == stream {
+			return true
 		}
-		return next(ctx, cmd)
 	}
+	return false
 }
 
-// ProcessPipelineHook preserves pipeline behavior; the sink does not issue
-// pipelines on the paths exercised by these tests.
-func (h *redisCommandHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
-	return func(ctx context.Context, cmds []redis.Cmder) error {
-		return next(ctx, cmds)
-	}
+func TestDestroyedGenerationMetadataCannotBeRecreated(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx := ptesting.NewTestContext(t)
+	stream, err := NewStream(t.Name(), rdb, options.WithStreamLogger(pulse.ClueLogger(ctx)))
+	require.NoError(t, err)
+	sink, err := stream.NewSink(ctx, "sink", options.WithSinkBlockDuration(testBlockDuration))
+	require.NoError(t, err)
+	defer func() { require.NoError(t, sink.Close(ctx)) }()
+	state := sink.streams[stream.key]
+	require.NotNil(t, state)
+	keepAliveKey := rmapContentKey(sinkKeepAliveMapName(stream, "sink"))
+	membershipKey := consumersMapContentKey(stream)
+	require.EqualValues(t, 1, rdb.Exists(ctx, keepAliveKey).Val())
+	require.EqualValues(t, 1, rdb.Exists(ctx, membershipKey).Val())
+
+	require.NoError(t, stream.Destroy(ctx))
+	require.EqualValues(t, 0, rdb.Exists(ctx, keepAliveKey).Val())
+	require.EqualValues(t, 0, rdb.Exists(ctx, membershipKey).Val())
+
+	// Neither a periodic keep-alive tick nor a consumer registration may
+	// resurrect metadata for the destroyed generation.
+	err = setSinkKeepAlive(ctx, state, "sink", sink.consumer, time.Now().UnixNano())
+	require.ErrorIs(t, err, ErrStreamDestroyed)
+	err = registerSinkConsumer(ctx, state, "sink", "ghost-consumer", time.Now().UnixNano())
+	require.ErrorIs(t, err, ErrStreamDestroyed)
+	require.EqualValues(t, 0, rdb.Exists(ctx, keepAliveKey).Val())
+	require.EqualValues(t, 0, rdb.Exists(ctx, membershipKey).Val())
 }

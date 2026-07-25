@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/oklog/ulid/v2"
 	redis "github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -21,6 +24,43 @@ var (
 	redisAddr = "localhost:6379"
 	// streamRegexp is a regular expression that matches valid stream keys
 	streamRegexp = regexp.MustCompile(`^pulse:stream:[^:]+:node:.*`)
+	// renewDatabaseLeaseScript extends only the lease still owned by this test.
+	renewDatabaseLeaseScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) ~= ARGV[1] then
+    return 0
+end
+redis.call("PEXPIRE", KEYS[1], ARGV[2])
+return 1
+`)
+	// releaseDatabaseLeaseScript releases only the lease still owned by this
+	// test process.
+	releaseDatabaseLeaseScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) ~= ARGV[1] then
+    return 0
+end
+return redis.call("DEL", KEYS[1])
+`)
+)
+
+const (
+	databaseLeaseTTL       = 2 * time.Minute
+	databaseLeaseHeartbeat = 30 * time.Second
+	databaseLeaseWait      = 30 * time.Second
+)
+
+type (
+	// databaseLease owns one non-coordination Redis database for one test,
+	// including cross-process heartbeat and release.
+	databaseLease struct {
+		coordinator  *redis.Client
+		key          string
+		token        string
+		stop         chan struct{}
+		done         chan struct{}
+		lock         sync.Mutex
+		heartbeatErr error
+		t            *testing.T
+	}
 )
 
 func init() {
@@ -32,10 +72,18 @@ func init() {
 	}
 }
 
+// NewRedisClient returns a client backed by a cross-process leased Redis
+// database. Package names are irrelevant, and FlushDB is safe because the
+// caller holds the database's exclusive lease until test cleanup completes.
 func NewRedisClient(t *testing.T) *redis.Client {
 	t.Helper()
-	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd})
+	lease, db := acquireDatabaseLease(t)
+	t.Cleanup(func() {
+		lease.release(t)
+	})
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd, DB: db})
 	require.NoError(t, rdb.Ping(context.Background()).Err())
+	require.NoError(t, rdb.FlushDB(context.Background()).Err())
 	return rdb
 }
 
@@ -47,53 +95,56 @@ func CleanupRedis(t *testing.T, rdb *redis.Client, checkClean bool, testName str
 	t.Helper()
 	ctx := context.Background()
 	if checkClean {
-		var (
-			filtered []string
-			keysErr  error
-		)
-		assert.Eventually(t, func() bool {
-			var keys []string
-			keys, keysErr = rdb.Keys(ctx, "*").Result()
-			if keysErr != nil {
-				filtered = []string{fmt.Sprintf("keys error: %v", keysErr)}
-				return false
-			}
-			filtered = filtered[:0]
-			for _, k := range keys {
-				if strings.HasSuffix(k, ":sinks:content") {
-					// Sinks content is cleaned up asynchronously, so ignore it
-					continue
-				}
-				if isDestroyTombstone(ctx, rdb, k) {
-					// Destroy tombstones are intentional rmap protocol state used so
-					// reconnecting replicas can order the next generation correctly.
-					continue
-				}
-				if isDestroyedStreamLifecycle(ctx, rdb, k) {
-					// Destroyed stream lifecycles are the intentional fence that
-					// prevents concurrent sinks from resurrecting stream metadata.
-					continue
-				}
-				if streamRegexp.MatchString(k) {
-					// Node streams are cleaned up asynchronously, so ignore them
-					continue
-				}
-				if strings.Contains(k, testName) {
-					filtered = append(filtered, k)
-				}
-			}
-			return len(filtered) == 0
-		}, 5*time.Second, time.Millisecond*10, "found keys: %v", filtered)
-		require.NoError(t, keysErr)
+		clean := assert.Eventually(t, func() bool {
+			filtered, err := remainingTestKeys(ctx, rdb, testName)
+			return err == nil && len(filtered) == 0
+		}, 5*time.Second, time.Millisecond*10)
+		if !clean {
+			filtered, err := remainingTestKeys(ctx, rdb, testName)
+			require.NoError(t, err)
+			t.Errorf("found keys: %v", filtered)
+		}
 	}
 	assert.NoError(t, rdb.FlushDB(ctx).Err())
+	assert.NoError(t, rdb.Close())
 }
 
-// isDestroyedStreamLifecycle reports whether key is the lifecycle fence of a
-// destroyed stream. Destroyed lifecycles intentionally outlive Stream.Destroy
-// so concurrent sinks cannot recreate the stream metadata.
+// remainingTestKeys returns keys owned by the named test that are not durable
+// protocol state or resources with documented asynchronous cleanup.
+func remainingTestKeys(ctx context.Context, rdb *redis.Client, testName string) ([]string, error) {
+	keys, err := rdb.Keys(ctx, "*").Result()
+	if err != nil {
+		return nil, err
+	}
+	var filtered []string
+	for _, key := range keys {
+		if strings.HasPrefix(key, "pulse:pool:") && strings.HasSuffix(key, ":cleanup-generations") {
+			continue
+		}
+		if strings.HasPrefix(key, "pulse:pool:") && strings.HasSuffix(key, ":resources") {
+			continue
+		}
+		if isDestroyedStreamLifecycle(ctx, rdb, key) {
+			continue
+		}
+		if strings.HasSuffix(key, ":sinks:content") {
+			continue
+		}
+		if isDestroyTombstone(ctx, rdb, key) {
+			continue
+		}
+		if streamRegexp.MatchString(key) {
+			continue
+		}
+		if strings.Contains(key, testName) {
+			filtered = append(filtered, key)
+		}
+	}
+	return filtered, nil
+}
+
 func isDestroyedStreamLifecycle(ctx context.Context, rdb *redis.Client, key string) bool {
-	if !strings.HasPrefix(key, "pulse:streammeta:") || !strings.HasSuffix(key, ":lifecycle") {
+	if !strings.HasPrefix(key, "pulse:stream:") || !strings.HasSuffix(key, ":lifecycle") {
 		return false
 	}
 	state, err := rdb.HGet(ctx, key, "state").Result()
@@ -116,4 +167,119 @@ func isDestroyTombstone(ctx context.Context, rdb *redis.Client, key string) bool
 	}
 	_, ok := content["=rev"]
 	return ok
+}
+
+// acquireDatabaseLease reserves one Redis database through DB 0, which is used
+// only for coordination. Expired leases make crashed test processes harmless.
+func acquireDatabaseLease(t *testing.T) (*databaseLease, int) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), databaseLeaseWait)
+	defer cancel()
+	coordinator := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPwd, DB: 0})
+	if err := coordinator.Ping(ctx).Err(); err != nil {
+		_ = coordinator.Close()
+		require.NoError(t, err)
+	}
+	config, err := coordinator.ConfigGet(ctx, "databases").Result()
+	if err != nil {
+		_ = coordinator.Close()
+		require.NoError(t, err)
+	}
+	databaseCount, err := strconv.Atoi(config["databases"])
+	if err != nil || databaseCount < 2 {
+		_ = coordinator.Close()
+		require.NoError(t, fmt.Errorf("invalid Redis database capacity %q", config["databases"]))
+	}
+	token := ulid.Make().String()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		for db := 1; db < databaseCount; db++ {
+			key := fmt.Sprintf("pulse:test:db-lease:%d", db)
+			acquired, err := coordinator.SetNX(ctx, key, token, databaseLeaseTTL).Result()
+			if err != nil {
+				_ = coordinator.Close()
+				require.NoError(t, err)
+			}
+			if !acquired {
+				continue
+			}
+			lease := &databaseLease{
+				coordinator: coordinator,
+				key:         key,
+				token:       token,
+				stop:        make(chan struct{}),
+				done:        make(chan struct{}),
+				t:           t,
+			}
+			go lease.heartbeat()
+			return lease, db
+		}
+		select {
+		case <-ctx.Done():
+			_ = coordinator.Close()
+			require.NoError(
+				t,
+				ctx.Err(),
+				"timed out waiting for one of %d isolated Redis test databases",
+				databaseCount-1,
+			)
+		case <-ticker.C:
+		}
+	}
+}
+
+// heartbeat renews the lease while the test owns its database.
+func (l *databaseLease) heartbeat() {
+	defer close(l.done)
+	ticker := time.NewTicker(databaseLeaseHeartbeat)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), databaseLeaseHeartbeat)
+			renewed, err := renewDatabaseLeaseScript.Run(
+				ctx,
+				l.coordinator,
+				[]string{l.key},
+				l.token,
+				databaseLeaseTTL.Milliseconds(),
+			).Int64()
+			cancel()
+			if err != nil {
+				heartbeatErr := fmt.Errorf("renew Redis database lease: %w", err)
+				l.lock.Lock()
+				l.heartbeatErr = heartbeatErr
+				l.lock.Unlock()
+				l.t.Errorf("%v", heartbeatErr)
+				return
+			}
+			if renewed != 1 {
+				heartbeatErr := fmt.Errorf("Redis database lease %q was lost", l.key)
+				l.lock.Lock()
+				l.heartbeatErr = heartbeatErr
+				l.lock.Unlock()
+				l.t.Errorf("%v", heartbeatErr)
+				return
+			}
+		case <-l.stop:
+			return
+		}
+	}
+}
+
+// release stops renewal and atomically frees the owned database lease.
+func (l *databaseLease) release(t *testing.T) {
+	t.Helper()
+	close(l.stop)
+	<-l.done
+	l.lock.Lock()
+	heartbeatErr := l.heartbeatErr
+	l.lock.Unlock()
+	assert.NoError(t, heartbeatErr)
+	ctx, cancel := context.WithTimeout(context.Background(), databaseLeaseHeartbeat)
+	defer cancel()
+	err := releaseDatabaseLeaseScript.Run(ctx, l.coordinator, []string{l.key}, l.token).Err()
+	assert.NoError(t, err)
+	assert.NoError(t, l.coordinator.Close())
 }

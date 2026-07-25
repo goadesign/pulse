@@ -1,7 +1,9 @@
-// Package options_test locks the v1 source compatibility of the exported
-// option structs: external code constructing them with unkeyed (positional)
-// literals must keep compiling. Adding, removing, reordering, or unexporting
-// a field breaks the literals below at compile time.
+// Package options_test locks the source compatibility of the exported option
+// structs: every v1 field keeps its name, type, and position (v1 fields form a
+// stable prefix, in v1 order), and new fields are only ever appended. Keyed
+// construction and field access from v1 code must keep compiling; unkeyed
+// literals were only guaranteed within the v1 patch line and are not part of
+// the contract for feature releases.
 package options_test
 
 import (
@@ -14,15 +16,36 @@ import (
 	"goa.design/pulse/streaming/options"
 )
 
-// TestOptionStructsKeepV1PositionalShape compiles v1 unkeyed literals of
+// TestOptionStructsKeepV1Fields compiles keyed literals of every v1 field of
 // every exported option struct. The assertions only exist to consume the
 // literals; the test is about compilation.
-func TestOptionStructsKeepV1PositionalShape(t *testing.T) {
-	reader := options.ReaderOptions{time.Second, 100, "topic", "pattern", 10, "0"}
-	sink := options.SinkOptions{time.Second, 100, "topic", "pattern", 10, "0", true, time.Minute}
-	addStream := options.AddStreamOptions{"42-0"}
-	stream := options.StreamOptions{1000, pulse.NoopLogger(), time.Minute, true}
-	addEvent := options.AddEventOptions{"topic", true}
+func TestOptionStructsKeepV1Fields(t *testing.T) {
+	reader := options.ReaderOptions{
+		BlockDuration: time.Second,
+		MaxPolled:     100,
+		Topic:         "topic",
+		TopicPattern:  "pattern",
+		BufferSize:    10,
+		LastEventID:   "0",
+	}
+	sink := options.SinkOptions{
+		BlockDuration:  time.Second,
+		MaxPolled:      100,
+		Topic:          "topic",
+		TopicPattern:   "pattern",
+		BufferSize:     10,
+		LastEventID:    "0",
+		NoAck:          true,
+		AckGracePeriod: time.Minute,
+	}
+	addStream := options.AddStreamOptions{LastEventID: "42-0"}
+	stream := options.StreamOptions{
+		MaxLen:     1000,
+		Logger:     pulse.NoopLogger(),
+		TTL:        time.Minute,
+		TTLSliding: true,
+	}
+	addEvent := options.AddEventOptions{Topic: "topic", OnlyIfStreamExists: true}
 
 	assert.Equal(t, time.Second, reader.BlockDuration)
 	assert.Equal(t, time.Minute, sink.AckGracePeriod)

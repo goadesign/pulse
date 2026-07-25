@@ -14,7 +14,7 @@ import (
 // NOTE: the example below does not handle errors for brevity.
 func main() {
 	// Create Redis client
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: os.Getenv("REDIS_PASSWORD")})
+	rdb := redis.NewClient(&redis.Options{Addr: os.Getenv("REDIS_ADDR"), Password: os.Getenv("REDIS_PASSWORD")})
 	ctx := context.Background()
 
 	// Make sure Redis is up and running and we can connect to it
@@ -29,7 +29,11 @@ func main() {
 	}
 
 	// Don't forget to destroy the stream when done
-	defer stream.Destroy(ctx)
+	defer func() {
+		if err := stream.Destroy(ctx); err != nil {
+			panic(err)
+		}
+	}()
 
 	// Write 2 events to the stream
 	id1, err := stream.Add(ctx, "event 1", []byte("payload 1"))
@@ -54,7 +58,11 @@ func main() {
 	}
 
 	// Don't forget to close the sink when done
-	defer sink1.Close(ctx)
+	defer func() {
+		if err := sink1.Close(ctx); err != nil {
+			panic(err)
+		}
+	}()
 
 	// Read and acknowlege event
 	ev := <-sink1.Subscribe()
@@ -70,12 +78,16 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	defer sink2.Close(ctx)
+	defer func() {
+		if err := sink2.Close(ctx); err != nil {
+			panic(err)
+		}
+	}()
 
 	// Read second event
 	ev = <-sink2.Subscribe()
 	fmt.Printf("sink 2, event: %s, payload: %s\n", ev.EventName, ev.Payload)
-	if sink2.Ack(ctx, ev); err != nil {
+	if err := sink2.Ack(ctx, ev); err != nil {
 		panic(err)
 	}
 }

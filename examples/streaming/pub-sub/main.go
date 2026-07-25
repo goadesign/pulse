@@ -14,7 +14,7 @@ import (
 // NOTE: the example below does not handle errors for brevity.
 func main() {
 	// Create Redis client
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: os.Getenv("REDIS_PASSWORD")})
+	rdb := redis.NewClient(&redis.Options{Addr: os.Getenv("REDIS_ADDR"), Password: os.Getenv("REDIS_PASSWORD")})
 	ctx := context.Background()
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		panic(err)
@@ -27,7 +27,11 @@ func main() {
 	}
 
 	// Don't forget to destroy the stream when done
-	defer stream.Destroy(ctx)
+	defer func() {
+		if err := stream.Destroy(ctx); err != nil {
+			panic(err)
+		}
+	}()
 
 	// Add a new event to topic "my-topic"
 	id1, err := stream.Add(ctx,
@@ -56,7 +60,11 @@ func main() {
 	}
 
 	// Don't forget to close the sink when done
-	defer sink.Close(ctx)
+	defer func() {
+		if err := sink.Close(ctx); err != nil {
+			panic(err)
+		}
+	}()
 
 	// Read both events
 	c := sink.Subscribe()

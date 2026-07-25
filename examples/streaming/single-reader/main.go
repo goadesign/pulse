@@ -13,7 +13,7 @@ import (
 
 func main() {
 	// Create Redis client
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: os.Getenv("REDIS_PASSWORD")})
+	rdb := redis.NewClient(&redis.Options{Addr: os.Getenv("REDIS_ADDR"), Password: os.Getenv("REDIS_PASSWORD")})
 	ctx := context.Background()
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		panic(err)
@@ -26,7 +26,11 @@ func main() {
 	}
 
 	// Don't forget to destroy the stream when done
-	defer stream.Destroy(ctx)
+	defer func() {
+		if err := stream.Destroy(ctx); err != nil {
+			panic(err)
+		}
+	}()
 
 	// Add a new event
 	id, err := stream.Add(ctx, "event", []byte("payload"))
