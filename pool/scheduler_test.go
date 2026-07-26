@@ -372,14 +372,72 @@ func TestSchedulerCollisionNeverOwnsForeignJob(t *testing.T) {
 	}
 	fence := claimTestSchedulerTransition(t, ctx, sched)
 
-	err := sched.startJobs(ctx, fence, []*JobParam{{Key: "collision", Payload: []byte("scheduled")}})
-	require.ErrorIs(t, err, ErrJobExists)
-	ownership, err := sched.schedulerOwnership(ctx, sched.keyPrefix+"collision")
+	// A foreign job already holds the key: the transition is satisfied, so it
+	// reports no error and plans the remaining jobs, but it must never take
+	// ownership of a job it did not dispatch. Repeated transitions converge on
+	// the same outcome instead of erroring every interval.
+	plan := []*JobParam{
+		{Key: "collision", Payload: []byte("scheduled")},
+		{Key: "independent", Payload: []byte("independent")},
+	}
+	for range 2 {
+		require.NoError(t, sched.startJobs(ctx, fence, plan))
+		ownership, err := sched.schedulerOwnership(ctx, sched.keyPrefix+"collision")
+		require.NoError(t, err)
+		require.Empty(t, ownership, "a foreign job must never become scheduler-owned")
+	}
+	// The job planned after the collision still ran and is scheduler-owned.
+	independent, err := sched.schedulerOwnership(ctx, sched.keyPrefix+"independent")
 	require.NoError(t, err)
-	require.Empty(t, ownership)
+	require.NotEmpty(t, independent, "a collision must not abort the remaining plan")
+
 	require.NoError(t, sched.clearJobs(ctx, fence))
+	require.Eventually(t, func() bool {
+		jobs := worker.Jobs()
+		return len(jobs) == 1 && string(jobs[0].Payload) == "foreign"
+	}, time.Second, time.Millisecond, "clearing schedules must not stop the foreign job")
+	require.NoError(t, node.Shutdown(ctx))
+}
+
+func TestSchedulerKeepsOwnershipWhenItsOwnJobStillRuns(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx := ptesting.NewTestContext(t)
+	node := newTestNode(t, ctx, rdb, ulid.Make().String())
+	worker := newTestWorker(t, ctx, node)
+	producer := newTestProducer("schedule", func() (*JobPlan, error) { return &JobPlan{}, nil })
+	encodedName := hex.EncodeToString([]byte(producer.Name()))
+	sched := &scheduler{
+		name:             node.PoolName + ":schedule",
+		interval:         20 * time.Millisecond,
+		producer:         producer,
+		node:             node,
+		keyPrefix:        encodedName + ":",
+		transitionPrefix: "=transition:" + encodedName + ":",
+		owner:            "test-" + ulid.Make().String(),
+		lease:            node.workerTTL,
+		logger:           node.logger,
+	}
+	fence := claimTestSchedulerTransition(t, ctx, sched)
+	plan := []*JobParam{{Key: "recurring", Payload: []byte("scheduled")}}
+
+	require.NoError(t, sched.startJobs(ctx, fence, plan))
+	require.Eventually(t, func() bool { return len(worker.Jobs()) == 1 }, time.Second, time.Millisecond)
+	first, err := sched.schedulerOwnership(ctx, sched.keyPrefix+"recurring")
+	require.NoError(t, err)
+	require.NotEmpty(t, first)
+
+	// Later transitions observe their own job still running: the exact
+	// dispatch identity is preserved instead of proposing a new one, so the
+	// scheduler converges silently rather than re-dispatching every interval.
+	for range 3 {
+		require.NoError(t, sched.startJobs(ctx, fence, plan))
+		again, err := sched.schedulerOwnership(ctx, sched.keyPrefix+"recurring")
+		require.NoError(t, err)
+		require.Equal(t, first, again)
+	}
 	require.Len(t, worker.Jobs(), 1)
-	require.Equal(t, []byte("foreign"), worker.Jobs()[0].Payload)
+	require.NoError(t, sched.clearJobs(ctx, fence))
 	require.NoError(t, node.Shutdown(ctx))
 }
 
