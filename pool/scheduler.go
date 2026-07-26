@@ -275,7 +275,10 @@ func (sched *scheduler) startJobs(ctx context.Context, fence string, jobs []*Job
 		if err != nil {
 			return fmt.Errorf("read job %q ownership: %w", job.Key, err)
 		}
-		if dispatchID == "" {
+		// A pre-existing record proves this scheduler already dispatched the
+		// key; a fresh proposal means any occupant of the key is foreign.
+		owned := dispatchID != ""
+		if !owned {
 			proposed := "scheduler-" + ulid.Make().String()
 			previous, err := sched.claimJobOwnership(ctx, fence, field, proposed)
 			if err != nil {
@@ -284,6 +287,7 @@ func (sched *scheduler) startJobs(ctx context.Context, fence string, jobs []*Job
 			dispatchID = proposed
 			if previous != "" {
 				dispatchID = previous
+				owned = true
 			}
 		}
 		dispatched := &Job{
@@ -294,16 +298,36 @@ func (sched *scheduler) startJobs(ctx context.Context, fence string, jobs []*Job
 			dispatchID: dispatchID,
 		}
 		if _, err := sched.dispatchJob(ctx, fence, dispatchID, dispatched); err != nil {
-			release := errors.Is(err, ErrJobExists)
-			if !release {
-				identity, identityErr := dispatchIdentity(job.Key, job.Payload)
-				if identityErr != nil {
-					return fmt.Errorf("encode job %q identity: %w", job.Key, identityErr)
+			if errors.Is(err, ErrJobExists) {
+				// The scheduled key is already running, which is the state
+				// this transition wanted. An occupant this scheduler
+				// dispatched keeps its ownership so later transitions retry
+				// the same exact dispatch instead of proposing a new one; a
+				// foreign occupant must never become scheduler-owned, so the
+				// speculative claim is dropped and the key is retried on the
+				// next transition. Either way the remaining planned jobs
+				// still run.
+				if owned {
+					continue
 				}
-				record, readErr := sched.node.readDispatchRecord(ctx, dispatchID, identity)
-				release = readErr == nil && record.status == dispatchTerminal
+				if releaseErr := sched.releaseOwnership(ctx, fence, field, dispatchID); releaseErr != nil {
+					return fmt.Errorf("release foreign job %q ownership: %w", job.Key, releaseErr)
+				}
+				sched.logger.Debug(
+					"scheduled job key held by a foreign job",
+					"job", job.Key,
+					"scheduler", sched.name,
+				)
+				continue
 			}
-			if release {
+			identity, identityErr := dispatchIdentity(job.Key, job.Payload)
+			if identityErr != nil {
+				return fmt.Errorf("encode job %q identity: %w", job.Key, identityErr)
+			}
+			record, readErr := sched.node.readDispatchRecord(ctx, dispatchID, identity)
+			if readErr == nil && record.status == dispatchTerminal {
+				// The run this scheduler owns already settled: drop ownership
+				// so the next transition dispatches a fresh run.
 				if releaseErr := sched.releaseOwnership(ctx, fence, field, dispatchID); releaseErr != nil {
 					return errors.Join(
 						fmt.Errorf("dispatch job %q as %q: %w", job.Key, dispatchID, err),
