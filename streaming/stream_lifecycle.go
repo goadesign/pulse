@@ -277,7 +277,16 @@ if deadline then
     redis.call("PEXPIREAT", KEYS[4], deadline)
 elseif ttl > 0 then
     if ARGV[10] == "1" then
+        local now = redis.call("TIME")
+        local expiry_deadline = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000) + ttl
+        redis.call("HSET", KEYS[3], "=deadline", expiry_deadline)
+        redis.call("SADD", KEYS[4], KEYS[3])
         redis.call("PEXPIRE", KEYS[2], ttl)
+        local resources = redis.call("SMEMBERS", KEYS[4])
+        for _, resource in ipairs(resources) do
+            redis.call("PEXPIRE", resource, ttl)
+        end
+        redis.call("PEXPIRE", KEYS[4], ttl)
     elseif redis.call("PTTL", KEYS[2]) == -1 then
         redis.call("PEXPIRE", KEYS[2], ttl)
     end

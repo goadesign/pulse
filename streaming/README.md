@@ -74,23 +74,22 @@ of at most 256 bytes. The length-delimited name, topic, and payload may total at
 most 1 MiB. The first call records those exact canonical bytes with the event
 ID; no digest is used. An exact retry returns the same ID, while reusing the key
 for different bytes returns `ErrIdempotencyConflict`. The event and its
-generation-scoped dedupe record
-share one Redis-absolute deadline, checked with Redis `TIME`, so retrying an
-ambiguous client result is safe even after max-length trimming removes the
-event itself. The returned ID remains the publication result even when that
-event is no longer retained.
+generation-scoped dedupe record share the stream's finite expiry, so retrying
+an ambiguous client result is safe even after max-length trimming removes the
+event itself. The returned ID remains the publication result while that retry
+record is retained.
 
-`AddOnce` takes no deadline argument: the active stream generation's immutable
-deadline is the sole expiry authority. A handle may adopt that existing
-deadline by omitting retention options; an explicitly configured handle must
-match it exactly.
-Ordinary `Add` calls use that same absolute expiry and never extend it. At or
-after expiry, Add, AddOnce, and
-Snapshot return `ErrDeadlineElapsed`; Sink.Close treats expiry as terminal and
-still closes its local subscriptions. Reuse of the logical name requires
-explicit `Destroy` followed by construction of a new generation. The lifecycle
-record intentionally survives expiry until Destroy so stale handles remain
-fenced.
+`AddOnce` accepts generations configured with an absolute deadline, a fixed
+TTL, or a sliding TTL. A handle may adopt the active retention by omitting
+retention options; an explicitly configured handle must match the complete
+retention contract. Ordinary `Add` calls never extend an absolute deadline or
+fixed TTL. On a sliding TTL, every ordinary or exact publication refreshes the
+stream, dedupe records, and recovery metadata together. At or after an absolute
+deadline, Add, AddOnce, and Snapshot return `ErrDeadlineElapsed`; Sink.Close
+treats expiry as terminal and still closes its local subscriptions. Reuse of
+that deadline-owned logical name requires explicit `Destroy` followed by
+construction of a new generation. The lifecycle record intentionally survives
+expiry until Destroy so stale handles remain fenced.
 
 `Stream.Snapshot` performs one generation-fenced Lua `XRANGE COUNT MaxLen+1`
 and returns currently retained immutable `SnapshotEvent` values in Redis ID

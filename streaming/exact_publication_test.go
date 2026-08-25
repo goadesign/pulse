@@ -102,6 +102,74 @@ func TestAddOnceConflictAndAmbiguousCommitRetry(t *testing.T) {
 	require.NoError(t, stream.Destroy(ctx))
 }
 
+func TestAddOnceSharesFixedAndSlidingTTLLifetimes(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		streamOpts []options.Stream
+		extends    bool
+	}{
+		{
+			name: "sliding ttl",
+			streamOpts: []options.Stream{
+				options.WithStreamMaxLen(100),
+				options.WithStreamSlidingTTL(2 * time.Second),
+			},
+			extends: true,
+		},
+		{
+			name: "fixed ttl",
+			streamOpts: []options.Stream{
+				options.WithStreamMaxLen(100),
+				options.WithStreamTTL(2 * time.Second),
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rdb := ptesting.NewRedisClient(t)
+			defer ptesting.CleanupRedis(t, rdb, false, "")
+			ctx := ptesting.NewTestContext(t)
+			streamName := t.Name()
+
+			firstWriter, err := NewStream(streamName, rdb, test.streamOpts...)
+			require.NoError(t, err)
+			_, err = firstWriter.Add(ctx, "ordinary", []byte("before"))
+			require.NoError(t, err)
+
+			keyedWriter, err := NewStream(streamName, rdb, test.streamOpts...)
+			require.NoError(t, err)
+			eventID, err := keyedWriter.AddOnce(ctx, "stable-key", "keyed", []byte("payload"))
+			require.NoError(t, err)
+
+			dedupeKey := streamKey(streamName) + ":generation:1:idempotency"
+			before := rdb.PTTL(ctx, dedupeKey).Val()
+			require.Positive(t, before)
+			time.Sleep(100 * time.Millisecond)
+
+			laterWriter, err := NewStream(streamName, rdb, test.streamOpts...)
+			require.NoError(t, err)
+			_, err = laterWriter.Add(ctx, "ordinary", []byte("after"))
+			require.NoError(t, err)
+			after := rdb.PTTL(ctx, dedupeKey).Val()
+			require.Positive(t, after)
+			if test.extends {
+				require.Greater(t, after, before-50*time.Millisecond)
+			} else {
+				require.Less(t, after, before-75*time.Millisecond)
+			}
+
+			retryWriter, err := NewStream(streamName, rdb, test.streamOpts...)
+			require.NoError(t, err)
+			retryID, err := retryWriter.AddOnce(ctx, "stable-key", "keyed", []byte("payload"))
+			require.NoError(t, err)
+			require.Equal(t, eventID, retryID)
+			require.EqualValues(t, 3, rdb.XLen(ctx, streamKey(streamName)).Val())
+
+			_, err = retryWriter.AddOnce(ctx, "stable-key", "keyed", []byte("changed"))
+			require.ErrorIs(t, err, ErrIdempotencyConflict)
+		})
+	}
+}
+
 func TestAddOnceMetadataSurvivesMaxLenAndScriptFlush(t *testing.T) {
 	rdb := ptesting.NewRedisClient(t)
 	defer ptesting.CleanupRedis(t, rdb, false, "")
