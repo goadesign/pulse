@@ -33,9 +33,10 @@ const (
 )
 
 var (
-	// addOnceScript verifies the stream generation and absolute deadline,
+	// addOnceScript verifies the stream generation and finite retention,
 	// resolves the generation-scoped idempotency record, and publishes exactly
-	// once. Redis TIME is authoritative for deadline admission.
+	// once. Redis TIME is authoritative for absolute-deadline admission and for
+	// aligning retry metadata with fixed or sliding stream TTLs.
 	addOnceScript = redis.NewScript(`
 local state = redis.call("HGET", KEYS[1], "state")
 local generation = redis.call("HGET", KEYS[1], "generation")
@@ -52,9 +53,6 @@ if ARGV[2] ~= "" then
     end
 else
     if not generation then
-        if ARGV[8] == "" then
-            return redis.error_reply("STREAMDEADLINEREQUIRED")
-        end
         generation = "1"
         physical = ARGV[4]
         recreate = true
@@ -73,12 +71,26 @@ end
 if retention and ARGV[18] == "1" and retention ~= ARGV[16] then
     return redis.error_reply("STREAMCONFIGMISMATCH")
 end
-if deadline then
+local effective_retention = retention or ARGV[16]
+local retention_mode = string.match(effective_retention, "|mode=([^|]+)|")
+local retention_value = tonumber(string.match(effective_retention, "|value=(%d+)|"))
+local retention_sliding = string.match(effective_retention, "|sliding=([^|]+)$")
+local ttl = 0
+local ttl_sliding = false
+if ttl_owned == "1" then
+    if retention_mode ~= "ttl" or not retention_value or retention_value <= 0 then
+        return redis.error_reply("STREAMCONFIGMISMATCH")
+    end
+    ttl = retention_value
+    ttl_sliding = retention_sliding == "true"
+elseif deadline then
     if ARGV[8] ~= "" and deadline ~= ARGV[8] then
         return redis.error_reply("STREAMDEADLINECONFLICT")
     end
-elseif ttl_owned == "1" then
-    return redis.error_reply("STREAMDEADLINECONFLICT")
+elseif retention_mode == "ttl" and retention_value and retention_value > 0 then
+    ttl = retention_value
+    ttl_sliding = retention_sliding == "true"
+    ttl_owned = "1"
 else
     if ARGV[8] == "" then
         return redis.error_reply("STREAMDEADLINEREQUIRED")
@@ -87,8 +99,17 @@ else
 end
 local now = redis.call("TIME")
 local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
-if now_ms >= tonumber(deadline) then
+if deadline and now_ms >= tonumber(deadline) then
     return redis.error_reply("DEADLINEELAPSED")
+end
+local expiry_deadline = deadline
+if ttl > 0 then
+    local remaining = redis.call("PTTL", physical)
+    if ttl_sliding or remaining < 0 then
+        expiry_deadline = now_ms + ttl
+    else
+        expiry_deadline = now_ms + remaining
+    end
 end
 
 local dedupe = ARGV[4] .. ":generation:" .. generation .. ":idempotency"
@@ -116,15 +137,16 @@ if existing then
     if existing_identity ~= ARGV[17] then
         return redis.error_reply("IDEMPOTENCYCONFLICT")
     end
-    redis.call("PEXPIREAT", physical, deadline)
-    redis.call("PEXPIREAT", dedupe, deadline)
-    redis.call("PEXPIREAT", recovery, deadline)
+    redis.call("HSET", recovery, "=deadline", expiry_deadline)
+    redis.call("PEXPIREAT", physical, expiry_deadline)
+    redis.call("PEXPIREAT", dedupe, expiry_deadline)
+    redis.call("PEXPIREAT", recovery, expiry_deadline)
     local existing_resources = redis.call("SMEMBERS", resources_key)
     for _, resource in ipairs(existing_resources) do
-        redis.call("PEXPIREAT", resource, deadline)
+        redis.call("PEXPIREAT", resource, expiry_deadline)
     end
-    redis.call("PEXPIREAT", resources_key, deadline)
-    return {generation, physical, deadline, retention, 0, event_id}
+    redis.call("PEXPIREAT", resources_key, expiry_deadline)
+    return {generation, physical, deadline or "", effective_retention, 0, event_id}
 end
 
 if recreate then
@@ -135,14 +157,21 @@ if recreate then
         "generation", generation,
         "state", ARGV[1],
         ARGV[5], physical,
-        ARGV[6], deadline,
         ARGV[15], ARGV[16])
-    redis.call("HDEL", KEYS[1], ARGV[7])
+    if deadline then
+        redis.call("HSET", KEYS[1], ARGV[6], deadline)
+        redis.call("HDEL", KEYS[1], ARGV[7])
+    else
+        redis.call("HDEL", KEYS[1], ARGV[6])
+        redis.call("HSET", KEYS[1], ARGV[7], "1")
+    end
 elseif redis.call("HGET", KEYS[1], ARGV[5]) == false then
     redis.call("HSET", KEYS[1], ARGV[5], physical)
+end
+if deadline and redis.call("HGET", KEYS[1], ARGV[6]) == false then
     redis.call("HSET", KEYS[1], ARGV[6], deadline)
-elseif redis.call("HGET", KEYS[1], ARGV[6]) == false then
-    redis.call("HSET", KEYS[1], ARGV[6], deadline)
+elseif ttl > 0 then
+    redis.call("HSET", KEYS[1], ARGV[7], "1")
 end
 if not retention then
     redis.call("HSET", KEYS[1], ARGV[15], ARGV[16])
@@ -161,18 +190,18 @@ else
         "n", ARGV[11], "p", ARGV[12])
 end
 redis.call("HSET", dedupe, ARGV[10], event_id .. "\0" .. ARGV[17])
-redis.call("HSET", recovery, "=deadline", deadline)
+redis.call("HSET", recovery, "=deadline", expiry_deadline)
 redis.call("SADD", resources_key, dedupe, recovery)
 
-redis.call("PEXPIREAT", physical, deadline)
-redis.call("PEXPIREAT", dedupe, deadline)
-redis.call("PEXPIREAT", recovery, deadline)
+redis.call("PEXPIREAT", physical, expiry_deadline)
+redis.call("PEXPIREAT", dedupe, expiry_deadline)
+redis.call("PEXPIREAT", recovery, expiry_deadline)
 local resources = redis.call("SMEMBERS", resources_key)
 for _, resource in ipairs(resources) do
-    redis.call("PEXPIREAT", resource, deadline)
+    redis.call("PEXPIREAT", resource, expiry_deadline)
 end
-redis.call("PEXPIREAT", resources_key, deadline)
-return {generation, physical, deadline, retention or ARGV[16], 1, event_id}
+redis.call("PEXPIREAT", resources_key, expiry_deadline)
+return {generation, physical, deadline or "", effective_retention, 1, event_id}
 `)
 
 	// snapshotScript binds an unbound handle using the same zero-migration
@@ -222,9 +251,10 @@ return {1, generation, physical, deadline or "", retention, events}
 
 // AddOnce publishes one event for idempotencyKey in this stream generation.
 // The first call stores the event ID and exact length-delimited event identity
-// until the generation deadline. Exact retries return that ID; content changes
-// return ErrIdempotencyConflict. The active generation must be deadline-owned;
-// a handle with explicit retention options must match that immutable deadline.
+// until the generation expires. Exact retries return that ID; content changes
+// return ErrIdempotencyConflict. The active generation must have an absolute
+// deadline or a finite TTL, and explicit retention options must match its
+// immutable retention contract.
 func (s *Stream) AddOnce(
 	ctx context.Context,
 	idempotencyKey string,
