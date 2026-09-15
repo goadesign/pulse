@@ -1,6 +1,9 @@
+// Workers translate pool deliveries into handler starts and stops. A running
+// job keeps its ownership across repeated deliveries until it stops or moves.
 package pool
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -40,7 +43,9 @@ type (
 		requeueTimeout time.Duration
 		logger         pulse.Logger
 		wg             sync.WaitGroup
-		rebalanceLock  sync.Mutex
+		// jobsLock serializes handler starts, stops, settlement updates and moves.
+		// Keep it separate from lock so heartbeat loss can close intake immediately.
+		jobsLock sync.Mutex
 
 		jobs        sync.Map // jobs being handled by the worker indexed by job key
 		nodeStreams sync.Map
@@ -72,11 +77,16 @@ type (
 		dispatchID string
 	}
 
-	// JobHandler starts and stops jobs.
+	// JobHandler starts and stops jobs owned by a worker.
 	JobHandler interface {
-		// Start starts a job.
+		// Start accepts a job and returns after the handler has started its work.
+		// While that job remains accepted on this worker, repeated recovery
+		// deliveries with the same key and payload do not call Start again.
+		// Recovery after process loss may call Start on another worker, so
+		// external effects must still tolerate a replay.
 		Start(job *Job) error
-		// Stop stops a job with a given key.
+		// Stop releases the accepted job before its key stops or moves. Pulse
+		// serializes Start and Stop calls for each worker.
 		Stop(key string) error
 	}
 
@@ -379,8 +389,29 @@ func (w *Worker) stopIntake() bool {
 	return firstAttempt
 }
 
-// startJob starts a job.
+// startJob accepts one delivery while excluding a concurrent stop or move.
 func (w *Worker) startJob(ctx context.Context, job *Job) error {
+	w.jobsLock.Lock()
+	defer w.jobsLock.Unlock()
+	if _, running := w.jobs.Load(job.Key); job.Requeued && !running {
+		// This delivery may have waited while rebalance moved the job. Leave
+		// it pending for routing to the current worker instead of restarting
+		// the handler on the worker that just released it. Internal restarts
+		// after a failed move call startJobLocked directly to restore ownership.
+		workerID, err := w.node.workerForEvent(evStartJob, job.Key)
+		if err != nil {
+			return errors.Join(ErrRequeue, err)
+		}
+		if workerID != w.ID {
+			return ErrRequeue
+		}
+	}
+	return w.startJobLocked(ctx, job)
+}
+
+// startJobLocked starts a new handler or acknowledges its accepted delivery.
+// The caller holds jobsLock through ownership writes and failed-start cleanup.
+func (w *Worker) startJobLocked(ctx context.Context, job *Job) error {
 	if w.IsStopped() {
 		return fmt.Errorf("worker %q stopped", w.ID)
 	}
@@ -389,6 +420,9 @@ func (w *Worker) startJob(ctx context.Context, job *Job) error {
 	}
 	if err := w.node.ensureGenerationActive(ctx); err != nil {
 		return err
+	}
+	if value, ok := w.jobs.Load(job.Key); ok {
+		return w.acceptRunningJob(ctx, value.(*Job), job)
 	}
 	if job.dispatchID != "" {
 		claimed, err := w.claimDispatchedStart(ctx, job)
@@ -431,6 +465,36 @@ func (w *Worker) startJob(ctx context.Context, job *Job) error {
 	w.logger.Info("started job", "job", job.Key)
 	w.jobs.Store(job.Key, job)
 	return nil
+}
+
+// acceptRunningJob checks a repeated delivery without changing the running handler.
+// Exact dispatches still prove their original key and bytes against Redis; a
+// different pending dispatch or payload cannot replace the accepted handler.
+func (w *Worker) acceptRunningJob(ctx context.Context, running, incoming *Job) error {
+	if incoming.dispatchID != "" {
+		identity, err := dispatchIdentity(incoming.Key, incoming.Payload)
+		if err != nil {
+			return err
+		}
+		record, err := w.node.readDispatchRecord(ctx, incoming.dispatchID, identity)
+		if err != nil {
+			if errors.Is(err, ErrDispatchConflict) {
+				return fmt.Errorf("%w: job %q dispatch %q",
+					errDispatchIdentityMismatch, incoming.Key, incoming.dispatchID)
+			}
+			return errors.Join(ErrRequeue, err)
+		}
+		if record.status == dispatchTerminal {
+			return dispatchTerminalError(record)
+		}
+		if incoming.dispatchID != running.dispatchID {
+			return fmt.Errorf("%w: job %q belongs to another dispatch", ErrJobExists, incoming.Key)
+		}
+	}
+	if !bytes.Equal(running.Payload, incoming.Payload) {
+		return fmt.Errorf("%w: job %q has a different payload", ErrJobExists, incoming.Key)
+	}
+	return w.restoreRunningJob(ctx, running)
 }
 
 // claimDispatchedStart creates durable ownership exactly once for the pending
@@ -500,8 +564,8 @@ func (w *Worker) cleanupFailedStart(ctx context.Context, key string) error {
 // for ordinary running-job rebalancing only after its original dispatch event
 // and durable terminal record have settled atomically.
 func (w *Worker) markDispatchSettled(key, dispatchID string) {
-	w.lock.Lock()
-	defer w.lock.Unlock()
+	w.jobsLock.Lock()
+	defer w.jobsLock.Unlock()
 	value, ok := w.jobs.Load(key)
 	if !ok {
 		return
@@ -517,6 +581,8 @@ func (w *Worker) markDispatchSettled(key, dispatchID string) {
 
 // stopJob stops a job.
 func (w *Worker) stopJob(ctx context.Context, key string) error {
+	w.jobsLock.Lock()
+	defer w.jobsLock.Unlock()
 	if err := w.releaseJob(ctx, key); err != nil {
 		if errors.Is(err, errJobNotOwned) {
 			return ErrRequeue
@@ -531,7 +597,8 @@ func (w *Worker) stopJob(ctx context.Context, key string) error {
 }
 
 // releaseJob stops local execution and removes this worker's ownership while
-// preserving the shared payload for another worker to claim.
+// preserving the shared payload for another worker to claim. The caller holds
+// jobsLock so another delivery cannot start or acknowledge this job mid-stop.
 func (w *Worker) releaseJob(ctx context.Context, key string) error {
 	if _, ok := w.jobs.Load(key); !ok {
 		return fmt.Errorf("%w: %s", errJobNotOwned, key)
@@ -662,8 +729,8 @@ func (w *Worker) refreshHeartbeat(ctx context.Context) error {
 
 // rebalance rebalances the jobs handled by the worker.
 func (w *Worker) rebalance(ctx context.Context, activeWorkers []string) {
-	w.rebalanceLock.Lock()
-	defer w.rebalanceLock.Unlock()
+	w.jobsLock.Lock()
+	defer w.jobsLock.Unlock()
 
 	w.logger.Debug("rebalance")
 	rebalanced := make(map[string]*Job)
@@ -690,7 +757,7 @@ func (w *Worker) rebalance(ctx context.Context, activeWorkers []string) {
 		if err := w.releaseJob(ctx, key); err != nil {
 			w.logger.Error(fmt.Errorf("rebalance: failed to release job: %w", err), "job", key)
 			if _, ok := w.jobs.Load(key); !ok {
-				if err := w.startJob(ctx, &requeue); err != nil {
+				if err := w.startJobLocked(ctx, &requeue); err != nil {
 					w.logger.Error(fmt.Errorf("rebalance: failed to restart job: %w", err), "job", key)
 				}
 			}
@@ -698,7 +765,7 @@ func (w *Worker) rebalance(ctx context.Context, activeWorkers []string) {
 		}
 		if _, err := w.node.poolStream.Add(ctx, evStartJob, marshalJob(&requeue)); err != nil {
 			w.logger.Error(fmt.Errorf("rebalance: failed to requeue job: %w", err), "job", key)
-			if err := w.startJob(ctx, &requeue); err != nil {
+			if err := w.startJobLocked(ctx, &requeue); err != nil {
 				w.logger.Error(fmt.Errorf("rebalance: failed to restart job: %w", err), "job", key)
 				continue
 			}
@@ -714,6 +781,8 @@ func (w *Worker) rebalance(ctx context.Context, activeWorkers []string) {
 // every publication flows through the lease-fenced stable dedup records. When
 // this worker loses the lease, the winning cleanup owner owns the requeue.
 func (w *Worker) requeueJobs(ctx context.Context) error {
+	w.jobsLock.Lock()
+	defer w.jobsLock.Unlock()
 	var unsettled []string
 	jobCount := 0
 	w.jobs.Range(func(_, value any) bool {
