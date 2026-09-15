@@ -329,6 +329,17 @@ input a job key and a job payload.
 The job key is used to route the job to the proper worker. If the worker starts
 the job successfully, the worker owns that key until the job stops or moves
 during rebalancing. The job payload is passed to the worker's `Start` method.
+Repeated recovery deliveries of the same key and exact payload bytes to that
+worker acknowledge the accepted job without calling `Start` again. A conflicting
+payload is rejected without changing the running handler, its ownership, or its
+stored payload. Exact dispatch retries still validate their original key and
+payload against the durable dispatch record. Recovery also restores missing
+ownership or payload entries from the accepted job, after atomically verifying
+that no other worker, pending dispatch, or different payload occupies the key.
+A failed repair leaves the running handler intact and never runs failed-start
+cleanup. These checks run in the same local
+critical section as starts, stops, and rebalancing; a recovery delivery waiting
+through a move is routed to the current worker before it can start again.
 
 Pulse establishes the durable dispatch record in the same operation that
 publishes the start event, so even an immediate worker acknowledgement cannot
