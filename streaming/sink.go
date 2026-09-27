@@ -1,3 +1,6 @@
+// Sink owns event polling, consumer maintenance, and each attached stream's
+// local map readers. Close joins that work even when Redis detachment fails;
+// failed detachment retains the exact stream and consumer needed for retry.
 package streaming
 
 import (
@@ -48,7 +51,7 @@ type (
 	Sink struct {
 		// Name is the sink name.
 		Name string
-		// closed is true if Close completed.
+		// closed is true after local and distributed cleanup both succeed.
 		closed bool
 		// consumer is the sink consumer name.
 		consumer string
@@ -78,6 +81,9 @@ type (
 		cancel context.CancelFunc
 		// wait is the sink cleanup wait group.
 		wait sync.WaitGroup
+		// closeWait joins automatic cleanup started by the read worker before
+		// that worker leaves wait. Public Close waits after joining wait.
+		closeWait sync.WaitGroup
 		// stopOnce cancels background work exactly once; distributed cleanup is
 		// intentionally retried until it succeeds.
 		stopOnce sync.Once
@@ -315,10 +321,27 @@ func (s *Sink) RemoveStream(ctx context.Context, stream *Stream) error {
 	return nil
 }
 
-// Close stops event polling and detaches every distributed membership. Failed
-// Redis cleanup is returned and may be retried with another context; the sink
-// is closed only after all membership and keep-alive side effects complete.
+// Close stops and joins all sink-owned local work and closes subscriptions,
+// including when Redis cleanup fails. Failed distributed detachment is returned
+// and may be retried with another context. IsClosed becomes true only after
+// local cleanup and every distributed detachment succeed.
 func (s *Sink) Close(ctx context.Context) error {
+	err := s.closeResources(ctx)
+	s.closeWait.Wait()
+	return err
+}
+
+// IsClosed reports whether local and distributed cleanup both succeeded.
+func (s *Sink) IsClosed() bool {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	return s.closed
+}
+
+// closeResources joins the main workers and releases local resources before
+// attempting each stream's distributed detachment. Automatic cleanup calls this
+// directly so it does not wait for its own completion through public Close.
+func (s *Sink) closeResources(ctx context.Context) error {
 	s.stopOnce.Do(func() {
 		s.closing.Store(true)
 		s.cancel()
@@ -335,12 +358,18 @@ func (s *Sink) Close(ctx context.Context) error {
 	if s.closed {
 		return nil
 	}
+	for _, c := range s.chans {
+		close(c)
+	}
+	s.chans = nil
 	var cleanupErr error
 	for streamKey, state := range s.streams {
+		// Detachment uses the stream and consumer identity, not live map
+		// readers. Stop both readers even when Redis cleanup must be retried.
+		state.close()
 		stream := state.stream
 		err := stream.verifyGeneration(ctx)
 		if errors.Is(err, ErrStreamDestroyed) || errors.Is(err, ErrDeadlineElapsed) {
-			state.close()
 			delete(s.streams, streamKey)
 			continue
 		}
@@ -362,26 +391,14 @@ func (s *Sink) Close(ctx context.Context) error {
 			))
 			continue
 		}
-		state.close()
 		delete(s.streams, streamKey)
 	}
 	if cleanupErr != nil {
 		return cleanupErr
 	}
-	for _, c := range s.chans {
-		close(c)
-	}
-	s.chans = nil
 	s.closed = true
 	s.logger.Info("closed")
 	return nil
-}
-
-// IsClosed returns true if the sink was closed.
-func (s *Sink) IsClosed() bool {
-	s.lock.Lock()
-	defer s.lock.Unlock()
-	return s.closed
 }
 
 // deleteStreamStaleConsumersWithLease deletes stale consumers for one attached
@@ -477,8 +494,8 @@ func (s *Sink) rollbackConsumer(ctx context.Context, consumer string, states []*
 
 // read reads events from the streams and sends them to the sink channel.
 func (s *Sink) read() {
-	defer s.logger.Debug("read: exiting")
 	defer s.wait.Done()
+	defer s.logger.Debug("read: exiting")
 	var retry readRetry
 	for {
 		if err := s.ensureConsumer(s.ctx); err != nil {
@@ -490,11 +507,7 @@ func (s *Sink) read() {
 		snapshot, err := s.readSnapshot(s.ctx)
 		if err != nil {
 			if fatal := fatalReadError(err); fatal != nil {
-				pulse.Go(s.logger, func() {
-					if closeErr := s.Close(context.WithoutCancel(s.ctx)); closeErr != nil {
-						s.logger.Error(fmt.Errorf("failed to close terminal sink: %w", closeErr))
-					}
-				})
+				s.closeAfterRead()
 				return
 			}
 			if !retry.wait(s.donechan, err, s.logger) {
@@ -565,11 +578,7 @@ func (s *Sink) read() {
 			fatal := fatalReadError(err)
 			if fatal != nil {
 				s.logger.Error(fmt.Errorf("fatal error while reading events: %w, stopping", fatal))
-				pulse.Go(s.logger, func() {
-					if err := s.Close(context.WithoutCancel(s.ctx)); err != nil {
-						s.logger.Error(fmt.Errorf("failed to close terminal sink: %w", err))
-					}
-				})
+				s.closeAfterRead()
 				return
 			}
 			if err == nil || err == redis.Nil {
@@ -583,6 +592,18 @@ func (s *Sink) read() {
 		}
 		retry.reset()
 	}
+}
+
+// closeAfterRead starts cleanup after a fatal read. The read worker registers
+// this work before exiting, so Close can join it after joining the main workers.
+func (s *Sink) closeAfterRead() {
+	s.closeWait.Add(1)
+	pulse.Go(s.logger, func() {
+		defer s.closeWait.Done()
+		if err := s.closeResources(context.WithoutCancel(s.ctx)); err != nil {
+			s.logger.Error(fmt.Errorf("failed to close terminal sink: %w", err))
+		}
+	})
 }
 
 // readSnapshot verifies and captures the exact stream capabilities and
