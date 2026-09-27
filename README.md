@@ -4,6 +4,8 @@ Pulse consists of a set of packages that enable event driven distributed
 architectures at scale. Each package is designed to be used independently but
 they can also be combined to implement more complex architectures.
 
+Pulse requires Go 1.26 or later.
+
 ## Replicated Maps
 
 Replicated maps provide a mechanism for sharing data across distributed nodes
