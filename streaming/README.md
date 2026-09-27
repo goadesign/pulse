@@ -39,7 +39,7 @@ default is five seconds; `WithReaderBlockDuration` and
 reject zero and negative durations. This guarantees `Close` can finish after at
 most the configured blocking read even when a Redis client does not interrupt
 the command on context cancellation. The examples use 100 milliseconds.
-Constructor contexts bound setup only. Reader and Sink background loops use
+Ordinary Reader and Sink constructor contexts bound setup only. Their background loops use
 their own lifecycle contexts and stop only when `Close` or a terminal lifecycle
 error cancels them.
 
@@ -66,6 +66,72 @@ flowchart LR
     linkStyle 3 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
     linkStyle 4 stroke:#DDDDDD,color:#DDDDDD,stroke-width:3px;
 ```
+
+## Strict retained-position replay
+
+`Stream.NewReplayReader(ctx, afterID, ReplayReaderOptions)` observes one existing
+stream with an atomic retained-position check. Opening checks the lifecycle,
+the exact anchor entry and the first batch together before returning success.
+It writes no stream data, establishes no lifecycle and performs no repairs.
+`"0-0"` starts at currently available history; it does not claim that older
+history is complete. Every other position must be a canonical Redis ID that is
+still retained. `Anchor()` returns that entry as a `SnapshotEvent`, independently
+of the successor stream; it does not automatically deliver it.
+
+The caller must provide positive `MaxEvents` and `MaxBytes`, and a
+`BlockDuration` of at least one millisecond. There are no defaults.
+`Subscribe()` returns one unbuffered channel, including on repeated calls.
+Each batch contains at most `MaxEvents` complete events whose combined IDs,
+event names, topics and payloads total at most `MaxBytes` inclusive. The opening
+anchor has its own equal byte allowance. If a next entry does not fit after a
+completed prefix, that prefix is delivered and the entry remains unconsumed.
+The next batch is not read until the copied prefix drains, even if a consumer
+stalls. A copied prefix remains valid if Redis subsequently trims it.
+
+At a valid tail, a finite `XREAD COUNT 1` only wakes the reader. Its data is
+discarded; lifecycle, retained position and successors are checked together
+again before any delivery. Empty history and tail timeouts do not close the
+channel. The continuity contract covers append and prefix trimming or whole
+stream expiry, not arbitrary interior deletion through `Remove`/`XDEL`.
+Pulse does not interpret event payload identities or select application runs.
+
+Terminal errors remain available through `Err()` before the channel closes:
+
+| Condition | Error |
+| --- | --- |
+| Invalid concrete ID syntax | `ErrInvalidReplayPosition` |
+| Missing initial lifecycle at `"0-0"` | `ErrStreamNotFound` |
+| Missing concrete anchor or invalidated attached lifecycle | `ErrReplayPositionUnavailable`, wrapping the applicable lifecycle error |
+| Opening anchor or first available event exceeds `MaxBytes` | `ErrReplayEventTooLarge` |
+| Malformed lifecycle/event, Redis transport or permission failure | Dependency error; never unavailable-position or clean EOF |
+
+`Done()` exposes completion independently of event consumption. It closes after
+the terminal error is recorded, the subscription closes, and the reader finishes
+its current command and read-loop work. A caller handling a previously received
+event can use this signal to stop dependent observations without consuming more
+events. Read `Err()` to determine the outcome; completion is not successful replay
+or completion of the application work described by those events.
+
+Unlike ordinary Reader, this reader retains its caller context throughout its
+lifetime. Cancellation preserves the context error and any custom cause.
+Deliberate `Close()` has no error unless a failure already won; it cancels
+observation and joins the reader loop and its in-flight Redis command. An
+already admitted channel send may finish. The shared Redis client and producers
+remain caller-owned. Command completion still depends on the client's transport
+configuration; a finite blocking wait is not a total operation deadline.
+The reader adds no dependency retry loop.
+
+**The byte allowance is a copied-content limit, not a pre-materialization work
+or memory bound.** A check uses at most one anchor lookup, `MaxEvents` accepted
+candidate lookups and one rejected or empty lookahead, each with `COUNT 1`.
+Redis materializes a complete entry before Lua measures it. A tail wakeup may
+also transfer one complete entry to the client. Ordinary `Add` imposes no
+equivalent body limit, and `AddOnce`'s limit does not cover unkeyed history.
+This API therefore makes no absolute server/client memory, iterator CPU,
+retention or production concurrency guarantee. Deployments requiring a complete
+work bound must separately establish and admit the cost of all supported
+current/historical entries, including lookahead and wakeup materialization,
+and select explicit budgets. Small synthetic tests do not close that gate.
 
 ## Exact publication and snapshots
 
