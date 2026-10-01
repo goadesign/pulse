@@ -250,9 +250,11 @@ before starting the older version.
 
 The `Close` method closes the pool node and releases all resources associated
 with it. It should be called when the node is no longer needed. Closing is an
-immediate admission fence: once it begins, the node rejects new workers, job or
-message dispatches, stop requests, and notifications while already admitted
-operations finish.
+admission stop: after the cleanup check succeeds and local closure begins, the
+node rejects new workers, job or message dispatches, stop requests, and
+notifications while already admitted operations finish. A job delivery that
+reaches a stopped worker before handler acceptance stays pending for routing
+to another worker; Pulse does not call that handler or report a terminal failure.
 
 Successful `Close` waits for `JobHandler.Stop` to release every locally accepted
 job. This local obligation does not depend on which node owns job requeue, and
@@ -275,6 +277,14 @@ described below.
 The `Shutdown` method shuts down the entire pool by stopping all its workers
 gracefully. It should be called when the pool is no longer needed. Shutdown
 publishes one Redis-owned obligation even when a local `Close` is concurrent.
+Each worker joins intake and releases its locally accepted handlers in one Stop
+phase. Node cleanup then reads the saved worker job list directly from storage,
+deletes its payloads, and removes the worker records without requeuing jobs.
+A failed Stop or saved-job cleanup returns an error and leaves local closure
+unfinished for another `Shutdown` attempt. Failed Stops remain locally visible;
+saved worker records remain available until payload cleanup succeeds. Successful
+Stops are not repeated because storage cleanup needs a retry. `IsClosed` reports
+local node closure, which may finish before the pool-wide shutdown completes.
 After every live node detaches, final cleanup is owned by a persisted
 owner-and-lease claim based on Redis time. Another process can reclaim an
 expired claim and finish cleanup, so an interrupted shutdown cannot permanently

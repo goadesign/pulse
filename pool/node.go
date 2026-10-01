@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash"
@@ -1150,9 +1151,12 @@ func (node *Node) stopAfterLifecycleLoss(reason string, shutdown bool) {
 // Shutdown stops the pool workers gracefully across all nodes. It notifies all
 // workers and waits until they are completed. Shutdown prevents the pool nodes
 // from creating new workers and the pool workers from accepting new jobs. After
-// Shutdown returns, the node object cannot be used anymore and should be
-// discarded. One of Shutdown or Close should be called before the node is
-// garbage collected unless it is client-only.
+// successful Shutdown, the node object cannot be used anymore and should be
+// discarded. A local Stop or saved-job cleanup failure leaves the node unclosed
+// and available for another Shutdown attempt. Successful Stops are not repeated
+// when saved-job cleanup fails. IsClosed describes local closure, which can
+// finish before pool-wide cleanup. One of Shutdown or Close should be called
+// before the node is garbage collected unless it is client-only.
 func (node *Node) Shutdown(ctx context.Context) error {
 	if node.clientOnly {
 		return fmt.Errorf("Shutdown: client-only node cannot shutdown worker pool")
@@ -1336,7 +1340,7 @@ func maintainNodeRegistrationLease(
 	}
 }
 
-// Close immediately rejects new node work, stops local workers, requeues their
+// Close rejects new node work once local closure begins, stops workers, requeues their
 // jobs, and detaches the node's Redis-owned resources. It does not close the
 // caller-owned Redis client or stop workers in other nodes. Success requires
 // Stop to have released every locally accepted job, even when another cleanup
@@ -1385,6 +1389,13 @@ func (node *Node) IsClosed() bool {
 // waits for background goroutines to complete, cleans up resources and closes
 // connections. It is idempotent and can be called multiple times safely.
 func (node *Node) close(ctx context.Context, shutdown bool) error {
+	return node.closeWithCleanup(ctx, shutdown, node.cleanupForClose)
+}
+
+// closeWithCleanup joins local workers and dispatch outcomes before invoking
+// the node-owned durable cleanup operation. Only successful release and cleanup
+// publish local closure. Errors leave unfinished work available for a retry.
+func (node *Node) closeWithCleanup(ctx context.Context, shutdown bool, cleanup func(context.Context, bool) error) error {
 	node.closeLock.Lock()
 	defer node.closeLock.Unlock()
 
@@ -1400,19 +1411,6 @@ func (node *Node) close(ctx context.Context, shutdown bool) error {
 
 	node.scheduleCancel()
 	node.scheduleWG.Wait()
-
-	var stopJobsErr error
-	if shutdown {
-		// Join accepted starts before taking the job list. Shutdown then stops
-		// those handlers and removes their saved payloads without requeuing them.
-		node.localWorkers.Range(func(_, value any) bool {
-			worker := value.(*Worker)
-			worker.stopIntake()
-			worker.wg.Wait()
-			return true
-		})
-		stopJobsErr = node.stopAllJobs(ctx)
-	}
 
 	var workerStopErr error
 	var workerStopLock sync.Mutex
@@ -1437,12 +1435,6 @@ func (node *Node) close(ctx context.Context, shutdown bool) error {
 	})
 	node.wg.Wait()
 	var localTeardownErr error
-	if stopJobsErr != nil {
-		localTeardownErr = errors.Join(
-			localTeardownErr,
-			fmt.Errorf("close: failed to stop jobs: %w", stopJobsErr),
-		)
-	}
 	if workerStopErr != nil {
 		localTeardownErr = errors.Join(
 			localTeardownErr,
@@ -1458,11 +1450,37 @@ func (node *Node) close(ctx context.Context, shutdown bool) error {
 	if localTeardownErr != nil {
 		return localTeardownErr
 	}
+	if err := cleanup(ctx, shutdown); err != nil {
+		return err
+	}
 
+	// Publish closure and shutdown ownership atomically after all node-owned
+	// side effects complete.
+	node.lock.Lock()
+	node.closedState = true
+	if shutdown {
+		node.shutdown = true
+	}
+	node.lock.Unlock()
+	close(node.closed)
+	node.logger.Info("closed")
+	return nil
+}
+
+// cleanupForClose completes saved-job recovery or Shutdown deletion, then
+// detaches workers and node resources. It returns every unfinished cleanup
+// step as an error before the caller can publish local closure.
+func (node *Node) cleanupForClose(ctx context.Context, shutdown bool) error {
 	// Retry saved job recovery even after local handlers have stopped. Requeue
 	// owns worker-record deletion, including recovery delegated to another node.
 	// Failed attempts retain local workers so a later Close can retry the work.
-	if !shutdown {
+	if shutdown {
+		// Intake and handler release completed above. Read saved jobs only now,
+		// after exact outcomes settle, and retain worker records if deletion fails.
+		if err := node.cleanupShutdownJobs(ctx, node.readWorkerJobKeys, node.deletePoolMap); err != nil {
+			return fmt.Errorf("close: failed to remove saved jobs: %w", err)
+		}
+	} else {
 		if err := node.requeueAllJobs(ctx); err != nil {
 			return fmt.Errorf("close: failed to requeue jobs: %w", err)
 		}
@@ -1510,16 +1528,6 @@ func (node *Node) close(ctx context.Context, shutdown bool) error {
 		return fmt.Errorf("close: pending distributed cleanup: %w", err)
 	}
 
-	// Publish closure and shutdown ownership atomically after all node-owned
-	// side effects complete.
-	node.lock.Lock()
-	node.closedState = true
-	if shutdown {
-		node.shutdown = true
-	}
-	node.lock.Unlock()
-	close(node.closed)
-	node.logger.Info("closed")
 	return nil
 }
 
@@ -1611,32 +1619,51 @@ func (node *Node) closeAfterDistributedLoss(ctx context.Context, shutdown bool) 
 	return teardownErr
 }
 
-// stopAllJobs stops all jobs running on the node.
-func (node *Node) stopAllJobs(ctx context.Context) error {
-	var wg sync.WaitGroup
-	var total atomic.Int32
-	var stopErr error
-	var errLock sync.Mutex
-	node.localWorkers.Range(func(key, value any) bool {
-		wg.Add(1)
+// cleanupShutdownJobs deletes saved payloads after local handlers and terminal
+// dispatch outcomes finish. The supplied operations read saved worker job keys
+// and delete map entries. Errors preserve worker records for the next attempt;
+// worker removal may proceed only after this method succeeds.
+func (node *Node) cleanupShutdownJobs(
+	ctx context.Context,
+	readKeys func(context.Context, string) ([]string, error),
+	deleteEntry func(context.Context, string, string) error,
+) error {
+	var cleanupErr error
+	node.localWorkers.Range(func(_, value any) bool {
 		worker := value.(*Worker)
-		pulse.Go(node.logger, func() {
-			defer wg.Done()
-			for _, job := range worker.Jobs() {
-				if err := worker.stopJob(ctx, job.Key); err != nil {
-					node.logger.Error(fmt.Errorf("Close: failed to stop job %q for worker %q: %w", job.Key, worker.ID, err))
-					errLock.Lock()
-					stopErr = errors.Join(stopErr, err)
-					errLock.Unlock()
-				}
-				total.Add(1)
+		keys, err := readKeys(ctx, worker.ID)
+		if err != nil {
+			cleanupErr = errors.Join(cleanupErr,
+				fmt.Errorf("read saved jobs for worker %q: %w", worker.ID, err))
+			return true
+		}
+		for _, key := range keys {
+			if err := deleteEntry(ctx, node.resources.jobPayloads, key); err != nil {
+				cleanupErr = errors.Join(cleanupErr,
+					fmt.Errorf("delete saved payload for worker %q job %q: %w", worker.ID, key, err))
 			}
-		})
+		}
 		return true
 	})
-	wg.Wait()
-	node.logger.Info("stopped all jobs", "total", total.Load())
-	return stopErr
+	return cleanupErr
+}
+
+// readWorkerJobKeys reads the existing saved JSON job list directly from
+// storage. A missing worker record has no remaining jobs. Read or decode errors
+// stop cleanup so a delayed local map update cannot hide saved payloads.
+func (node *Node) readWorkerJobKeys(ctx context.Context, workerID string) ([]string, error) {
+	value, err := node.rdb.HGet(ctx, rmapContentKey(node.resources.jobs), workerID).Result()
+	if errors.Is(err, redis.Nil) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var keys []string
+	if err := json.Unmarshal([]byte(value), &keys); err != nil {
+		return nil, fmt.Errorf("decode saved job keys: %w", err)
+	}
+	return keys, nil
 }
 
 // handlePoolEvents reads events from the pool job stream.

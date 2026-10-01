@@ -86,11 +86,15 @@ type (
 		// deliveries with the same key and payload do not call Start again.
 		// Recovery after process loss may call Start on another worker, so
 		// external effects must still tolerate a replay.
+		// If intake stops before acceptance, Pulse leaves the delivery pending
+		// without calling Start. Start errors other than ErrRequeue remain
+		// terminal once their saved ownership and payload have been removed.
 		Start(job *Job) error
 		// Stop releases the accepted job before its key stops or moves. Pulse
-		// serializes Start and Stop calls for each worker. Close and RemoveWorker
-		// wait for successful Stops even when another node owns job recovery.
+		// serializes Start and Stop calls for each worker. Close, RemoveWorker,
+		// and Shutdown wait for successful Stops regardless of recovery ownership.
 		// A failed Stop leaves the local job available for another stop attempt.
+		// A successful Stop is not repeated when saved-job cleanup needs a retry.
 		Stop(key string) error
 	}
 
@@ -314,31 +318,41 @@ func (w *Worker) handleEvents(ctx context.Context, c <-chan *streaming.Event) {
 			default:
 				err = fmt.Errorf("unknown worker event %q", ev.EventName)
 			}
-			if err != nil {
-				if redis.HasErrorPrefix(err, "WORKERCLEANUPLOST") {
-					return
-				}
-				if errors.Is(err, ErrRequeue) {
-					w.logger.Info("requeue", "event", ev.EventName, "id", ev.ID)
-					continue
-				}
-				if dispatched != nil && dispatched.dispatchID != "" {
-					w.node.ownDispatchSettlement(w, nodeID, ev.ID, dispatched, err)
-				} else {
-					w.ackPoolEvent(ctx, nodeID, ev.ID, err)
-				}
-				w.logger.Error(fmt.Errorf("handler failed: %w", err), "event", ev.EventName, "id", ev.ID)
-				continue
+			if redis.HasErrorPrefix(err, "WORKERCLEANUPLOST") {
+				return
 			}
-			if dispatched != nil && dispatched.dispatchID != "" {
-				w.node.ownDispatchSettlement(w, nodeID, ev.ID, dispatched, nil)
-			} else {
-				w.ackPoolEvent(ctx, nodeID, ev.ID, nil)
-			}
+			w.completeEvent(ctx, nodeID, ev, dispatched, err, w.ackPoolEvent, w.node.ownDispatchSettlement)
 		case <-w.done:
 			w.logger.Debug("handleEvents: done")
 			return
 		}
+	}
+}
+
+// completeEvent leaves retryable results pending without acknowledging or
+// settling them. Other results go to exact-dispatch settlement when the job
+// has a dispatch ID, or ordinary acknowledgement otherwise. The operations
+// supplied by the worker loop own those two completion routes.
+func (w *Worker) completeEvent(
+	ctx context.Context,
+	nodeID string,
+	event *streaming.Event,
+	dispatched *Job,
+	resultErr error,
+	acknowledge func(context.Context, string, string, error),
+	settle func(*Worker, string, string, *Job, error),
+) {
+	if errors.Is(resultErr, ErrRequeue) {
+		w.logger.Info("requeue", "event", event.EventName, "id", event.ID)
+		return
+	}
+	if dispatched != nil && dispatched.dispatchID != "" {
+		settle(w, nodeID, event.ID, dispatched, resultErr)
+	} else {
+		acknowledge(ctx, nodeID, event.ID, resultErr)
+	}
+	if resultErr != nil {
+		w.logger.Error(fmt.Errorf("handler failed: %w", resultErr), "event", event.EventName, "id", event.ID)
 	}
 }
 
@@ -415,6 +429,11 @@ func (w *Worker) stopIntake() {
 func (w *Worker) startJob(ctx context.Context, job *Job) error {
 	w.jobsLock.Lock()
 	defer w.jobsLock.Unlock()
+	if w.IsStopped() {
+		// Intake ended before acceptance. Leave either dispatch format pending
+		// so routing can select a worker that still accepts jobs.
+		return fmt.Errorf("%w: worker %q stopped before accepting job", ErrRequeue, w.ID)
+	}
 	if _, running := w.jobs.Load(job.Key); job.Requeued && !running {
 		// This delivery may have waited while rebalance moved the job. Leave
 		// it pending for routing to the current worker instead of restarting
@@ -433,9 +452,10 @@ func (w *Worker) startJob(ctx context.Context, job *Job) error {
 
 // startJobLocked starts a new handler or acknowledges its accepted delivery.
 // The caller holds jobsLock through ownership writes and failed-start cleanup.
+// Internal restarts restore ownership without repeating delivery routing.
 func (w *Worker) startJobLocked(ctx context.Context, job *Job) error {
 	if w.IsStopped() {
-		return fmt.Errorf("worker %q stopped", w.ID)
+		return fmt.Errorf("%w: worker %q stopped before accepting job", ErrRequeue, w.ID)
 	}
 	if err := w.refreshHeartbeat(ctx); err != nil {
 		return err
@@ -476,10 +496,18 @@ func (w *Worker) startJobLocked(ctx context.Context, job *Job) error {
 			return ErrRequeue
 		}
 	}
+	return w.startHandler(ctx, job, w.cleanupFailedStart)
+}
+
+// startHandler accepts a job whose ownership and payload have been saved.
+// Start success records local execution for a later Stop. Start failure is
+// terminal only after saved-job cleanup succeeds; otherwise delivery retries.
+// The caller holds jobsLock, and cleanup removes the failed job's saved data.
+func (w *Worker) startHandler(ctx context.Context, job *Job, cleanup func(context.Context, string) error) error {
 	job.Worker = w
 	if err := w.handler.Start(job); err != nil {
 		w.logger.Debug("handler failed to start job", "job", job.Key, "error", err)
-		if cleanupErr := w.cleanupFailedStart(ctx, job.Key); cleanupErr != nil {
+		if cleanupErr := cleanup(ctx, job.Key); cleanupErr != nil {
 			return errors.Join(ErrRequeue, err, cleanupErr)
 		}
 		return err

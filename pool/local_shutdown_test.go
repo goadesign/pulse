@@ -1,6 +1,7 @@
-// These tests construct already accepted jobs with stopped intake and no Redis
-// client. They check local handler release, joining, and retry through worker
-// shutdown and node cleanup without running distributed recovery.
+// These tests use synthetic jobs, stopped intake, and in-process saved-data
+// operations with no Redis client. They check acceptance, local handler release,
+// joining, and retry in the production shutdown algorithms. They do not run
+// distributed recovery or the pool-wide shutdown barrier.
 package pool
 
 import (
@@ -14,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"goa.design/pulse/pulse"
+	"goa.design/pulse/streaming"
 )
 
 func TestLocalShutdownReleasesAcceptedJobsWithoutDistributedState(t *testing.T) {
@@ -267,6 +269,378 @@ func TestLocalShutdownPreservesSettlementFailureAfterSuccessfulStops(t *testing.
 	assert.Empty(t, worker.Jobs())
 	assert.ErrorIs(t, node.Close(context.Background()), settlementErr)
 	assert.Equal(t, 1, calls)
+}
+
+func TestLocalShutdownRejectsStartsBeforeHandlerAcceptance(t *testing.T) {
+	for _, dispatchID := range []string{"", "synthetic-exact-dispatch"} {
+		name := "ordinary"
+		if dispatchID != "" {
+			name = "exact"
+		}
+		t.Run(name, func(t *testing.T) {
+			for _, requeued := range []bool{false, true} {
+				calls := 0
+				worker := newLocalShutdownWorker(&mockJobHandler{
+					startFunc: func(*Job) error {
+						calls++
+						return nil
+					},
+				})
+				original := &Job{
+					Key:        "not-accepted",
+					Payload:    []byte("synthetic payload"),
+					Requeued:   requeued,
+					dispatchID: dispatchID,
+				}
+				job, err := unmarshalJob(marshalJob(original))
+				require.NoError(t, err)
+
+				// handleEvents checks ErrRequeue before either exact settlement
+				// or ordinary acknowledgement, leaving this delivery pending.
+				err = worker.startJob(context.Background(), job)
+				assert.ErrorIs(t, err, ErrRequeue)
+				assert.Zero(t, calls)
+				assert.Empty(t, worker.Jobs())
+				assert.Nil(t, job.Worker)
+				acks, settlements := completeLocalShutdownStart(t, worker, job, err)
+				assert.Zero(t, acks)
+				assert.Zero(t, settlements)
+			}
+		})
+	}
+}
+
+func TestLocalShutdownPreservesHandlerStartOutcomes(t *testing.T) {
+	handlerErr := errors.New("synthetic handler rejected job")
+	cleanupErr := errors.New("synthetic failed-start cleanup failed")
+	for _, dispatchID := range []string{"", "synthetic-exact-dispatch"} {
+		name := "ordinary"
+		if dispatchID != "" {
+			name = "exact"
+		}
+		t.Run(name, func(t *testing.T) {
+			for _, test := range []struct {
+				name       string
+				startErr   error
+				cleanupErr error
+				requeue    bool
+			}{
+				{name: "accepted"},
+				{name: "terminal-handler-error", startErr: handlerErr},
+				{name: "unfinished-cleanup", startErr: handlerErr, cleanupErr: cleanupErr, requeue: true},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					startCalls := 0
+					worker := newLocalShutdownWorker(&mockJobHandler{
+						startFunc: func(job *Job) error {
+							startCalls++
+							assert.Equal(t, "saved-job", job.Key)
+							assert.Equal(t, dispatchID, job.dispatchID)
+							return test.startErr
+						},
+					})
+					worker.stopped = false
+					job := &Job{Key: "saved-job", dispatchID: dispatchID}
+					cleanupCalls := 0
+					cleanup := func(_ context.Context, key string) error {
+						cleanupCalls++
+						assert.Equal(t, job.Key, key)
+						return test.cleanupErr
+					}
+
+					// The ownership phase is already complete in this fixture.
+					// Exercise the same handler-acceptance phase used by startJob.
+					worker.jobsLock.Lock()
+					err := worker.startHandler(context.Background(), job, cleanup)
+					worker.jobsLock.Unlock()
+					assert.Equal(t, 1, startCalls)
+					assert.Same(t, worker, job.Worker)
+					assert.Equal(t, test.requeue, errors.Is(err, ErrRequeue))
+					acks, settlements := completeLocalShutdownStart(t, worker, job, err)
+					if test.requeue {
+						assert.Zero(t, acks)
+						assert.Zero(t, settlements)
+					} else if dispatchID == "" {
+						assert.Equal(t, 1, acks)
+						assert.Zero(t, settlements)
+					} else {
+						assert.Zero(t, acks)
+						assert.Equal(t, 1, settlements)
+					}
+					if test.startErr == nil {
+						require.NoError(t, err)
+						assert.Zero(t, cleanupCalls)
+						require.Len(t, worker.Jobs(), 1)
+					} else {
+						assert.ErrorIs(t, err, handlerErr)
+						assert.Equal(t, 1, cleanupCalls)
+						assert.Empty(t, worker.Jobs())
+						if test.cleanupErr == nil {
+							assert.Same(t, handlerErr, err)
+						} else {
+							assert.ErrorIs(t, err, cleanupErr)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestLocalShutdownAttemptsFailedStopOnceBeforeRetry(t *testing.T) {
+	stopErr := errors.New("synthetic handler still running")
+	calls := 0
+	worker := newLocalShutdownWorker(&mockJobHandler{
+		stopFunc: func(string) error {
+			calls++
+			return stopErr
+		},
+	}, "accepted-job")
+	node := newLocalShutdownNode(worker)
+
+	assert.ErrorIs(t, node.close(context.Background(), true), stopErr)
+	assert.Equal(t, 1, calls, "Shutdown must have only one handler-release phase")
+	assert.False(t, node.IsClosed())
+	assert.False(t, node.IsShutdown())
+	assert.Len(t, node.Workers(), 1)
+	assert.Len(t, worker.Jobs(), 1)
+
+	cleanupCalls := 0
+	cleanup := func(_ context.Context, shutdown bool) error {
+		cleanupCalls++
+		assert.True(t, shutdown)
+		assert.Empty(t, worker.Jobs())
+		node.localWorkers.Delete(worker.ID)
+		return nil
+	}
+	assert.ErrorIs(t, node.closeWithCleanup(context.Background(), true, cleanup), stopErr)
+	assert.Zero(t, cleanupCalls, "failed local release prevents durable cleanup")
+	stopErr = nil
+	require.NoError(t, node.closeWithCleanup(context.Background(), true, cleanup))
+	assert.Equal(t, 3, calls)
+	assert.Equal(t, 1, cleanupCalls)
+	assert.Empty(t, worker.Jobs())
+	assert.True(t, node.IsClosed())
+	assert.True(t, node.IsShutdown())
+	assert.Empty(t, node.Workers())
+	require.NoError(t, node.closeWithCleanup(context.Background(), true, cleanup))
+	assert.Equal(t, 3, calls)
+	assert.Equal(t, 1, cleanupCalls)
+}
+
+func TestLocalShutdownRetriesSavedCleanupWithoutRepeatedStops(t *testing.T) {
+	for _, failure := range []string{"read", "delete", "partial-delete"} {
+		t.Run(failure, func(t *testing.T) {
+			stopCalls := 0
+			worker := newLocalShutdownWorker(&mockJobHandler{
+				stopFunc: func(string) error {
+					stopCalls++
+					return nil
+				},
+			}, "accepted-job")
+			node := newLocalShutdownNode(worker)
+			node.resources.jobPayloads = "synthetic-payloads"
+			savedKeys := []string{"accepted-job", "saved-only-job"}
+			payloads := map[string]bool{"accepted-job": true, "saved-only-job": true}
+			cleanupErr := errors.New("synthetic saved-data operation failed")
+			fail := true
+			readCalls := 0
+			deleteCalls := make(map[string]int)
+			readKeys := func(_ context.Context, workerID string) ([]string, error) {
+				readCalls++
+				assert.Equal(t, worker.ID, workerID)
+				assert.Empty(t, worker.Jobs(), "saved-data read follows successful Stop")
+				if fail && failure == "read" {
+					return nil, cleanupErr
+				}
+				return savedKeys, nil
+			}
+			deleteEntry := func(_ context.Context, mapName, key string) error {
+				assert.Equal(t, node.resources.jobPayloads, mapName)
+				deleteCalls[key]++
+				if fail && (failure == "delete" || failure == "partial-delete" && key == "saved-only-job") {
+					return cleanupErr
+				}
+				delete(payloads, key)
+				return nil
+			}
+
+			cleanup := func(ctx context.Context, shutdown bool) error {
+				assert.True(t, shutdown)
+				if err := node.cleanupShutdownJobs(ctx, readKeys, deleteEntry); err != nil {
+					return err
+				}
+				savedKeys = nil
+				node.localWorkers.Delete(worker.ID)
+				return nil
+			}
+			assert.ErrorIs(t, node.closeWithCleanup(context.Background(), true, cleanup), cleanupErr)
+			assert.Equal(t, 1, stopCalls)
+			assert.False(t, node.IsClosed())
+			assert.Len(t, node.Workers(), 1)
+			assert.Equal(t, []string{"accepted-job", "saved-only-job"}, savedKeys)
+			if failure == "read" {
+				assert.Empty(t, deleteCalls, "a read failure cannot hide jobs by deleting records")
+			} else {
+				assert.Equal(t, map[string]int{"accepted-job": 1, "saved-only-job": 1}, deleteCalls)
+			}
+
+			fail = false
+			require.NoError(t, node.closeWithCleanup(context.Background(), true, cleanup))
+			assert.Equal(t, 1, stopCalls, "cleanup retry must not repeat a successful Stop")
+			assert.Equal(t, 2, readCalls, "each attempt reads the saved record")
+			assert.Empty(t, payloads)
+			assert.Empty(t, savedKeys)
+			assert.Empty(t, node.Workers())
+			assert.True(t, node.IsClosed())
+			assert.True(t, node.IsShutdown())
+			require.NoError(t, node.closeWithCleanup(context.Background(), true, cleanup))
+			assert.Equal(t, 1, stopCalls)
+			assert.Equal(t, 2, readCalls)
+		})
+	}
+}
+
+func TestLocalShutdownJoinsAcceptedStartBeforeSavedJobRead(t *testing.T) {
+	stopCalls := 0
+	worker := newLocalShutdownWorker(&mockJobHandler{
+		stopFunc: func(key string) error {
+			stopCalls++
+			assert.Equal(t, "late-accepted-job", key)
+			return nil
+		},
+	})
+	node := newLocalShutdownNode(worker)
+	readCalls := 0
+	readKeys := func(_ context.Context, workerID string) ([]string, error) {
+		readCalls++
+		assert.Equal(t, worker.ID, workerID)
+		assert.Equal(t, 1, stopCalls)
+		assert.Empty(t, worker.Jobs())
+		return []string{"late-accepted-job"}, nil
+	}
+	deleteEntry := func(_ context.Context, _, key string) error {
+		assert.Equal(t, "late-accepted-job", key)
+		return nil
+	}
+	cleanup := func(ctx context.Context, shutdown bool) error {
+		assert.True(t, shutdown)
+		if err := node.cleanupShutdownJobs(ctx, readKeys, deleteEntry); err != nil {
+			return err
+		}
+		node.localWorkers.Delete(worker.ID)
+		return nil
+	}
+	worker.wg.Add(1)
+	result := make(chan error, 1)
+	go func() {
+		result <- node.closeWithCleanup(context.Background(), true, cleanup)
+	}()
+	select {
+	case err := <-result:
+		t.Errorf("close returned before accepted start finished: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	worker.jobs.Store("late-accepted-job", &Job{Key: "late-accepted-job"})
+	worker.wg.Done()
+	require.NoError(t, awaitLocalShutdown(t, result))
+	assert.Equal(t, 1, readCalls)
+	assert.True(t, node.IsClosed())
+	assert.Empty(t, node.Workers())
+}
+
+func TestLocalShutdownOrdinaryClosePreservesSavedRecovery(t *testing.T) {
+	stopCalls := 0
+	worker := newLocalShutdownWorker(&mockJobHandler{
+		stopFunc: func(string) error {
+			stopCalls++
+			return nil
+		},
+	}, "accepted-job")
+	node := newLocalShutdownNode(worker)
+	savedPayload := []byte("synthetic saved payload")
+	savedKeys := []string{"accepted-job"}
+	recoveryErr := errors.New("synthetic recovery still pending")
+	cleanupCalls := 0
+	cleanup := func(_ context.Context, shutdown bool) error {
+		cleanupCalls++
+		assert.False(t, shutdown)
+		assert.Empty(t, worker.Jobs())
+		assert.Equal(t, []byte("synthetic saved payload"), savedPayload)
+		assert.Equal(t, []string{"accepted-job"}, savedKeys)
+		if recoveryErr != nil {
+			return recoveryErr
+		}
+		node.localWorkers.Delete(worker.ID)
+		return nil
+	}
+
+	assert.ErrorIs(t, node.closeWithCleanup(context.Background(), false, cleanup), recoveryErr)
+	assert.False(t, node.IsClosed())
+	assert.True(t, node.closing)
+	assert.Len(t, node.Workers(), 1)
+	_, admissionErr := node.AddWorker(context.Background(), &mockJobHandler{})
+	assert.Error(t, admissionErr, "local closing rejects new workers before storage access")
+	recoveryErr = nil
+	require.NoError(t, node.closeWithCleanup(context.Background(), false, cleanup))
+	assert.Equal(t, 1, stopCalls)
+	assert.Equal(t, 2, cleanupCalls)
+	assert.True(t, node.IsClosed())
+	assert.False(t, node.IsShutdown())
+	assert.Equal(t, []string{"accepted-job"}, savedKeys, "delegated recovery retains the saved record")
+}
+
+func TestLocalShutdownJoinsTerminalOutcomeBeforeSavedCleanup(t *testing.T) {
+	worker := newLocalShutdownWorker(&mockJobHandler{
+		stopFunc: func(string) error {
+			return nil
+		},
+	}, "accepted-job")
+	node := newLocalShutdownNode(worker)
+	finish := node.settlements.begin(worker.ID)
+	cleanupCalls := 0
+	cleanup := func(_ context.Context, shutdown bool) error {
+		cleanupCalls++
+		assert.True(t, shutdown)
+		node.localWorkers.Delete(worker.ID)
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	assert.ErrorIs(t, node.closeWithCleanup(ctx, true, cleanup), context.Canceled)
+	assert.False(t, node.IsClosed())
+	assert.Empty(t, worker.Jobs())
+	assert.Zero(t, cleanupCalls)
+	finish(nil)
+
+	require.NoError(t, node.closeWithCleanup(context.Background(), true, cleanup))
+	assert.Equal(t, 1, cleanupCalls)
+	assert.True(t, node.IsClosed())
+}
+
+// completeLocalShutdownStart sends a decoded start result through the worker
+// loop's completion phase. In-process operations record which route receives
+// the result and verify its worker, event, job, and error without storage access.
+func completeLocalShutdownStart(t *testing.T, worker *Worker, job *Job, resultErr error) (int, int) {
+	t.Helper()
+	acks, settlements := 0, 0
+	event := &streaming.Event{ID: "synthetic-event", EventName: evStartJob}
+	acknowledge := func(_ context.Context, nodeID, eventID string, err error) {
+		acks++
+		assert.Equal(t, "synthetic-node", nodeID)
+		assert.Equal(t, event.ID, eventID)
+		assert.Equal(t, resultErr, err)
+	}
+	settle := func(owner *Worker, nodeID, eventID string, dispatched *Job, err error) {
+		settlements++
+		assert.Same(t, worker, owner)
+		assert.Equal(t, "synthetic-node", nodeID)
+		assert.Equal(t, event.ID, eventID)
+		assert.Same(t, job, dispatched)
+		assert.Equal(t, resultErr, err)
+	}
+	worker.completeEvent(context.Background(), "synthetic-node", event, job, resultErr, acknowledge, settle)
+	return acks, settlements
 }
 
 // newLocalShutdownWorker represents accepted jobs after worker intake stopped.
