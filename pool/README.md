@@ -254,6 +254,16 @@ immediate admission fence: once it begins, the node rejects new workers, job or
 message dispatches, stop requests, and notifications while already admitted
 operations finish.
 
+Successful `Close` waits for `JobHandler.Stop` to release every locally accepted
+job. This local obligation does not depend on which node owns job requeue, and
+still applies after distributed pool cleanup has completed. Pulse retains saved
+job records for requeue even after local handlers stop. If another cleanup owner
+holds the requeue lease, closing leaves those records for that owner to finish.
+A failed `Stop` is returned as an error, leaves the node unclosed, and retains
+the failed local jobs for a later `Close` attempt. Pulse cannot forcibly stop
+application goroutines; handlers must release their work before returning
+success from `Stop`.
+
 [![Pool Close](../snippets/pool-close.png)](../examples/pool/producer/main.go#L66-L70)
 
 Note that closing a pool node does not stop remote workers. It only stops the
@@ -318,6 +328,11 @@ keyed messages and `HandleNotification` to receive job-scoped notifications.
 
 The `AddWorker` function returns a new worker and an error. Workers can be
 removed from pool nodes using the `RemoveWorker` method.
+
+Successful `RemoveWorker` joins worker intake and waits for `Stop` to release
+every accepted local job before removing the worker locally. Saved jobs remain
+available for requeue by this worker or another cleanup owner. A failed `Stop`
+retains the worker and failed local jobs so removal can be retried.
 
 ### Dispatching A Job
 

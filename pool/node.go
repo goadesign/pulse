@@ -1,3 +1,7 @@
+// Nodes own local workers, schedules, and dispatch outcomes. Close joins local
+// work and stops accepted handlers before detaching node resources. Workers
+// holding a requeue lease own saved job recovery; local removal preserves those
+// records when another cleanup owner must finish the recovery.
 package pool
 
 import (
@@ -553,8 +557,10 @@ func (node *Node) AddWorker(ctx context.Context, handler JobHandler) (*Worker, e
 	return w, nil
 }
 
-// RemoveWorker stops the worker, removes it from the pool and requeues all its
-// jobs.
+// RemoveWorker joins worker intake and waits for Stop to release every locally
+// accepted job before removing the worker locally. Saved jobs are requeued by
+// the worker or another cleanup owner. A Stop failure retains the worker and
+// failed jobs so RemoveWorker can be retried.
 func (node *Node) RemoveWorker(ctx context.Context, w *Worker) error {
 	node.lock.RLock()
 	defer node.lock.RUnlock()
@@ -570,9 +576,7 @@ func (node *Node) RemoveWorker(ctx context.Context, w *Worker) error {
 	if err := w.requeueJobs(ctx); err != nil {
 		return fmt.Errorf("RemoveWorker: failed to requeue jobs for worker %q: %w", w.ID, err)
 	}
-	if err := node.removeWorker(ctx, w.ID); err != nil {
-		return fmt.Errorf("RemoveWorker: failed to remove worker %q: %w", w.ID, err)
-	}
+	node.workerStreams.Delete(w.ID)
 	node.localWorkers.Delete(w.ID)
 	node.logger.Info("removed worker", "worker", w.ID)
 	return nil
@@ -1334,10 +1338,13 @@ func maintainNodeRegistrationLease(
 
 // Close immediately rejects new node work, stops local workers, requeues their
 // jobs, and detaches the node's Redis-owned resources. It does not close the
-// caller-owned Redis client or stop workers in other nodes. A distributed
-// detach failure is returned without marking the node closed, so Close may be
-// retried with a fresh context. One of Shutdown or Close should be called
-// before the node is garbage collected unless it is client-only.
+// caller-owned Redis client or stop workers in other nodes. Success requires
+// Stop to have released every locally accepted job, even when another cleanup
+// owner requeues the saved jobs or pool cleanup has already completed. A Stop
+// failure retains failed jobs and leaves the node unclosed for another attempt.
+// A distributed detach failure also leaves the node unclosed, so Close may be
+// retried with a fresh context. One of Shutdown or Close should be called before
+// the node is garbage collected unless it is client-only.
 func (node *Node) Close(ctx context.Context) error {
 	node.lock.RLock()
 	cleanupComplete := node.cleanupComplete
@@ -1396,6 +1403,14 @@ func (node *Node) close(ctx context.Context, shutdown bool) error {
 
 	var stopJobsErr error
 	if shutdown {
+		// Join accepted starts before taking the job list. Shutdown then stops
+		// those handlers and removes their saved payloads without requeuing them.
+		node.localWorkers.Range(func(_, value any) bool {
+			worker := value.(*Worker)
+			worker.stopIntake()
+			worker.wg.Wait()
+			return true
+		})
 		stopJobsErr = node.stopAllJobs(ctx)
 	}
 
@@ -1444,9 +1459,9 @@ func (node *Node) close(ctx context.Context, shutdown bool) error {
 		return localTeardownErr
 	}
 
-	// Requeue and distributed worker cleanup are retried on every Close attempt.
-	// A worker remains locally discoverable until all of its map records are
-	// removed, so a failed attempt cannot hide incomplete cleanup.
+	// Retry saved job recovery even after local handlers have stopped. Requeue
+	// owns worker-record deletion, including recovery delegated to another node.
+	// Failed attempts retain local workers so a later Close can retry the work.
 	if !shutdown {
 		if err := node.requeueAllJobs(ctx); err != nil {
 			return fmt.Errorf("close: failed to requeue jobs: %w", err)
@@ -1455,10 +1470,13 @@ func (node *Node) close(ctx context.Context, shutdown bool) error {
 	var workerCleanupErr error
 	node.localWorkers.Range(func(key, value any) bool {
 		worker := value.(*Worker)
-		if err := node.removeWorker(ctx, worker.ID); err != nil {
-			workerCleanupErr = errors.Join(workerCleanupErr, err)
-			return true
+		if shutdown {
+			if err := node.removeWorker(ctx, worker.ID); err != nil {
+				workerCleanupErr = errors.Join(workerCleanupErr, err)
+				return true
+			}
 		}
+		node.workerStreams.Delete(worker.ID)
 		node.localWorkers.Delete(key)
 		return true
 	})
@@ -1531,8 +1549,15 @@ func (node *Node) closeAfterDistributedLoss(ctx context.Context, shutdown bool) 
 
 	node.scheduleCancel()
 	node.scheduleWG.Wait()
+	var workerStopErr error
 	node.localWorkers.Range(func(key, value any) bool {
-		value.(*Worker).stopLocal()
+		worker := value.(*Worker)
+		if err := worker.stopLocal(); err != nil {
+			workerStopErr = errors.Join(workerStopErr,
+				fmt.Errorf("close after distributed cleanup: stop worker %q: %w", worker.ID, err))
+			return true
+		}
+		node.workerStreams.Delete(worker.ID)
 		node.localWorkers.Delete(key)
 		return true
 	})
@@ -1569,6 +1594,12 @@ func (node *Node) closeAfterDistributedLoss(ctx context.Context, shutdown bool) 
 		node.pendingJobChannels.Delete(key)
 		return true
 	})
+
+	// Distributed resources may be gone while an application handler still
+	// refuses to stop. Keep that worker and leave Close retryable until it stops.
+	if workerStopErr != nil {
+		return errors.Join(workerStopErr, teardownErr)
+	}
 
 	node.lock.Lock()
 	node.closedState = true
@@ -2283,31 +2314,15 @@ func (node *Node) cleanupWorker(ctx context.Context, workerID string) {
 			node.logger.Error(fmt.Errorf("cleanupWorker: release lease: %w", err), "worker", workerID)
 		}
 	}()
-	complete = node.requeueWorkerJobs(ctx, lease, nil)
+	complete = node.requeueWorkerJobs(ctx, lease)
 }
 
 // requeueWorkerJobs republishes every job owned by the leased worker through
 // the lease-fenced stable publication records and deletes the worker once all
-// jobs are processed. onProcessed, when non-nil, observes each job key that
-// left the worker's ownership so a gracefully stopping worker can stop its
-// local handler; an onProcessed error leaves the job for the next attempt.
-// It returns true when the worker was completely requeued and deleted.
-func (node *Node) requeueWorkerJobs(
-	ctx context.Context,
-	lease *workerCleanupLease,
-	onProcessed func(key string) error,
-) bool {
+// jobs are processed. Local handlers have already stopped when this is called
+// during graceful removal. It returns true when recovery and deletion complete.
+func (node *Node) requeueWorkerJobs(ctx context.Context, lease *workerCleanupLease) bool {
 	workerID := lease.workerID
-	processKey := func(key string) bool {
-		if onProcessed == nil {
-			return true
-		}
-		if err := onProcessed(key); err != nil {
-			node.logger.Error(fmt.Errorf("requeueWorkerJobs: local stop failed: %w", err), "job", key, "worker", workerID)
-			return false
-		}
-		return true
-	}
 
 	// Get the worker's jobs
 	keys, ok := node.jobMap.GetValues(workerID)
@@ -2347,9 +2362,6 @@ func (node *Node) requeueWorkerJobs(
 					"dispatch",
 					dispatchID,
 				)
-				if !processKey(key) {
-					continue
-				}
 				processed++
 				continue
 			}
@@ -2365,9 +2377,6 @@ func (node *Node) requeueWorkerJobs(
 				continue
 			}
 			node.logger.Info("requeueWorkerJobs: removed stale job key with missing payload", "job", key, "worker", workerID)
-			if !processKey(key) {
-				continue
-			}
 			processed++
 			continue
 		}
@@ -2381,9 +2390,6 @@ func (node *Node) requeueWorkerJobs(
 			continue
 		}
 		if status == 2 {
-			if !processKey(key) {
-				continue
-			}
 			processed++
 			continue
 		}
@@ -2396,13 +2402,7 @@ func (node *Node) requeueWorkerJobs(
 			if !removed {
 				continue
 			}
-			if !processKey(key) {
-				continue
-			}
 			processed++
-			continue
-		}
-		if !processKey(key) {
 			continue
 		}
 		requeued++
@@ -2549,8 +2549,9 @@ func (node *Node) deleteWorker(id string) error {
 	return node.removeWorkerFromMaps(ctx, id)
 }
 
-// removeWorker removes a worker that was created by this node.
-// This is used during graceful shutdown or explicit worker removal.
+// removeWorker removes saved tracking records during pool-wide Shutdown, when
+// jobs will not be requeued. Ordinary Close and RemoveWorker leave this deletion
+// to the cleanup owner holding the worker's requeue lease.
 func (node *Node) removeWorker(ctx context.Context, id string) error {
 	if err := node.removeWorkerFromMaps(ctx, id); err != nil {
 		return err
