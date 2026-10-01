@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	redis "github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -616,6 +617,134 @@ func TestLocalShutdownJoinsTerminalOutcomeBeforeSavedCleanup(t *testing.T) {
 	require.NoError(t, node.closeWithCleanup(context.Background(), true, cleanup))
 	assert.Equal(t, 1, cleanupCalls)
 	assert.True(t, node.IsClosed())
+}
+
+func TestLocalShutdownSavedJobReadContract(t *testing.T) {
+	readErr := errors.New("synthetic storage read failed")
+	for _, test := range []struct {
+		name    string
+		value   string
+		readErr error
+		keys    []string
+		invalid bool
+	}{
+		{name: "missing", readErr: redis.Nil},
+		{name: "nonempty-array", value: `["accepted-job","saved-only-job"]`, keys: []string{"accepted-job", "saved-only-job"}},
+		{name: "empty-array", value: `[]`, keys: []string{}},
+		{name: "string-content", value: `["","  spaced  ","comma,key","quote\"key","key","key"]`, keys: []string{"", "  spaced  ", "comma,key", `quote"key`, "key", "key"}},
+		{name: "json-whitespace", value: " \n [\"accepted-job\"] \t", keys: []string{"accepted-job"}},
+		{name: "read-error", value: `["accepted-job"]`, readErr: readErr, invalid: true},
+		{name: "top-null", value: `null`, invalid: true},
+		{name: "top-object", value: `{}`, invalid: true},
+		{name: "top-string", value: `"accepted-job"`, invalid: true},
+		{name: "top-number", value: `1`, invalid: true},
+		{name: "top-boolean", value: `true`, invalid: true},
+		{name: "empty-value", value: ``, invalid: true},
+		{name: "malformed-json", value: `[`, invalid: true},
+		{name: "trailing-value", value: `[] []`, invalid: true},
+		{name: "null-element", value: `[null]`, invalid: true},
+		{name: "mixed-null-element", value: `["accepted-job",null]`, invalid: true},
+		{name: "number-element", value: `[1]`, invalid: true},
+		{name: "boolean-element", value: `[false]`, invalid: true},
+		{name: "object-element", value: `[{}]`, invalid: true},
+		{name: "array-element", value: `[[]]`, invalid: true},
+		{name: "mixed-number-element", value: `["accepted-job",1]`, invalid: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			keys, err := decodeWorkerJobKeys(test.value, test.readErr)
+			if test.invalid {
+				require.Error(t, err)
+				assert.Nil(t, keys)
+				if test.readErr != nil {
+					assert.ErrorIs(t, err, test.readErr)
+				}
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, test.keys, keys)
+			}
+
+			stopCalls := 0
+			worker := newLocalShutdownWorker(&mockJobHandler{
+				stopFunc: func(string) error {
+					stopCalls++
+					return nil
+				},
+			}, "accepted-job")
+			node := newLocalShutdownNode(worker)
+			node.resources.jobPayloads = "synthetic-payloads"
+			records := map[string]string{worker.ID: test.value}
+			if errors.Is(test.readErr, redis.Nil) {
+				delete(records, worker.ID)
+			}
+			currentReadErr := test.readErr
+			var deletedPayloads []string
+			readKeys := func(_ context.Context, workerID string) ([]string, error) {
+				value, exists := records[workerID]
+				if currentReadErr != nil {
+					return decodeWorkerJobKeys(value, currentReadErr)
+				}
+				if !exists {
+					return decodeWorkerJobKeys("", redis.Nil)
+				}
+				return decodeWorkerJobKeys(value, nil)
+			}
+			deleteEntry := func(_ context.Context, mapName, key string) error {
+				assert.Equal(t, node.resources.jobPayloads, mapName)
+				deletedPayloads = append(deletedPayloads, key)
+				return nil
+			}
+			cleanup := func(ctx context.Context, shutdown bool) error {
+				assert.True(t, shutdown)
+				if err := node.cleanupShutdownJobs(ctx, readKeys, deleteEntry); err != nil {
+					return err
+				}
+				delete(records, worker.ID)
+				node.localWorkers.Delete(worker.ID)
+				return nil
+			}
+
+			err = node.closeWithCleanup(context.Background(), true, cleanup)
+			if test.invalid {
+				require.Error(t, err)
+				if test.readErr != nil {
+					assert.ErrorIs(t, err, test.readErr)
+				}
+				assert.False(t, node.IsClosed())
+				assert.False(t, node.IsShutdown())
+				assert.Len(t, node.Workers(), 1)
+				assert.Equal(t, test.value, records[worker.ID])
+				assert.Empty(t, deletedPayloads)
+				assert.Empty(t, worker.Jobs())
+				assert.Equal(t, 1, stopCalls)
+				select {
+				case <-node.closed:
+					t.Error("invalid saved record must prevent publishing closure")
+				default:
+				}
+
+				// A later read supplies valid stored data. Cleanup can then
+				// finish without stopping the already released handler again.
+				records[worker.ID] = `["accepted-job"]`
+				currentReadErr = nil
+				require.NoError(t, node.closeWithCleanup(context.Background(), true, cleanup))
+				assert.Equal(t, []string{"accepted-job"}, deletedPayloads)
+			} else {
+				require.NoError(t, err)
+				if len(test.keys) == 0 {
+					assert.Empty(t, deletedPayloads)
+				} else {
+					assert.Equal(t, test.keys, deletedPayloads)
+				}
+			}
+			assert.True(t, node.IsClosed())
+			assert.True(t, node.IsShutdown())
+			assert.Empty(t, records)
+			assert.Empty(t, node.Workers())
+			assert.Equal(t, 1, stopCalls)
+			require.NoError(t, node.closeWithCleanup(context.Background(), true, cleanup))
+			assert.Equal(t, 1, stopCalls)
+		})
+	}
 }
 
 // completeLocalShutdownStart sends a decoded start result through the worker

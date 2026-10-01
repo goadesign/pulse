@@ -1653,15 +1653,32 @@ func (node *Node) cleanupShutdownJobs(
 // stop cleanup so a delayed local map update cannot hide saved payloads.
 func (node *Node) readWorkerJobKeys(ctx context.Context, workerID string) ([]string, error) {
 	value, err := node.rdb.HGet(ctx, rmapContentKey(node.resources.jobs), workerID).Result()
-	if errors.Is(err, redis.Nil) {
+	return decodeWorkerJobKeys(value, err)
+}
+
+// decodeWorkerJobKeys turns one storage read result into saved job keys.
+// Missing records have no keys. Present records must contain a JSON array of
+// strings; null or other values return an error so cleanup retains the record.
+func decodeWorkerJobKeys(value string, readErr error) ([]string, error) {
+	if errors.Is(readErr, redis.Nil) {
 		return nil, nil
 	}
-	if err != nil {
-		return nil, err
+	if readErr != nil {
+		return nil, readErr
 	}
-	var keys []string
-	if err := json.Unmarshal([]byte(value), &keys); err != nil {
+	var values []*string
+	if err := json.Unmarshal([]byte(value), &values); err != nil {
 		return nil, fmt.Errorf("decode saved job keys: %w", err)
+	}
+	if values == nil {
+		return nil, errors.New("decode saved job keys: expected an array of strings")
+	}
+	keys := make([]string, len(values))
+	for i, key := range values {
+		if key == nil {
+			return nil, fmt.Errorf("decode saved job keys: element %d must be a string", i)
+		}
+		keys[i] = *key
 	}
 	return keys, nil
 }
