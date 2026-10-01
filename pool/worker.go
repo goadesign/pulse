@@ -1,5 +1,7 @@
 // Workers translate pool deliveries into handler starts and stops. A running
 // job keeps its ownership across repeated deliveries until it stops or moves.
+// Local shutdown releases accepted handlers before distributed recovery begins;
+// saved job records remain available even after the local handlers stop.
 package pool
 
 import (
@@ -84,9 +86,15 @@ type (
 		// deliveries with the same key and payload do not call Start again.
 		// Recovery after process loss may call Start on another worker, so
 		// external effects must still tolerate a replay.
+		// If intake stops before acceptance, Pulse leaves the delivery pending
+		// without calling Start. Start errors other than ErrRequeue remain
+		// terminal once their saved ownership and payload have been removed.
 		Start(job *Job) error
 		// Stop releases the accepted job before its key stops or moves. Pulse
-		// serializes Start and Stop calls for each worker.
+		// serializes Start and Stop calls for each worker. Close, RemoveWorker,
+		// and Shutdown wait for successful Stops regardless of recovery ownership.
+		// A failed Stop leaves the local job available for another stop attempt.
+		// A successful Stop is not repeated when saved-job cleanup needs a retry.
 		Stop(key string) error
 	}
 
@@ -245,7 +253,8 @@ func (w *Worker) Jobs() []*Job {
 	return jobs
 }
 
-// IsStopped returns true if the worker is stopped.
+// IsStopped reports whether worker intake has stopped accepting deliveries.
+// Accepted handlers may still be stopping or waiting for a failed Stop to retry.
 func (w *Worker) IsStopped() bool {
 	w.lock.RLock()
 	defer w.lock.RUnlock()
@@ -309,31 +318,41 @@ func (w *Worker) handleEvents(ctx context.Context, c <-chan *streaming.Event) {
 			default:
 				err = fmt.Errorf("unknown worker event %q", ev.EventName)
 			}
-			if err != nil {
-				if redis.HasErrorPrefix(err, "WORKERCLEANUPLOST") {
-					return
-				}
-				if errors.Is(err, ErrRequeue) {
-					w.logger.Info("requeue", "event", ev.EventName, "id", ev.ID)
-					continue
-				}
-				if dispatched != nil && dispatched.dispatchID != "" {
-					w.node.ownDispatchSettlement(w, nodeID, ev.ID, dispatched, err)
-				} else {
-					w.ackPoolEvent(ctx, nodeID, ev.ID, err)
-				}
-				w.logger.Error(fmt.Errorf("handler failed: %w", err), "event", ev.EventName, "id", ev.ID)
-				continue
+			if redis.HasErrorPrefix(err, "WORKERCLEANUPLOST") {
+				return
 			}
-			if dispatched != nil && dispatched.dispatchID != "" {
-				w.node.ownDispatchSettlement(w, nodeID, ev.ID, dispatched, nil)
-			} else {
-				w.ackPoolEvent(ctx, nodeID, ev.ID, nil)
-			}
+			w.completeEvent(ctx, nodeID, ev, dispatched, err, w.ackPoolEvent, w.node.ownDispatchSettlement)
 		case <-w.done:
 			w.logger.Debug("handleEvents: done")
 			return
 		}
+	}
+}
+
+// completeEvent leaves retryable results pending without acknowledging or
+// settling them. Other results go to exact-dispatch settlement when the job
+// has a dispatch ID, or ordinary acknowledgement otherwise. The operations
+// supplied by the worker loop own those two completion routes.
+func (w *Worker) completeEvent(
+	ctx context.Context,
+	nodeID string,
+	event *streaming.Event,
+	dispatched *Job,
+	resultErr error,
+	acknowledge func(context.Context, string, string, error),
+	settle func(*Worker, string, string, *Job, error),
+) {
+	if errors.Is(resultErr, ErrRequeue) {
+		w.logger.Info("requeue", "event", event.EventName, "id", event.ID)
+		return
+	}
+	if dispatched != nil && dispatched.dispatchID != "" {
+		settle(w, nodeID, event.ID, dispatched, resultErr)
+	} else {
+		acknowledge(ctx, nodeID, event.ID, resultErr)
+	}
+	if resultErr != nil {
+		w.logger.Error(fmt.Errorf("handler failed: %w", resultErr), "event", event.EventName, "id", event.ID)
 	}
 }
 
@@ -346,9 +365,12 @@ func (w *Worker) dropMalformedEvent(ctx context.Context, event *streaming.Event,
 	}
 }
 
-// stop stops the reader, destroys the stream and closes the worker.
+// stop joins worker intake and releases its accepted handlers before destroying
+// the worker stream. A failed Stop is returned without forgetting the local job.
 func (w *Worker) stop(ctx context.Context) error {
-	w.stopLocal()
+	if err := w.stopLocal(); err != nil {
+		return err
+	}
 	w.lock.RLock()
 	destroyed := w.streamDestroyed
 	w.lock.RUnlock()
@@ -364,17 +386,32 @@ func (w *Worker) stop(ctx context.Context) error {
 	return nil
 }
 
-// stopLocal stops and joins worker intake without mutating Redis. It is used
-// when pool cleanup already destroyed the worker's generation-owned resources.
-func (w *Worker) stopLocal() {
-	firstAttempt := w.stopIntake()
-	if firstAttempt {
-		w.wg.Wait()
-	}
+// stopLocal joins worker intake, then releases every accepted handler without
+// changing saved job records. It returns all Stop errors and retains failed
+// jobs so another call can retry them after distributed cleanup or recovery.
+func (w *Worker) stopLocal() error {
+	w.stopIntake()
+	w.wg.Wait()
+
+	// Intake can no longer start handlers. Serialize with any remaining move
+	// before releasing local jobs, and keep failed jobs for another attempt.
+	w.jobsLock.Lock()
+	defer w.jobsLock.Unlock()
+	var stopErr error
+	w.jobs.Range(func(key, _ any) bool {
+		jobKey := key.(string)
+		if err := w.handler.Stop(jobKey); err != nil {
+			stopErr = errors.Join(stopErr, fmt.Errorf("failed to stop job %q: %w", jobKey, err))
+			return true
+		}
+		w.jobs.Delete(jobKey)
+		return true
+	})
+	return stopErr
 }
 
 // stopIntake closes worker-owned input without joining the calling goroutine.
-func (w *Worker) stopIntake() bool {
+func (w *Worker) stopIntake() {
 	w.lock.Lock()
 	firstAttempt := !w.stopped
 	if firstAttempt {
@@ -386,13 +423,17 @@ func (w *Worker) stopIntake() bool {
 		close(w.done)
 		w.reader.Close()
 	}
-	return firstAttempt
 }
 
 // startJob accepts one delivery while excluding a concurrent stop or move.
 func (w *Worker) startJob(ctx context.Context, job *Job) error {
 	w.jobsLock.Lock()
 	defer w.jobsLock.Unlock()
+	if w.IsStopped() {
+		// Intake ended before acceptance. Leave either dispatch format pending
+		// so routing can select a worker that still accepts jobs.
+		return fmt.Errorf("%w: worker %q stopped before accepting job", ErrRequeue, w.ID)
+	}
 	if _, running := w.jobs.Load(job.Key); job.Requeued && !running {
 		// This delivery may have waited while rebalance moved the job. Leave
 		// it pending for routing to the current worker instead of restarting
@@ -411,9 +452,10 @@ func (w *Worker) startJob(ctx context.Context, job *Job) error {
 
 // startJobLocked starts a new handler or acknowledges its accepted delivery.
 // The caller holds jobsLock through ownership writes and failed-start cleanup.
+// Internal restarts restore ownership without repeating delivery routing.
 func (w *Worker) startJobLocked(ctx context.Context, job *Job) error {
 	if w.IsStopped() {
-		return fmt.Errorf("worker %q stopped", w.ID)
+		return fmt.Errorf("%w: worker %q stopped before accepting job", ErrRequeue, w.ID)
 	}
 	if err := w.refreshHeartbeat(ctx); err != nil {
 		return err
@@ -454,10 +496,18 @@ func (w *Worker) startJobLocked(ctx context.Context, job *Job) error {
 			return ErrRequeue
 		}
 	}
+	return w.startHandler(ctx, job, w.cleanupFailedStart)
+}
+
+// startHandler accepts a job whose ownership and payload have been saved.
+// Start success records local execution for a later Stop. Start failure is
+// terminal only after saved-job cleanup succeeds; otherwise delivery retries.
+// The caller holds jobsLock, and cleanup removes the failed job's saved data.
+func (w *Worker) startHandler(ctx context.Context, job *Job, cleanup func(context.Context, string) error) error {
 	job.Worker = w
 	if err := w.handler.Start(job); err != nil {
 		w.logger.Debug("handler failed to start job", "job", job.Key, "error", err)
-		if cleanupErr := w.cleanupFailedStart(ctx, job.Key); cleanupErr != nil {
+		if cleanupErr := cleanup(ctx, job.Key); cleanupErr != nil {
 			return errors.Join(ErrRequeue, err, cleanupErr)
 		}
 		return err
@@ -775,34 +825,13 @@ func (w *Worker) rebalance(ctx context.Context, activeWorkers []string) {
 	}
 }
 
-// requeueJobs requeues the jobs handled by the worker during graceful
-// shutdown. It self-acquires the worker requeue lease — the same capability
-// stale-worker cleanup uses — so exactly one party republishes the jobs, and
-// every publication flows through the lease-fenced stable dedup records. When
-// this worker loses the lease, the winning cleanup owner owns the requeue.
+// requeueJobs republishes the worker's saved jobs after local handlers stop and
+// dispatch outcomes settle. The shared requeue lease selects one publisher.
+// When acquisition is refused, saved worker records remain for recovery by
+// another cleanup owner. Empty local jobs never imply that recovery completed.
 func (w *Worker) requeueJobs(ctx context.Context) error {
 	w.jobsLock.Lock()
 	defer w.jobsLock.Unlock()
-	var unsettled []string
-	jobCount := 0
-	w.jobs.Range(func(_, value any) bool {
-		job := value.(*Job)
-		if job.dispatchID != "" {
-			unsettled = append(unsettled, job.dispatchID)
-			return true
-		}
-		jobCount++
-		return true
-	})
-	if len(unsettled) > 0 {
-		sort.Strings(unsettled)
-		return fmt.Errorf("requeueJobs: exact dispatch settlements still pending: %v", unsettled)
-	}
-	if jobCount == 0 {
-		w.logger.Debug("requeueJobs: no jobs to requeue")
-		return nil
-	}
-	w.logger.Debug("requeueJobs: requeuing", "jobs", jobCount)
 
 	lease, err := w.node.acquireGracefulRequeue(ctx, w.ID)
 	if err != nil {
@@ -821,20 +850,9 @@ func (w *Worker) requeueJobs(ctx context.Context) error {
 		}
 	}()
 
-	stopLocal := func(key string) error {
-		if _, ok := w.jobs.Load(key); !ok {
-			return nil
-		}
-		if err := w.handler.Stop(key); err != nil {
-			return fmt.Errorf("requeueJobs: failed to stop job %q: %w", key, err)
-		}
-		w.jobs.Delete(key)
-		w.logger.Debug("requeueJobs: stopped", "job", key)
-		return nil
-	}
 	retryUntil := time.Now().Add(w.requeueTimeout)
 	for {
-		complete = w.node.requeueWorkerJobs(ctx, lease, stopLocal)
+		complete = w.node.requeueWorkerJobs(ctx, lease)
 		if complete || !retryUntil.After(time.Now()) {
 			break
 		}
@@ -848,9 +866,9 @@ func (w *Worker) requeueJobs(ctx context.Context) error {
 		}
 	}
 	if !complete {
-		return fmt.Errorf("requeueJobs: failed to requeue %d jobs after retrying for %v", jobCount, w.requeueTimeout)
+		return fmt.Errorf("requeueJobs: failed to requeue worker jobs after retrying for %v", w.requeueTimeout)
 	}
-	w.logger.Info("requeued", "jobs", jobCount)
+	w.logger.Info("requeued worker jobs")
 	return nil
 }
 

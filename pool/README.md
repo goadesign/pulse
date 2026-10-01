@@ -250,9 +250,21 @@ before starting the older version.
 
 The `Close` method closes the pool node and releases all resources associated
 with it. It should be called when the node is no longer needed. Closing is an
-immediate admission fence: once it begins, the node rejects new workers, job or
-message dispatches, stop requests, and notifications while already admitted
-operations finish.
+admission stop: after the cleanup check succeeds and local closure begins, the
+node rejects new workers, job or message dispatches, stop requests, and
+notifications while already admitted operations finish. A job delivery that
+reaches a stopped worker before handler acceptance stays pending for routing
+to another worker; Pulse does not call that handler or report a terminal failure.
+
+Successful `Close` waits for `JobHandler.Stop` to release every locally accepted
+job. This local obligation does not depend on which node owns job requeue, and
+still applies after distributed pool cleanup has completed. Pulse retains saved
+job records for requeue even after local handlers stop. If another cleanup owner
+holds the requeue lease, closing leaves those records for that owner to finish.
+A failed `Stop` is returned as an error, leaves the node unclosed, and retains
+the failed local jobs for a later `Close` attempt. Pulse cannot forcibly stop
+application goroutines; handlers must release their work before returning
+success from `Stop`.
 
 [![Pool Close](../snippets/pool-close.png)](../examples/pool/producer/main.go#L66-L70)
 
@@ -265,6 +277,14 @@ described below.
 The `Shutdown` method shuts down the entire pool by stopping all its workers
 gracefully. It should be called when the pool is no longer needed. Shutdown
 publishes one Redis-owned obligation even when a local `Close` is concurrent.
+Each worker joins intake and releases its locally accepted handlers in one Stop
+phase. Node cleanup then reads the saved worker job list directly from storage,
+deletes its payloads, and removes the worker records without requeuing jobs.
+A failed Stop or saved-job cleanup returns an error and leaves local closure
+unfinished for another `Shutdown` attempt. Failed Stops remain locally visible;
+saved worker records remain available until payload cleanup succeeds. Successful
+Stops are not repeated because storage cleanup needs a retry. `IsClosed` reports
+local node closure, which may finish before the pool-wide shutdown completes.
 After every live node detaches, final cleanup is owned by a persisted
 owner-and-lease claim based on Redis time. Another process can reclaim an
 expired claim and finish cleanup, so an interrupted shutdown cannot permanently
@@ -318,6 +338,11 @@ keyed messages and `HandleNotification` to receive job-scoped notifications.
 
 The `AddWorker` function returns a new worker and an error. Workers can be
 removed from pool nodes using the `RemoveWorker` method.
+
+Successful `RemoveWorker` joins worker intake and waits for `Stop` to release
+every accepted local job before removing the worker locally. Saved jobs remain
+available for requeue by this worker or another cleanup owner. A failed `Stop`
+retains the worker and failed local jobs so removal can be retried.
 
 ### Dispatching A Job
 
