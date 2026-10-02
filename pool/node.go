@@ -1347,8 +1347,12 @@ func maintainNodeRegistrationLease(
 // owner requeues the saved jobs or pool cleanup has already completed. A Stop
 // failure retains failed jobs and leaves the node unclosed for another attempt.
 // A distributed detach failure also leaves the node unclosed, so Close may be
-// retried with a fresh context. One of Shutdown or Close should be called before
-// the node is garbage collected unless it is client-only.
+// retried with a fresh context. If the preliminary cleanup-state read fails,
+// Close still attempts ordinary local shutdown and cleanup, and returns the
+// read error together with any shutdown error. IsClosed can be true despite
+// that read error only if ordinary closure actually completed; the read error
+// does not establish pool-wide cleanup completion. One of Shutdown or Close
+// should be called before the node is garbage collected unless it is client-only.
 func (node *Node) Close(ctx context.Context) error {
 	node.lock.RLock()
 	cleanupComplete := node.cleanupComplete
@@ -1358,7 +1362,7 @@ func (node *Node) Close(ctx context.Context) error {
 	}
 	cleanupComplete, err := node.poolCleanupComplete(ctx)
 	if err != nil {
-		return err
+		return errors.Join(err, node.close(ctx, false))
 	}
 	if cleanupComplete {
 		node.lock.Lock()

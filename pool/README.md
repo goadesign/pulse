@@ -250,8 +250,8 @@ before starting the older version.
 
 The `Close` method closes the pool node and releases all resources associated
 with it. It should be called when the node is no longer needed. Closing is an
-admission stop: after the cleanup check succeeds and local closure begins, the
-node rejects new workers, job or message dispatches, stop requests, and
+admission stop: once local closure begins, the node rejects new workers, job or
+message dispatches, stop requests, and
 notifications while already admitted operations finish. A job delivery that
 reaches a stopped worker before handler acceptance stays pending for routing
 to another worker; Pulse does not call that handler or report a terminal failure.
@@ -265,6 +265,15 @@ A failed `Stop` is returned as an error, leaves the node unclosed, and retains
 the failed local jobs for a later `Close` attempt. Pulse cannot forcibly stop
 application goroutines; handlers must release their work before returning
 success from `Stop`.
+
+If the preliminary Redis cleanup-state read fails, `Close` still attempts the
+ordinary local shutdown and cleanup before returning that read error together
+with any shutdown error. New work is rejected at the existing local closure
+transition, not while the preliminary read is still pending. Failed Stops and
+unfinished cleanup remain available for another attempt; successful Stops are
+not repeated. `IsClosed` can be true despite the read error only when ordinary
+closure actually completed. An unreadable cleanup marker does not establish
+pool-wide cleanup completion or shutdown.
 
 [![Pool Close](../snippets/pool-close.png)](../examples/pool/producer/main.go#L66-L70)
 

@@ -1,12 +1,14 @@
-// These tests use synthetic jobs, stopped intake, and in-process saved-data
-// operations with no Redis client. They check acceptance, local handler release,
-// joining, and retry in the production shutdown algorithms. They do not run
-// distributed recovery or the pool-wide shutdown barrier.
+// These tests use synthetic jobs and in-process saved-data operations. Public
+// Close tests intercept Redis commands in memory and reject dialing. They check
+// acceptance, local handler release, joining, and retry in the shutdown code;
+// they do not execute Redis scripts or the distributed shutdown barrier.
 package pool
 
 import (
 	"context"
 	"errors"
+	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,6 +20,317 @@ import (
 	"goa.design/pulse/pulse"
 	"goa.design/pulse/streaming"
 )
+
+type (
+	// localCloseHook answers only commands selected by a synthetic test. It
+	// rejects connections and pipelines so fixture mistakes cannot reach Redis.
+	localCloseHook struct {
+		process   func(context.Context, redis.Cmder) error
+		dials     atomic.Int32
+		pipelines atomic.Int32
+		verifySHA string
+	}
+)
+
+func TestLocalShutdownCloseReadErrorJoinsOwnedWork(t *testing.T) {
+	readErr, stopErr := errors.New("cleanup read failed"), errors.New("handler still running")
+	started, releaseStart, stopping := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var releaseStartOnce sync.Once
+	t.Cleanup(func() {
+		releaseStartOnce.Do(func() {
+			close(releaseStart)
+		})
+	})
+	worker := newLocalShutdownWorker(&mockJobHandler{
+		startFunc: func(*Job) error {
+			close(started)
+			<-releaseStart
+			return nil
+		},
+		stopFunc: func(string) error {
+			close(stopping)
+			return stopErr
+		},
+	})
+	node, hook := newLocalCloseReadNode(t, worker)
+	worker.stopped = false
+	worker.done = make(chan struct{})
+	hook.process = func(_ context.Context, cmd redis.Cmder) error {
+		if cmd.Name() == "evalsha" {
+			assert.Equal(t, hook.verifySHA, cmd.Args()[1])
+			cmd.(*redis.Cmd).SetVal(int64(1))
+			return nil
+		}
+		assert.Equal(t, []any{"hmget", poolCleanupGenerationsKey(node.PoolName), "state", "generation"}, cmd.Args())
+		return readErr
+	}
+	var err error
+	worker.reader, err = node.poolStream.NewReader(context.Background())
+	require.NoError(t, err)
+	node.nodeReader, err = node.poolStream.NewReader(context.Background())
+	require.NoError(t, err)
+
+	worker.wg.Add(1)
+	go func() {
+		defer worker.wg.Done()
+		worker.jobsLock.Lock()
+		defer worker.jobsLock.Unlock()
+		assert.NoError(t, worker.startHandler(context.Background(), &Job{Key: "accepted"}, func(context.Context, string) error {
+			return errors.New("unexpected failed-start cleanup")
+		}))
+	}()
+	awaitLocalCloseSignal(t, started)
+	plannerCanceled, releasePlanner := make(chan struct{}), make(chan struct{})
+	var releasePlannerOnce sync.Once
+	t.Cleanup(func() {
+		releasePlannerOnce.Do(func() {
+			close(releasePlanner)
+		})
+	})
+	node.scheduleCtx, node.scheduleCancel = context.WithCancel(context.Background())
+	t.Cleanup(node.scheduleCancel)
+	producer := &testProducer{compute: func(ctx context.Context) (*JobPlan, error) {
+		<-ctx.Done()
+		close(plannerCanceled)
+		<-releasePlanner
+		return nil, ctx.Err()
+	}}
+	// Register the synthetic invocation with the same owner wait group used by
+	// Schedule; this runs PlanContext, not the distributed scheduler scripts.
+	node.scheduleWG.Add(1)
+	go func() {
+		defer node.scheduleWG.Done()
+		_, err := producer.PlanContext(node.scheduleCtx)
+		assert.ErrorIs(t, err, context.Canceled)
+	}()
+	nodeStopped, releaseNode := make(chan struct{}), make(chan struct{})
+	var releaseNodeOnce sync.Once
+	t.Cleanup(func() {
+		releaseNodeOnce.Do(func() {
+			close(releaseNode)
+		})
+	})
+	node.wg.Add(2)
+	go node.handleNodeEvents(make(chan *streaming.Event))
+	go func() {
+		defer node.wg.Done()
+		<-node.stop
+		close(nodeStopped)
+		<-releaseNode
+	}()
+	t.Cleanup(func() {
+		node.stopOnce.Do(func() {
+			close(node.stop)
+		})
+	})
+	finish := node.settlements.begin(worker.ID)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		result <- node.Close(ctx)
+	}()
+	awaitLocalCloseSignal(t, plannerCanceled)
+	assert.False(t, worker.IsStopped(), "planner must join before worker shutdown")
+	_, err = node.AddWorker(context.Background(), &mockJobHandler{})
+	assert.Error(t, err)
+	_, err = node.DispatchJobOnce(context.Background(), "new-dispatch", "new-job", nil)
+	assert.Error(t, err)
+	assert.Error(t, node.Schedule(context.Background(), producer, time.Millisecond))
+	releasePlannerOnce.Do(func() {
+		close(releasePlanner)
+	})
+	awaitLocalCloseSignal(t, worker.done)
+	select {
+	case <-stopping:
+		t.Fatal("Stop ran before accepted Start joined")
+	default:
+	}
+	releaseStartOnce.Do(func() {
+		close(releaseStart)
+	})
+	awaitLocalCloseSignal(t, stopping)
+	awaitLocalCloseSignal(t, nodeStopped)
+	select {
+	case err := <-result:
+		t.Fatalf("Close returned before node work joined: %v", err)
+	default:
+	}
+	releaseNodeOnce.Do(func() {
+		close(releaseNode)
+	})
+	cancel()
+	err = awaitLocalShutdown(t, result)
+	assert.ErrorIs(t, err, readErr)
+	assert.ErrorIs(t, err, stopErr)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.True(t, worker.reader.IsClosed())
+	assert.True(t, node.nodeReader.IsClosed())
+	assert.False(t, node.IsClosed())
+	assert.False(t, node.IsShutdown())
+	assert.False(t, node.cleanupComplete)
+	assert.Len(t, worker.Jobs(), 1)
+	assert.ErrorIs(t, node.settlements.waitAll(ctx), context.Canceled)
+	finish(nil)
+	require.NoError(t, node.settlements.waitAll(context.Background()))
+}
+
+func TestLocalShutdownCloseReadFailureRetriesUnfinishedWork(t *testing.T) {
+	readErr, stopErr := errors.New("cleanup read failed"), errors.New("retry handler still running")
+	recoveryErr := errors.New("saved recovery failed")
+	var successfulCalls, retryCalls atomic.Int32
+	first := newLocalShutdownWorker(&mockJobHandler{stopFunc: func(string) error {
+		successfulCalls.Add(1)
+		return nil
+	}}, "success")
+	second := newLocalShutdownWorker(&mockJobHandler{stopFunc: func(string) error {
+		retryCalls.Add(1)
+		return stopErr
+	}}, "retry")
+	second.ID = "second-worker"
+	node, hook := newLocalCloseReadNode(t, first)
+	second.node = node
+	node.localWorkers.Store(second.ID, second)
+	currentReadErr := readErr
+	reads := 0
+	var recoveryCalls atomic.Int32
+	hook.process = func(_ context.Context, cmd redis.Cmder) error {
+		switch cmd.Name() {
+		case "hmget":
+			assert.Equal(t, []any{"hmget", poolCleanupGenerationsKey(node.PoolName), "state", "generation"}, cmd.Args())
+			reads++
+			if currentReadErr != nil {
+				return currentReadErr
+			}
+			cmd.(*redis.SliceCmd).SetVal([]any{poolCleanupCompleteState, node.poolStream.Generation()})
+			return nil
+		case "evalsha":
+			assert.Equal(t, acquireWorkerCleanupScript.Hash(), cmd.Args()[1])
+			recoveryCalls.Add(1)
+			return recoveryErr
+		default:
+			t.Errorf("unexpected command %v", cmd.Args())
+			return errors.New("unexpected fixture command")
+		}
+	}
+	err := node.Close(context.Background())
+	assert.ErrorIs(t, err, readErr)
+	assert.ErrorIs(t, err, stopErr)
+	assert.Equal(t, int32(1), successfulCalls.Load())
+	assert.Equal(t, int32(1), retryCalls.Load())
+	assert.Empty(t, first.Jobs())
+	assert.Len(t, second.Jobs(), 1)
+	assert.Len(t, node.Workers(), 2)
+	assert.Zero(t, recoveryCalls.Load())
+	assert.False(t, node.IsClosed())
+	assert.False(t, node.cleanupComplete)
+	assert.False(t, node.IsShutdown())
+	stopErr = nil
+	err = node.Close(context.Background())
+	assert.ErrorIs(t, err, readErr)
+	assert.ErrorContains(t, err, recoveryErr.Error())
+	assert.Equal(t, int32(2), recoveryCalls.Load(), "both released workers retain recovery obligations")
+	assert.Equal(t, int32(1), successfulCalls.Load())
+	assert.Equal(t, int32(2), retryCalls.Load())
+	assert.Empty(t, second.Jobs())
+	assert.Len(t, node.Workers(), 2)
+	assert.False(t, node.IsClosed())
+	select {
+	case <-node.closed:
+		t.Fatal("closure published with unfinished recovery")
+	default:
+	}
+	currentReadErr = nil
+	require.NoError(t, node.Close(context.Background()))
+	assert.True(t, node.IsClosed())
+	assert.True(t, node.IsShutdown())
+	assert.True(t, node.cleanupComplete)
+	assert.Empty(t, node.Workers())
+	assert.Equal(t, 3, reads)
+	require.NoError(t, node.Close(context.Background()))
+	assert.Equal(t, 3, reads, "cached completion must not read again")
+	assert.Equal(t, int32(1), successfulCalls.Load())
+	assert.Equal(t, int32(2), retryCalls.Load())
+}
+
+func TestLocalShutdownCloseCleanupMarkerSelection(t *testing.T) {
+	for _, marker := range []string{"missing", "incomplete", "different-generation", "matching", "cached", "canceled"} {
+		t.Run(marker, func(t *testing.T) {
+			stopErr := errors.New("synthetic Stop failed")
+			calls, reads := 0, 0
+			worker := newLocalShutdownWorker(&mockJobHandler{stopFunc: func(string) error {
+				calls++
+				return stopErr
+			}}, "accepted")
+			node, hook := newLocalCloseReadNode(t, worker)
+			node.cleanupComplete = marker == "cached"
+			hook.process = func(ctx context.Context, cmd redis.Cmder) error {
+				assert.Equal(t, []any{"hmget", poolCleanupGenerationsKey(node.PoolName), "state", "generation"}, cmd.Args())
+				reads++
+				if marker == "canceled" {
+					return ctx.Err()
+				}
+				state, generation := poolCleanupCompleteState, node.poolStream.Generation()
+				switch marker {
+				case "missing":
+					cmd.(*redis.SliceCmd).SetVal([]any{nil, nil})
+					return nil
+				case "incomplete":
+					state = "active"
+				case "different-generation":
+					generation = "other-generation"
+				}
+				cmd.(*redis.SliceCmd).SetVal([]any{state, generation})
+				return nil
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if marker == "canceled" {
+				cancel()
+			}
+			err := node.Close(ctx)
+			assert.ErrorIs(t, err, stopErr)
+			if marker == "canceled" {
+				assert.ErrorIs(t, err, context.Canceled)
+			}
+			assert.Equal(t, 1, calls)
+			assert.False(t, node.IsClosed())
+			assert.False(t, node.IsShutdown())
+			assert.Equal(t, marker == "matching" || marker == "cached", node.cleanupComplete)
+			assert.Len(t, worker.Jobs(), 1)
+			if marker == "cached" {
+				assert.Zero(t, reads)
+			} else {
+				assert.Equal(t, 1, reads)
+			}
+		})
+	}
+}
+
+func TestLocalShutdownCloseReadErrorPreservesCompletedOrdinaryClosure(t *testing.T) {
+	readErr := errors.New("cleanup read failed")
+	stopCalls := 0
+	worker := newLocalShutdownWorker(&mockJobHandler{stopFunc: func(string) error {
+		stopCalls++
+		return nil
+	}}, "accepted")
+	node, hook := newLocalCloseReadNode(t, worker)
+	// This existing callback seam completes ordinary local closure in memory.
+	// It proves the state transition, not Redis detachment or script behavior.
+	require.NoError(t, node.closeWithCleanup(context.Background(), false, func(context.Context, bool) error {
+		node.localWorkers.Delete(worker.ID)
+		return nil
+	}))
+	hook.process = func(_ context.Context, cmd redis.Cmder) error {
+		assert.Equal(t, []any{"hmget", poolCleanupGenerationsKey(node.PoolName), "state", "generation"}, cmd.Args())
+		return readErr
+	}
+	assert.ErrorIs(t, node.Close(context.Background()), readErr)
+	assert.True(t, node.IsClosed())
+	assert.False(t, node.IsShutdown())
+	assert.False(t, node.cleanupComplete)
+	assert.Equal(t, 1, stopCalls)
+}
 
 func TestLocalShutdownReleasesAcceptedJobsWithoutDistributedState(t *testing.T) {
 	var stopped []string
@@ -815,4 +1128,83 @@ func awaitLocalShutdown(t *testing.T, result <-chan error) error {
 		t.Fatal("local shutdown did not finish")
 		return nil
 	}
+}
+
+// newLocalCloseReadNode binds an actual stream handle through Open using two
+// in-memory lifecycle replies. Later Close reads use the test's exact commands,
+// and cleanup verifies no connection was attempted. No Lua is executed here.
+func newLocalCloseReadNode(t *testing.T, worker *Worker) (*Node, *localCloseHook) {
+	t.Helper()
+	hook := &localCloseHook{}
+	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:0", MaxRetries: -1})
+	rdb.AddHook(hook)
+	t.Cleanup(func() {
+		assert.Zero(t, hook.dials.Load(), "synthetic Close must never dial")
+		assert.Zero(t, hook.pipelines.Load(), "fixture accepts only direct commands")
+		assert.NoError(t, rdb.Close())
+	})
+	stream, err := streaming.NewStream("synthetic-pool", rdb)
+	require.NoError(t, err)
+	openCalls := 0
+	hook.process = func(_ context.Context, cmd redis.Cmder) error {
+		assert.Equal(t, "evalsha", cmd.Name())
+		assert.Equal(t, 1, cmd.Args()[2])
+		assert.Equal(t, "pulse:stream:synthetic-pool:lifecycle", cmd.Args()[3])
+		openCalls++
+		if openCalls == 1 {
+			cmd.(*redis.Cmd).SetVal([]any{"1", "pulse:stream:synthetic-pool", "", "v=2|max=1000|mode=none|value=0|sliding=false"})
+		} else {
+			assert.Equal(t, 2, openCalls)
+			hook.verifySHA = cmd.Args()[1].(string)
+			cmd.(*redis.Cmd).SetVal(int64(1))
+		}
+		return nil
+	}
+	require.NoError(t, stream.Open(context.Background()))
+	require.Equal(t, 2, openCalls)
+	require.Equal(t, "1", stream.Generation())
+	node := newLocalShutdownNode(worker)
+	node.ID, node.PoolName = "synthetic-node", "synthetic-pool"
+	node.rdb, node.poolStream = rdb, stream
+	node.resources = flatPoolResources(node.PoolName, stream.Generation())
+	worker.node = node
+	return node, hook
+}
+
+// awaitLocalCloseSignal waits for an owned invocation's observed transition.
+// Its test-only deadline prevents a joining regression from hanging the suite.
+func awaitLocalCloseSignal(t *testing.T, signal <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(time.Second):
+		t.Fatal("owned shutdown transition did not occur")
+	}
+}
+
+// DialHook rejects connection attempts and records fixture mistakes.
+func (h *localCloseHook) DialHook(_ redis.DialHook) redis.DialHook {
+	return func(context.Context, string, string) (net.Conn, error) {
+		h.dials.Add(1)
+		return nil, errors.New("unexpected synthetic Close dial")
+	}
+}
+
+// ProcessHook supplies the selected in-memory reply without calling Redis.
+func (h *localCloseHook) ProcessHook(_ redis.ProcessHook) redis.ProcessHook {
+	return h.processCommand
+}
+
+// ProcessPipelineHook rejects commands outside the direct Close fixture.
+func (h *localCloseHook) ProcessPipelineHook(_ redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(context.Context, []redis.Cmder) error {
+		h.pipelines.Add(1)
+		return errors.New("unexpected synthetic Close pipeline")
+	}
+}
+
+// processCommand uses the current fixture reply after Open has bound the stream.
+// The client retains this method while tests replace the replies for Close.
+func (h *localCloseHook) processCommand(ctx context.Context, cmd redis.Cmder) error {
+	return h.process(ctx, cmd)
 }
