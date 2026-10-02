@@ -271,9 +271,10 @@ ordinary local shutdown and cleanup before returning that read error together
 with any shutdown error. New work is rejected at the existing local closure
 transition, not while the preliminary read is still pending. Failed Stops and
 unfinished cleanup remain available for another attempt; successful Stops are
-not repeated. `IsClosed` can be true despite the read error only when ordinary
-closure actually completed. An unreadable cleanup marker does not establish
-pool-wide cleanup completion or shutdown.
+not repeated. This error path newly publishes local closure only after ordinary
+close succeeds. If another close operation has already closed the node, its
+existing state is preserved. The failed read itself establishes neither
+pool-wide cleanup completion nor shutdown.
 
 [![Pool Close](../snippets/pool-close.png)](../examples/pool/producer/main.go#L66-L70)
 
