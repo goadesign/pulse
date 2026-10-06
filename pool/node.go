@@ -538,24 +538,42 @@ func AddNode(ctx context.Context, poolName string, rdb *redis.Client, opts ...No
 // NotificationHandler and MessageHandler interfaces to handle job-scoped
 // notifications and hash-routed messages.
 func (node *Node) AddWorker(ctx context.Context, handler JobHandler) (*Worker, error) {
+	// Reject local closure before storage access. The Redis lifecycle check
+	// runs without this lock because retirement must acquire its write side.
 	node.lock.RLock()
-	defer node.lock.RUnlock()
 	if node.closing {
+		node.lock.RUnlock()
 		return nil, fmt.Errorf("AddWorker: pool %q is closed", node.PoolName)
 	}
 	if node.clientOnly {
+		node.lock.RUnlock()
 		return nil, fmt.Errorf("AddWorker: pool %q is client-only", node.PoolName)
 	}
+	node.lock.RUnlock()
 	if err := node.ensureGenerationActive(ctx); err != nil {
 		return nil, fmt.Errorf("AddWorker: %w", err)
 	}
-	w, err := newWorker(ctx, node, handler)
-	if err != nil {
-		return nil, err
+
+	// Local close waits for construction and publication. Redis registration
+	// checks the pool again, so retirement after the first check cannot admit work.
+	node.lock.RLock()
+	if node.closing {
+		node.lock.RUnlock()
+		return nil, fmt.Errorf("AddWorker: pool %q is closed", node.PoolName)
 	}
-	node.localWorkers.Store(w.ID, w)
-	node.workerStreams.Store(w.ID, w.stream)
-	return w, nil
+	w, err := newWorker(ctx, node, handler)
+	if err == nil {
+		node.localWorkers.Store(w.ID, w)
+		node.workerStreams.Store(w.ID, w.stream)
+	}
+	node.lock.RUnlock()
+
+	// An ended pool or node is retired after releasing the read lock. Keep
+	// the original failure even when the final lifecycle check also fails.
+	if errors.Is(err, ErrPoolGenerationLost) {
+		return nil, errors.Join(err, node.ensureGenerationActive(context.WithoutCancel(ctx)))
+	}
+	return w, err
 }
 
 // RemoveWorker joins worker intake and waits for Stop to release every locally

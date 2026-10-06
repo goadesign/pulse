@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strconv"
 	"sync"
 	"time"
 
@@ -135,9 +134,6 @@ var (
 
 // newWorker creates a new worker.
 func newWorker(ctx context.Context, node *Node, h JobHandler) (*Worker, error) {
-	if err := node.ensureGenerationActive(ctx); err != nil {
-		return nil, err
-	}
 	wid := ulid.Make().String()
 	createdAt, err := node.rdb.Time(ctx).Result()
 	if err != nil {
@@ -162,30 +158,19 @@ func newWorker(ctx context.Context, node *Node, h JobHandler) (*Worker, error) {
 			destroyErr,
 		)
 	}
-	if err := node.setPoolMapAndWait(
-		ctx,
-		node.workerMap,
-		node.resources.workers,
-		wid,
-		strconv.FormatInt(createdAt.UnixNano(), 10),
-	); err != nil {
+	// Save discovery and the first heartbeat together so cleanup cannot
+	// observe a newly published worker without a heartbeat.
+	if err := node.registerWorker(ctx, wid, createdAt, stream); err != nil {
 		reader.Close()
 		destroyErr := stream.Destroy(context.WithoutCancel(ctx))
+		var removeErr error
+		// Retire the stream before deleting discovery. If retirement fails,
+		// keep the entry so another node can finish the worker's cleanup.
+		if destroyErr == nil {
+			removeErr = node.removeWorkerRegistration(context.WithoutCancel(ctx), wid, createdAt, stream)
+		}
 		return nil, errors.Join(
-			fmt.Errorf("failed to add worker %q to pool %q: %w", wid, node.PoolName, err),
-			destroyErr,
-		)
-	}
-	now, err := node.updateWorkerHeartbeat(ctx, wid)
-	if err == nil {
-		err = waitPoolMapValue(ctx, node.workerKeepAliveMap, wid, now)
-	}
-	if err != nil {
-		removeErr := node.deletePoolMap(context.WithoutCancel(ctx), node.resources.workers, wid)
-		reader.Close()
-		destroyErr := stream.Destroy(context.WithoutCancel(ctx))
-		return nil, errors.Join(
-			fmt.Errorf("failed to update worker keep-alive: %w", err),
+			fmt.Errorf("failed to register worker %q in pool %q: %w", wid, node.PoolName, err),
 			removeErr,
 			destroyErr,
 		)
