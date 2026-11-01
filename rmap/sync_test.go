@@ -151,10 +151,11 @@ func TestExpiredMapStartsNewGeneration(t *testing.T) {
 	assert.Equal(t, "v4", v)
 }
 
-// TestStaleGenerationChangeDoesNotResurrectExpiredData delivers a queued
+// TestStaleGenerationChangeDoesNotResurrectExpiredData handles a queued
 // change from an expired generation after Sync has seen the map gone. The
 // replica must check Redis rather than adopt the change, so the expired value
-// stays gone.
+// stays gone. The change is handled synchronously, exactly as the run loop
+// would, so the assertion follows its processing.
 func TestStaleGenerationChangeDoesNotResurrectExpiredData(t *testing.T) {
 	rdb := ptesting.NewRedisClient(t)
 	// Each test is bounded so a regression fails here instead of hanging.
@@ -168,9 +169,7 @@ func TestStaleGenerationChangeDoesNotResurrectExpiredData(t *testing.T) {
 	_, ok := m.Get("k")
 	require.False(t, ok)
 
-	stale := "set:" + packStrings("k", "expired", "1", "old-generation")
-	require.NoError(t, rdb.Publish(ctx, m.chankey, stale).Err())
-	time.Sleep(200 * time.Millisecond)
+	m.handleMessage("set:" + packStrings("k", "expired", "1", "old-generation"))
 	_, ok = m.Get("k")
 	assert.False(t, ok, "a change from an expired generation must not be applied")
 }

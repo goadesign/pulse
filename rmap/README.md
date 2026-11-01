@@ -57,9 +57,9 @@ scripts, must all run a Pulse version with the same format:
   extra step.
 * **Downgrading Pulse** requires stopping every process that runs the newer
   version first, then removing the generation field from each map before an
-  older version starts, for example `HDEL map:<name>:content =gen` (or
-  `Destroy` the map). Starting older processes alone is not enough, because the
-  field stays in Redis.
+  older version starts: `HDEL map:<name>:content =gen`. This removes only the
+  field and keeps the map's entries. Starting older processes alone is not
+  enough, because the field stays in Redis.
 
 ### Writing to the Map
 
