@@ -15,6 +15,36 @@ import (
 	ptesting "goa.design/pulse/testing"
 )
 
+// TestTickerNamesWithEquals creates tickers whose map fields contain "=" (a
+// ticker named "a=b") or start with "=" (a pool whose name starts with "="),
+// and checks that each one is created and ticks. Map reloads must keep such
+// fields.
+func TestTickerNamesWithEquals(t *testing.T) {
+	cases := []struct {
+		pool, ticker string
+	}{
+		{pool: "", ticker: "a=b"},
+		{pool: "=", ticker: "ticker"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.pool+tc.ticker, func(t *testing.T) {
+			rdb := ptesting.NewRedisClient(t)
+			testName := tc.pool + strings.Replace(t.Name(), "/", "_", -1)
+			defer ptesting.CleanupRedis(t, rdb, false, testName)
+			ctx := log.Context(ptesting.NewTestContext(t), log.WithOutput(io.Discard))
+			node := newTestNode(t, ctx, rdb, testName)
+			ticker, err := node.NewTicker(ctx, tc.ticker, 10*time.Millisecond)
+			require.NoError(t, err)
+			select {
+			case <-ticker.C:
+			case <-time.After(5 * time.Second):
+				t.Fatal("ticker did not tick")
+			}
+			ticker.Stop()
+		})
+	}
+}
+
 func TestNewTicker(t *testing.T) {
 	rdb := ptesting.NewRedisClient(t)
 	defer ptesting.CleanupRedis(t, rdb, false, t.Name())

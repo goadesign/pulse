@@ -174,6 +174,31 @@ func TestStaleGenerationChangeDoesNotResurrectExpiredData(t *testing.T) {
 	assert.False(t, ok, "a change from an expired generation must not be applied")
 }
 
+// TestReloadKeepsDirectlyWrittenFields reloads a map whose hash holds fields
+// written directly by other packages, including names containing or starting
+// with "=" (pool writes a ticker named "a=b" as "p:a=b", and pool names may
+// start with "="). Every such field must survive the reload; only rmap's own
+// bookkeeping fields are hidden.
+func TestReloadKeepsDirectlyWrittenFields(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	// Each test is bounded so a regression fails here instead of hanging.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	m, err := Join(ctx, "test", rdb)
+	require.NoError(t, err)
+	defer cleanup(t, m)
+	require.NoError(t, m.Reset(ctx))
+
+	fields := map[string]string{"p:a=b": "ticker", "=pool:x": "owner"}
+	for k, v := range fields {
+		require.NoError(t, rdb.HSet(ctx, m.hashkey, k, v).Err())
+	}
+	require.NoError(t, rdb.HIncrBy(ctx, m.hashkey, revField, 1).Err())
+	require.NoError(t, m.Sync(ctx))
+
+	assert.Equal(t, fields, m.Map())
+}
+
 // TestResubscribeReloadsMissedChanges drops a replica's Redis connections and
 // holds it disconnected while another replica writes, so the notifications
 // are lost. Once go-redis reconnects and resubscribes, the replica must reload

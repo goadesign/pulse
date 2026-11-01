@@ -787,12 +787,12 @@ func parseRevisionString(s string) (uint64, bool) {
 	return rev, true
 }
 
-// extractState removes every field that is not a map key from a Redis
-// snapshot and returns the snapshot's revision, the kind of its last change,
-// and its generation. Map keys can never contain "=", so any field that does
-// is bookkeeping: rmap's own "=rev", "=kind", and "=gen", and private fields
-// other writers (such as pool's scheduler) keep in the same hash. A missing
-// hash yields revision 0 and generation "".
+// extractState removes rmap's bookkeeping fields ("=rev", "=kind", "=gen")
+// from a Redis snapshot and returns the snapshot's revision, the kind of its
+// last change, and its generation. Every other field is kept: packages that
+// write a map's hash directly (pool, streaming) may store fields with any
+// name, and their readers decide which ones they use. A missing hash yields
+// revision 0 and generation "".
 func extractState(content map[string]string) (uint64, EventKind, string) {
 	kind := EventChange
 	if s, ok := content[kindField]; ok {
@@ -800,11 +800,9 @@ func extractState(content map[string]string) (uint64, EventKind, string) {
 	}
 	gen := content[genField]
 	rawRev, hasRev := content[revField]
-	for field := range content {
-		if strings.Contains(field, "=") {
-			delete(content, field)
-		}
-	}
+	delete(content, kindField)
+	delete(content, genField)
+	delete(content, revField)
 	if !hasRev {
 		return 0, kind, gen
 	}
