@@ -149,6 +149,12 @@ changes published while it was disconnected were never delivered.
 
 [![Replicated Map Subscribe](../snippets/rmap-subscribe.png)](../examples/rmap/basics/main.go#L102-L03)
 
+When a replica reloads its whole copy from Redis (after missing changes, after
+the map expired, or on `Sync`), it sends one notification for the reload.
+That notification is `EventReset` whenever the copy changed generation or
+skipped more than one change, because the entries that changed are not known;
+read the map again with `Map`, `Get`, or `Keys` to see the current content.
+
 > **Note:** Notifications do not include any information about the change that
 > triggered them. The application must query the map to retrieve the current
 > state. Multiple updates may result in a single notification however it is
