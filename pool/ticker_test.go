@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"context"
 	"errors"
 	"io"
 	"strings"
@@ -33,7 +34,10 @@ func TestTickerNamesWithEquals(t *testing.T) {
 			defer ptesting.CleanupRedis(t, rdb, false, testName)
 			ctx := log.Context(ptesting.NewTestContext(t), log.WithOutput(io.Discard))
 			node := newTestNode(t, ctx, rdb, testName)
-			ticker, err := node.NewTicker(ctx, tc.ticker, 10*time.Millisecond)
+			// Bound creation too: a ticker whose field is lost blocks NewTicker.
+			createCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			ticker, err := node.NewTicker(createCtx, tc.ticker, 10*time.Millisecond)
 			require.NoError(t, err)
 			select {
 			case <-ticker.C:
