@@ -159,14 +159,13 @@ func isDestroyTombstone(ctx context.Context, rdb *redis.Client, key string) bool
 	if err != nil {
 		return false
 	}
-	// A destroyed map keeps only its bookkeeping fields: generation,
-	// revision, and kind (see internal/rmapwire publishClear).
-	if len(content) != 3 || content["=kind"] != "destroy" {
+	// A destroyed map keeps only its bookkeeping fields: "=rev", and "=kind"
+	// holding "destroy:<generation>" (see internal/rmapwire publishClear).
+	if len(content) != 2 || !strings.HasPrefix(content["=kind"], "destroy:") {
 		return false
 	}
-	_, hasRev := content["=rev"]
-	_, hasGen := content["=gen"]
-	return hasRev && hasGen
+	_, ok := content["=rev"]
+	return ok
 }
 
 // acquireDatabaseLease reserves one Redis database through DB 0, which is used

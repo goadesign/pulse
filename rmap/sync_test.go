@@ -176,9 +176,9 @@ func TestStaleGenerationChangeDoesNotResurrectExpiredData(t *testing.T) {
 
 // TestReloadKeepsDirectlyWrittenFields reloads a map whose hash holds fields
 // written directly by other packages, including names containing or starting
-// with "=" (pool writes a ticker named "a=b" as "p:a=b", and pool names may
-// start with "="). Every such field must survive the reload; only rmap's own
-// bookkeeping fields are hidden.
+// with "=" (pool writes a ticker named "a=b" as "p:a=b", pool names may start
+// with "=", and streaming stores a sink named "=gen" under that name). Every
+// such field must survive the reload; only "=rev" and "=kind" are hidden.
 func TestReloadKeepsDirectlyWrittenFields(t *testing.T) {
 	rdb := ptesting.NewRedisClient(t)
 	// Each test is bounded so a regression fails here instead of hanging.
@@ -189,7 +189,7 @@ func TestReloadKeepsDirectlyWrittenFields(t *testing.T) {
 	defer cleanup(t, m)
 	require.NoError(t, m.Reset(ctx))
 
-	fields := map[string]string{"p:a=b": "ticker", "=pool:x": "owner"}
+	fields := map[string]string{"p:a=b": "ticker", "=pool:x": "owner", "=gen": "sink"}
 	for k, v := range fields {
 		require.NoError(t, rdb.HSet(ctx, m.hashkey, k, v).Err())
 	}

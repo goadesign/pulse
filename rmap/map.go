@@ -88,7 +88,6 @@ type (
 const (
 	revField  = "=rev"
 	kindField = "=kind"
-	genField  = "=gen"
 )
 
 // errMissedChanges reports a published change the local replica cannot apply
@@ -787,21 +786,18 @@ func parseRevisionString(s string) (uint64, bool) {
 	return rev, true
 }
 
-// extractState removes rmap's bookkeeping fields ("=rev", "=kind", "=gen")
-// from a Redis snapshot and returns the snapshot's revision, the kind of its
-// last change, and its generation. Every other field is kept: packages that
-// write a map's hash directly (pool, streaming) may store fields with any
-// name, and their readers decide which ones they use. A missing hash yields
-// revision 0 and generation "".
+// extractState removes the map's two bookkeeping fields from a Redis
+// snapshot and returns the snapshot's revision ("=rev"), and the kind of its
+// last change and its generation (both stored in "=kind" as
+// "<kind>:<generation>"). Every other field is kept, whatever its name:
+// packages that write a map's hash directly (pool, streaming) may store
+// fields with any name. A missing hash, or one written by an older Pulse,
+// yields generation "".
 func extractState(content map[string]string) (uint64, EventKind, string) {
-	kind := EventChange
-	if s, ok := content[kindField]; ok {
-		kind = parseStoredKind(s)
-	}
-	gen := content[genField]
+	storedKind, gen, _ := strings.Cut(content[kindField], ":")
+	kind := parseStoredKind(storedKind)
 	rawRev, hasRev := content[revField]
 	delete(content, kindField)
-	delete(content, genField)
 	delete(content, revField)
 	if !hasRev {
 		return 0, kind, gen
@@ -882,7 +878,7 @@ func (sm *Map) applyMessageLocked(op string, data []byte) (mapChange, bool, erro
 	if err != nil {
 		return mapChange{}, false, err
 	}
-	if c.key == revField || c.key == kindField || c.key == genField {
+	if c.key == revField || c.key == kindField {
 		return mapChange{}, false, nil
 	}
 	if c.gen != sm.gen {

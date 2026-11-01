@@ -49,6 +49,28 @@ var (
 	testAckDuration     = 50 * time.Millisecond
 )
 
+// TestSinkNamedGenAfterAnotherSink creates an ordinary sink, then a sink
+// named "=gen". Sink names are unrestricted and each sink's membership is
+// stored under its name in the stream's replicated membership map, so the map's
+// own bookkeeping must not claim the "=gen" field.
+func TestSinkNamedGenAfterAnotherSink(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx, cancel := context.WithTimeout(ptesting.NewTestContext(t), 10*time.Second)
+	defer cancel()
+	stream, err := NewStream(t.Name(), rdb)
+	require.NoError(t, err)
+
+	for _, name := range []string{"normal", "=gen"} {
+		sink, err := stream.NewSink(ctx, name, options.WithSinkBlockDuration(testBlockDuration))
+		require.NoError(t, err, "create sink %q", name)
+		defer func() { assert.NoError(t, sink.Close(ctx)) }()
+		membership, err := rdb.HGet(ctx, consumersMapContentKey(stream), name).Result()
+		require.NoError(t, err, "membership of sink %q", name)
+		assert.NotEmpty(t, membership)
+	}
+}
+
 func TestSinkClosingFencesSubscriptions(t *testing.T) {
 	rdb := ptesting.NewRedisClient(t)
 	defer ptesting.CleanupRedis(t, rdb, false, "")

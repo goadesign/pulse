@@ -24,7 +24,7 @@ var (
 	// protocolRE matches hand-written map protocol: bumping "=rev", packing a
 	// change, or publishing a map payload.
 	// A direct stamp call would advance the revision without publishing.
-	protocolRE = regexp.MustCompile(`"=rev"|"=gen"|struct\.pack|"(set|del|reset|destroy):"|\bstamp\(`)
+	protocolRE = regexp.MustCompile(`"=rev"|"=kind"|struct\.pack|"(set|del|reset|destroy):"|\bstamp\(`)
 )
 
 // TestScriptsUseSharedProtocol keeps this package the only definition of the

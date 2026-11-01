@@ -44,22 +44,21 @@ replica's copy when it finds the map expired.
 
 ### Upgrading and rolling back
 
-Every write stamps the map's Redis hash with a generation (`=gen`) and each
-published change carries it. Processes that share a replicated map, including
-the `pool` and `streaming` packages, which write map hashes from their own
-scripts, must all run a Pulse version with the same format:
+Every published change now carries the map's generation, which is stored with
+the last change's kind in the hash's existing `=kind` field. Processes that
+share a replicated map, including the `pool` and `streaming` packages, which
+write map hashes from their own scripts, must all run a Pulse version with the
+same change format:
 
 * **Upgrade every process together.** Stop every process that uses a given map,
   deploy the new version everywhere, then start them. An older process cannot
-  decode the new change format, and if it loads the map it shows `=gen` as if
-  it were an entry.
+  decode the new reset and destroy notifications, and a newer process treats
+  an older process's changes as missing their generation.
 * **Rolling back your application** while keeping this Pulse version needs no
   extra step.
 * **Downgrading Pulse** requires stopping every process that runs the newer
-  version first, then removing the generation field from each map before an
-  older version starts: `HDEL map:<name>:content =gen`. This removes only the
-  field and keeps the map's entries. Starting older processes alone is not
-  enough, because the field stays in Redis.
+  version before any older one starts. No data cleanup is needed: older
+  versions already hide `=kind` and treat its new value as an ordinary change.
 
 ### Writing to the Map
 

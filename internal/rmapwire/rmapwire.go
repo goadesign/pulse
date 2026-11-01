@@ -1,14 +1,20 @@
 // Package rmapwire owns the replicated map's Redis protocol: how a Lua script
 // numbers a change to a map's hash and publishes it to the map's replicas.
-// Package rmap and package pool both write map hashes from their own Lua
-// scripts; building every such script with NewScript gives them one shared
-// definition, so the published format cannot drift between writers.
+// Package rmap, package pool, and package streaming all write map hashes from
+// their own Lua scripts; building every such script with NewScript gives them
+// one shared definition, so the published format cannot drift between writers.
 //
 // Each change carries the map's generation and revision. A generation starts
-// whenever a script finds the map's hash missing (never written, or removed by
-// its TTL): stamp stores a fresh random id under "=gen" and revisions restart
-// at 1. Reset and destroy keep the generation. A replica compares revisions
-// for changes of its own generation and reloads the map for any other.
+// whenever a script finds no generation in the hash (never written, removed by
+// its TTL, or written by an older Pulse): stamp takes a fresh random id and
+// revisions restart at 1 when the hash is missing. Reset and destroy keep the
+// generation. A replica compares revisions for changes of its own generation
+// and reloads the map for any other.
+//
+// The hash keeps only the two bookkeeping fields Pulse has always reserved:
+// "=rev" (the revision) and "=kind" (the last change's kind and the
+// generation, as "<kind>:<gen>"). Every other field belongs to the map's
+// writers, whatever its name.
 //
 // Payloads published on the map's channel:
 //
@@ -18,7 +24,7 @@
 //	destroy:<gen>:<rev>
 //
 // where pack writes each string as a little-endian uint32 length followed by
-// its bytes (Lua struct.pack "ic0").
+// its bytes (Lua struct.pack "ic0"). Generation ids never contain ":".
 package rmapwire
 
 import (
@@ -44,17 +50,20 @@ type (
 const prelude = `
 local rmapNewGen = table.remove(ARGV)
 
--- stamp returns the generation of the map stored in hash and its next
--- revision, starting a generation when the hash is missing. Only the publish
--- helpers below call it, each publishing exactly one change, so revisions
--- advance by exactly one per published change and replicas can detect a lost
--- notification as a skipped revision.
-local function stamp(hash)
-   local gen = redis.call("HGET", hash, "=gen")
+-- stamp records a change of kind ("set", "del", "reset", or "destroy") to
+-- the map stored in hash and returns the map's generation and the change's
+-- revision. The generation is read from "=kind" ("<kind>:<gen>"); when there is
+-- none, the injected id starts one. Only the publish helpers below call it,
+-- each publishing exactly one change, so revisions advance by exactly one per
+-- published change and replicas can detect a lost notification as a skipped
+-- revision.
+local function stamp(hash, kind)
+   local stored = redis.call("HGET", hash, "=kind")
+   local gen = stored and string.match(stored, ":(.+)$")
    if not gen then
       gen = rmapNewGen
-      redis.call("HSET", hash, "=gen", gen)
    end
+   redis.call("HSET", hash, "=kind", kind .. ":" .. gen)
    return gen, tostring(redis.call("HINCRBY", hash, "=rev", 1))
 end
 
@@ -62,8 +71,7 @@ end
 -- publishes the change on channel, and returns its revision. The caller has
 -- already written the value.
 local function publishSet(hash, channel, key, value)
-   local gen, rev = stamp(hash)
-   redis.call("HSET", hash, "=kind", "set")
+   local gen, rev = stamp(hash, "set")
    redis.call("PUBLISH", channel, "set:" .. struct.pack("ic0ic0ic0ic0",
       string.len(key), key, string.len(value), value, string.len(rev), rev, string.len(gen), gen))
    return rev
@@ -73,8 +81,7 @@ end
 -- publishes the change on channel, and returns its revision. The caller has
 -- already removed the field.
 local function publishDel(hash, channel, key)
-   local gen, rev = stamp(hash)
-   redis.call("HSET", hash, "=kind", "del")
+   local gen, rev = stamp(hash, "del")
    redis.call("PUBLISH", channel, "del:" .. struct.pack("ic0ic0ic0",
       string.len(key), key, string.len(rev), rev, string.len(gen), gen))
    return rev
@@ -84,9 +91,9 @@ end
 -- revision, publishes kind ("reset" or "destroy") on channel, and returns the
 -- revision.
 local function publishClear(hash, channel, kind)
-   local gen, rev = stamp(hash)
+   local gen, rev = stamp(hash, kind)
    redis.call("DEL", hash)
-   redis.call("HSET", hash, "=gen", gen, "=rev", rev, "=kind", kind)
+   redis.call("HSET", hash, "=rev", rev, "=kind", kind .. ":" .. gen)
    redis.call("PUBLISH", channel, kind .. ":" .. gen .. ":" .. rev)
    return rev
 end
@@ -94,7 +101,7 @@ end
 -- deleteMap removes the map stored in hash entirely, leaving no hash behind,
 -- and publishes "destroy" on channel so replicas empty their copies.
 local function deleteMap(hash, channel)
-   local gen, rev = stamp(hash)
+   local gen, rev = stamp(hash, "destroy")
    redis.call("DEL", hash)
    redis.call("PUBLISH", channel, "destroy:" .. gen .. ":" .. rev)
 end
