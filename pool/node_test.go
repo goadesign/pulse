@@ -142,7 +142,7 @@ func TestAddNodeRollsBackPostRegistrationFailure(t *testing.T) {
 	leases, err := rdb.HKeys(ctx, rmapContentKey(nodeKeepAliveMapName(poolName))).Result()
 	require.NoError(t, err)
 	for _, key := range leases {
-		require.True(t, key == "=rev" || key == "=kind", "leaked node registration %q", key)
+		require.True(t, key == "=rev" || key == "=kind" || key == "=gen", "leaked node registration %q", key)
 	}
 	keys, err := rdb.Keys(ctx, "pulse:stream:"+nodeStreamName(poolName, "")+"*").Result()
 	require.NoError(t, err)

@@ -9,12 +9,13 @@ import (
 	"fmt"
 
 	redis "github.com/redis/go-redis/v9"
+	"goa.design/pulse/internal/rmapwire"
 )
 
 // restoreRunningJobScript checks every conflicting owner before writing either
 // map. Worker and node registration checks prevent a removed process from
 // recreating ownership after another process has taken over its cleanup.
-var restoreRunningJobScript = redis.NewScript(`
+var restoreRunningJobScript = rmapwire.NewScript(`
 if redis.call("HGET", KEYS[1], "state") ~= ARGV[1]
 or redis.call("HGET", KEYS[1], "generation") ~= ARGV[2] then
     return redis.error_reply("POOLGENERATIONLOST")
@@ -61,11 +62,7 @@ end
 
 local function set_value(content, channel, key, value)
     redis.call("HSET", content, key, value)
-    local rev = tostring(redis.call("HINCRBY", content, "=rev", 1))
-    redis.call("HSET", content, "=kind", "set")
-    local message = struct.pack("ic0ic0ic0",
-        string.len(key), key, string.len(value), value, string.len(rev), rev)
-    redis.call("PUBLISH", channel, "set:" .. message)
+    local rev = publishSet(content, channel, key, value)
 end
 if not owned then
     table.insert(own_jobs, job)

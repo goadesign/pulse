@@ -13,6 +13,7 @@ import (
 	"github.com/oklog/ulid/v2"
 	redis "github.com/redis/go-redis/v9"
 
+	"goa.design/pulse/internal/rmapwire"
 	"goa.design/pulse/streaming"
 )
 
@@ -73,7 +74,7 @@ return {1, fence}
 
 	// destroyStaleNodeScript destroys one exact node stream and removes its
 	// heartbeat only while the supplied cleanup owner remains current.
-	destroyStaleNodeScript = redis.NewScript(`
+	destroyStaleNodeScript = rmapwire.NewScript(`
 if redis.call("HGET", KEYS[1], "state") ~= ARGV[1]
 or redis.call("HGET", KEYS[1], "generation") ~= ARGV[2] then
     return redis.error_reply("POOLGENERATIONLOST")
@@ -108,14 +109,7 @@ end
 
 redis.call("HDEL", KEYS[2], ARGV[3])
 redis.call("HSET", KEYS[2], ARGV[7], "dead|" .. ARGV[5] .. "|0")
-local rev = tostring(redis.call("HINCRBY", KEYS[2], "=rev", 1))
-redis.call("HSET", KEYS[2], "=kind", "del")
-local message = struct.pack(
-    "ic0ic0",
-    string.len(ARGV[3]), ARGV[3],
-    string.len(rev), rev
-)
-redis.call("PUBLISH", KEYS[3], "del:" .. message)
+local rev = publishDel(KEYS[2], KEYS[3], ARGV[3])
 redis.call("HDEL", KEYS[6], "error:" .. ARGV[3])
 return 1
 `)

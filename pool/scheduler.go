@@ -11,6 +11,7 @@ import (
 	"github.com/oklog/ulid/v2"
 	redis "github.com/redis/go-redis/v9"
 
+	"goa.design/pulse/internal/rmapwire"
 	"goa.design/pulse/pulse"
 )
 
@@ -88,7 +89,7 @@ var (
 
 	// stopSchedulerJobScript atomically verifies exact scheduler ownership,
 	// publishes the durable stop request, and removes the ownership record.
-	stopSchedulerJobScript = redis.NewScript(`
+	stopSchedulerJobScript = rmapwire.NewScript(`
 if redis.call("HGET", KEYS[1], "state") ~= ARGV[1]
 or redis.call("HGET", KEYS[1], "generation") ~= ARGV[2] then
     return redis.error_reply("POOLGENERATIONLOST")
@@ -109,20 +110,13 @@ if not stream then
 end
 redis.call("XADD", stream, "*", "n", ARGV[5], "p", ARGV[6])
 redis.call("HDEL", KEYS[2], ARGV[3])
-local rev = tostring(redis.call("HINCRBY", KEYS[2], "=rev", 1))
-redis.call("HSET", KEYS[2], "=kind", "del")
-local message = struct.pack(
-    "ic0ic0",
-    string.len(ARGV[3]), ARGV[3],
-    string.len(rev), rev
-)
-redis.call("PUBLISH", KEYS[3], "del:" .. message)
+local rev = publishDel(KEYS[2], KEYS[3], ARGV[3])
 return 1
 `)
 
 	// releaseSchedulerOwnershipScript removes only the exact scheduler
 	// capability, without publishing a stop request for a foreign job.
-	releaseSchedulerOwnershipScript = redis.NewScript(`
+	releaseSchedulerOwnershipScript = rmapwire.NewScript(`
 if redis.call("HGET", KEYS[1], "state") ~= ARGV[1]
 or redis.call("HGET", KEYS[1], "generation") ~= ARGV[2] then
     return redis.error_reply("POOLGENERATIONLOST")
@@ -138,14 +132,7 @@ if redis.call("HGET", KEYS[2], ARGV[3]) ~= ARGV[4] then
     return 0
 end
 redis.call("HDEL", KEYS[2], ARGV[3])
-local rev = tostring(redis.call("HINCRBY", KEYS[2], "=rev", 1))
-redis.call("HSET", KEYS[2], "=kind", "del")
-local message = struct.pack(
-    "ic0ic0",
-    string.len(ARGV[3]), ARGV[3],
-    string.len(rev), rev
-)
-redis.call("PUBLISH", KEYS[3], "del:" .. message)
+local rev = publishDel(KEYS[2], KEYS[3], ARGV[3])
 return 1
 `)
 )

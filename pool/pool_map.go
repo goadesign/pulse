@@ -9,8 +9,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/redis/go-redis/v9"
-
+	"goa.design/pulse/internal/rmapwire"
 	"goa.design/pulse/rmap"
 )
 
@@ -18,7 +17,7 @@ import (
 // stream generation is active. It emits the canonical rmap wire update in the
 // same Redis operation, so paused old-generation nodes cannot recreate deleted
 // map keys after cleanup.
-var mutatePoolMapScript = redis.NewScript(`
+var mutatePoolMapScript = rmapwire.NewScript(`
 if redis.call("HGET", KEYS[1], "state") ~= ARGV[1] or
    redis.call("HGET", KEYS[1], "generation") ~= ARGV[2] then
     return redis.error_reply("POOLGENERATIONLOST")
@@ -91,27 +90,17 @@ end
 if not changed then
     return 0
 end
-local rev = tostring(redis.call("HINCRBY", KEYS[2], "=rev", 1))
 if operation == "delete" or (operation == "remove" and update == "") then
-    redis.call("HSET", KEYS[2], "=kind", "del")
-    local msg = struct.pack("ic0ic0", string.len(key), key, string.len(rev), rev)
-    redis.call("PUBLISH", KEYS[3], "del:" .. msg)
+    publishDel(KEYS[2], KEYS[3], key)
 else
-    redis.call("HSET", KEYS[2], "=kind", "set")
-    local msg = struct.pack(
-        "ic0ic0ic0",
-        string.len(key), key,
-        string.len(update), update,
-        string.len(rev), rev
-    )
-    redis.call("PUBLISH", KEYS[3], "set:" .. msg)
+    publishSet(KEYS[2], KEYS[3], key, update)
 end
 return 1
 `)
 
 // testAndSetPoolMapScript atomically advances a distributed ticker only while
 // its exact pool generation remains active.
-var testAndSetPoolMapScript = redis.NewScript(`
+var testAndSetPoolMapScript = rmapwire.NewScript(`
 if redis.call("HGET", KEYS[1], "state") ~= ARGV[1] or
    redis.call("HGET", KEYS[1], "generation") ~= ARGV[2] then
     return redis.error_reply("POOLGENERATIONLOST")
@@ -125,15 +114,7 @@ if (ARGV[4] == "" and current) or
     return current or ""
 end
 redis.call("HSET", KEYS[2], ARGV[3], ARGV[5])
-local rev = tostring(redis.call("HINCRBY", KEYS[2], "=rev", 1))
-redis.call("HSET", KEYS[2], "=kind", "set")
-local msg = struct.pack(
-    "ic0ic0ic0",
-    string.len(ARGV[3]), ARGV[3],
-    string.len(ARGV[5]), ARGV[5],
-    string.len(rev), rev
-)
-redis.call("PUBLISH", KEYS[3], "set:" .. msg)
+local rev = publishSet(KEYS[2], KEYS[3], ARGV[3], ARGV[5])
 return ARGV[4]
 `)
 

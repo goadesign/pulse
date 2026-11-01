@@ -36,6 +36,12 @@ Redis hash backing a map:
   created and never extended).
 - `rmap.WithSlidingTTL(ttl)` sets a **sliding TTL** (refreshed on every write).
 
+When the hash expires, the map's data is gone from Redis. The next write starts
+a new *generation* of the map, and every replica that receives a change from a
+generation it does not hold reloads the map from Redis, so no replica keeps
+serving the expired data once the map is written again. `Sync` also empties a
+replica's copy when it finds the map expired.
+
 ### Writing to the Map
 
 * The `Set` method sets the value for a given key and returns the previous value. 
@@ -92,11 +98,9 @@ so they cost no network call. Each replica applies changes as Redis
 broadcasts them, which means a write that has just completed through *another*
 process may not be in this copy yet. Two methods order reads after writes:
 
-* `SetAndWait` writes a value and returns once this replica has applied that
-  write (or a newer one), so the writer's own reads that follow see it.
-* `Sync` waits until this replica has applied every write that completed
-  before the call, wherever it was made. It reads the map's revision from Redis
-  once, then waits for the local copy to reach it. Call it before a read that
+* `Sync` reads the whole map from Redis once and replaces the local copy when
+  Redis holds newer data, so the reads that follow include every write that
+  completed before the call, wherever it was made. Call it before a read that
   must reflect an earlier request handled by a different process:
 
 ```go
@@ -107,8 +111,17 @@ if err := m.Sync(ctx); err != nil {
 settings, _ := m.Get("settings:" + userID) // includes that save
 ```
 
-`Sync` does not lock the map: a write that is still in progress when it is
-called may or may not be included.
+* `SetAndWait` is `Set` followed by `Sync`, so the writer's own reads that
+  follow see its write.
+
+`Sync` does not stop other processes from writing to Redis, so a write that is
+still in progress when it is called may or may not be included. Each call reads
+the whole map, so use it where the freshness matters rather than before every
+read.
+
+Replicas also recover on their own: when the Redis connection drops, go-redis
+reconnects and resubscribes, and the replica then reloads the map, because
+changes published while it was disconnected were never delivered.
 
 ### Subscribing to Map Updates
 
