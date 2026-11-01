@@ -10,6 +10,7 @@ import (
 	"strconv"
 
 	redis "github.com/redis/go-redis/v9"
+	"goa.design/pulse/internal/rmapwire"
 )
 
 type (
@@ -159,7 +160,7 @@ return result
 	// lifecycle record remains as the monotonic source used by the next
 	// explicit NewStream call. The generation-qualified membership map is never
 	// reused, so its destroy notification needs no persistent rmap tombstone.
-	destroyStreamScript = redis.NewScript(`
+	destroyStreamScript = rmapwire.NewScript(`
 if redis.call("HGET", KEYS[1], "generation") ~= ARGV[2] then
     return redis.error_reply("STREAMDESTROYED")
 end
@@ -175,14 +176,13 @@ if redis.call("HGET", KEYS[1], ARGV[4]) ~= KEYS[2] then
 end
 
 redis.call("HSET", KEYS[1], "state", ARGV[3])
-local rev = redis.call("HINCRBY", KEYS[4], "=rev", 1)
 local resources = redis.call("SMEMBERS", KEYS[6])
 if #resources > 0 then
     redis.call("DEL", unpack(resources))
 end
-redis.call("DEL", KEYS[2], KEYS[3], KEYS[4])
+redis.call("DEL", KEYS[2], KEYS[3])
 redis.call("DEL", KEYS[6])
-redis.call("PUBLISH", KEYS[5], "destroy:" .. tostring(rev))
+deleteMap(KEYS[4], KEYS[5])
 return 1
 `)
 )

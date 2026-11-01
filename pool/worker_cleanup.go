@@ -14,8 +14,9 @@ import (
 	"time"
 
 	"github.com/oklog/ulid/v2"
-	redis "github.com/redis/go-redis/v9"
 
+	redis "github.com/redis/go-redis/v9"
+	"goa.design/pulse/internal/rmapwire"
 	"goa.design/pulse/streaming"
 )
 
@@ -33,7 +34,7 @@ var (
 	// heartbeat only while the worker remains registered and no cleanup fence
 	// has been installed. A resumed stale worker therefore cannot resurrect
 	// itself after cleanup begins.
-	updateWorkerHeartbeatScript = redis.NewScript(`
+	updateWorkerHeartbeatScript = rmapwire.NewScript(`
 if redis.call("HGET", KEYS[1], "state") ~= ARGV[1]
 or redis.call("HGET", KEYS[1], "generation") ~= ARGV[2] then
     return redis.error_reply("POOLGENERATIONLOST")
@@ -46,15 +47,7 @@ end
 local clock = redis.call("TIME")
 local timestamp = clock[1] .. string.format("%06d", clock[2]) .. "000"
 redis.call("HSET", KEYS[2], ARGV[3], timestamp)
-local rev = tostring(redis.call("HINCRBY", KEYS[2], "=rev", 1))
-redis.call("HSET", KEYS[2], "=kind", "set")
-local message = struct.pack(
-    "ic0ic0ic0",
-    string.len(ARGV[3]), ARGV[3],
-    string.len(timestamp), timestamp,
-    string.len(rev), rev
-)
-redis.call("PUBLISH", KEYS[5], "set:" .. message)
+local rev = publishSet(KEYS[2], KEYS[5], ARGV[3], timestamp)
 return timestamp
 `)
 
@@ -64,7 +57,7 @@ return timestamp
 	// instead requires the worker's own live registration and atomically
 	// marks it inactive, so the lease is the single fence deciding which
 	// party — the worker or a cleanup owner — requeues the jobs.
-	acquireWorkerCleanupScript = redis.NewScript(`
+	acquireWorkerCleanupScript = rmapwire.NewScript(`
 if redis.call("HGET", KEYS[1], "state") ~= ARGV[1]
 or redis.call("HGET", KEYS[1], "generation") ~= ARGV[2] then
     return redis.error_reply("POOLGENERATIONLOST")
@@ -107,29 +100,13 @@ if ARGV[8] == "1" then
     end
     local inactive = "-"
     redis.call("HSET", KEYS[5], ARGV[3], inactive)
-    local registration_rev = tostring(redis.call("HINCRBY", KEYS[5], "=rev", 1))
-    redis.call("HSET", KEYS[5], "=kind", "set")
-    local registration_message = struct.pack(
-        "ic0ic0ic0",
-        string.len(ARGV[3]), ARGV[3],
-        string.len(inactive), inactive,
-        string.len(registration_rev), registration_rev
-    )
-    redis.call("PUBLISH", KEYS[6], "set:" .. registration_message)
+    local registration_rev = publishSet(KEYS[5], KEYS[6], ARGV[3], inactive)
 end
 local fence_field = ARGV[6]
 local fence = tostring(redis.call("HINCRBY", KEYS[3], fence_field, 1))
 local value = ARGV[4] .. "|" .. fence .. "|" .. tostring(now + tonumber(ARGV[5]))
 redis.call("HSET", KEYS[3], ARGV[3], value)
-local rev = tostring(redis.call("HINCRBY", KEYS[3], "=rev", 1))
-redis.call("HSET", KEYS[3], "=kind", "set")
-local message = struct.pack(
-    "ic0ic0ic0",
-    string.len(ARGV[3]), ARGV[3],
-    string.len(value), value,
-    string.len(rev), rev
-)
-redis.call("PUBLISH", KEYS[4], "set:" .. message)
+local rev = publishSet(KEYS[3], KEYS[4], ARGV[3], value)
 return {1, fence}
 `)
 
@@ -204,7 +181,7 @@ return {1, event_id}
 
 	// removeStaleWorkerJobScript removes payload-less ownership only while the
 	// exact cleanup lease is live and the authoritative payload remains absent.
-	removeStaleWorkerJobScript = redis.NewScript(`
+	removeStaleWorkerJobScript = rmapwire.NewScript(`
 if redis.call("HGET", KEYS[1], "state") ~= ARGV[1]
 or redis.call("HGET", KEYS[1], "generation") ~= ARGV[2] then
     return redis.error_reply("POOLGENERATIONLOST")
@@ -246,31 +223,17 @@ else
     update = cjson.encode(remaining)
     redis.call("HSET", KEYS[3], ARGV[3], update)
 end
-local rev = tostring(redis.call("HINCRBY", KEYS[3], "=rev", 1))
 if update == "" then
-    redis.call("HSET", KEYS[3], "=kind", "del")
-    local message = struct.pack(
-        "ic0ic0",
-        string.len(ARGV[3]), ARGV[3],
-        string.len(rev), rev
-    )
-    redis.call("PUBLISH", KEYS[4], "del:" .. message)
+    publishDel(KEYS[3], KEYS[4], ARGV[3])
 else
-    redis.call("HSET", KEYS[3], "=kind", "set")
-    local message = struct.pack(
-        "ic0ic0ic0",
-        string.len(ARGV[3]), ARGV[3],
-        string.len(update), update,
-        string.len(rev), rev
-    )
-    redis.call("PUBLISH", KEYS[4], "set:" .. message)
+    publishSet(KEYS[3], KEYS[4], ARGV[3], update)
 end
 return 1
 `)
 
 	// deleteStaleWorkerScript destroys the exact worker stream incarnation and
 	// removes worker discovery only while the cleanup capability is current.
-	deleteStaleWorkerScript = redis.NewScript(`
+	deleteStaleWorkerScript = rmapwire.NewScript(`
 if redis.call("HGET", KEYS[1], "state") ~= ARGV[1]
 or redis.call("HGET", KEYS[1], "generation") ~= ARGV[2] then
     return redis.error_reply("POOLGENERATIONLOST")
@@ -307,14 +270,7 @@ local function delete_field(content, channel, field)
     if redis.call("HDEL", content, field) == 0 then
         return
     end
-    local rev = tostring(redis.call("HINCRBY", content, "=rev", 1))
-    redis.call("HSET", content, "=kind", "del")
-    local message = struct.pack(
-        "ic0ic0",
-        string.len(field), field,
-        string.len(rev), rev
-    )
-    redis.call("PUBLISH", channel, "del:" .. message)
+    local rev = publishDel(content, channel, field)
 end
 delete_field(KEYS[5], KEYS[6], ARGV[3])
 delete_field(KEYS[7], KEYS[8], ARGV[3])
@@ -324,7 +280,7 @@ return 1
 
 	// releaseWorkerCleanupScript releases only the exact capability. Completed
 	// cleanup also removes its stable publication and fence metadata.
-	releaseWorkerCleanupScript = redis.NewScript(`
+	releaseWorkerCleanupScript = rmapwire.NewScript(`
 if redis.call("HGET", KEYS[1], "state") ~= ARGV[1]
 or redis.call("HGET", KEYS[1], "generation") ~= ARGV[2] then
     return redis.error_reply("POOLGENERATIONLOST")
@@ -343,14 +299,7 @@ if ARGV[6] == "1" then
         end
     end
 end
-local rev = tostring(redis.call("HINCRBY", KEYS[2], "=rev", 1))
-redis.call("HSET", KEYS[2], "=kind", "del")
-local message = struct.pack(
-    "ic0ic0",
-    string.len(ARGV[3]), ARGV[3],
-    string.len(rev), rev
-)
-redis.call("PUBLISH", KEYS[3], "del:" .. message)
+local rev = publishDel(KEYS[2], KEYS[3], ARGV[3])
 return 1
 `)
 )

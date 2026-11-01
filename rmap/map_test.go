@@ -788,42 +788,6 @@ func TestRemoveValuesErrors(t *testing.T) {
 	assert.False(t, removed)
 }
 
-func TestReconnect(t *testing.T) {
-	rdb := ptesting.NewRedisClient(t)
-	ctx := context.Background()
-	var buf Buffer
-	ctx = log.Context(ctx, log.WithOutput(&buf))
-	log.FlushAndDisableBuffering(ctx)
-
-	m, err := Join(ctx, "test", rdb, WithLogger(pulse.ClueLogger(ctx)))
-	require.NoError(t, err)
-	defer cleanup(t, m)
-
-	// Write a value
-	const key, val = "foo", "bar"
-	old, err := m.Set(ctx, key, val)
-	assert.NoError(t, err)
-	assert.Equal(t, "", old)
-
-	// Check that the value is eventually available
-	assert.Eventually(t, func() bool { return len(m.Map()) == 1 }, wf, tck)
-	assert.Equal(t, val, m.Map()[key])
-
-	// Artificially close the connection
-	assert.NoError(t, m.sub.Close())
-	assert.Eventually(t, func() bool { return strings.Contains(buf.String(), "disconnected") }, wf, tck)
-	assert.Eventually(t, func() bool { return strings.Contains(buf.String(), "reconnected") }, wf, tck)
-
-	// Write a new value
-	const key2, val2 = "foo2", "bar2"
-	old, err = m.Set(ctx, key2, val2)
-	assert.NoError(t, err)
-	assert.Equal(t, "", old)
-
-	// Check that the new value is eventually available
-	assert.Eventually(t, func() bool { return len(m.Map()) == 2 }, wf, tck)
-}
-
 func TestDestroyAllowsReuse(t *testing.T) {
 	rdb := ptesting.NewRedisClient(t)
 	ctx := context.Background()
@@ -864,70 +828,6 @@ func TestApplyMessageLockedRejectsDestroyWithoutRevision(t *testing.T) {
 	assert.Equal(t, mapChange{}, change)
 	assert.Equal(t, uint64(7), sm.rev)
 	assert.Equal(t, map[string]string{"stale": "value"}, sm.content)
-}
-
-func TestReconnectPreservesResetEvent(t *testing.T) {
-	rdb := ptesting.NewRedisClient(t)
-	ctx := context.Background()
-
-	observer, err := Join(ctx, "reconnect-reset-event", rdb)
-	require.NoError(t, err)
-	defer cleanup(t, observer)
-
-	writer, err := Join(ctx, "reconnect-reset-event", rdb)
-	require.NoError(t, err)
-	defer writer.Close()
-
-	require.NoError(t, observer.Reset(ctx))
-	_, err = writer.Set(ctx, "k", "v")
-	require.NoError(t, err)
-	require.Eventually(t, func() bool {
-		v, ok := observer.Get("k")
-		return ok && v == "v"
-	}, wf, tck)
-
-	ch := observer.Subscribe()
-	require.NotNil(t, ch)
-
-	observer.lock.RLock()
-	require.NoError(t, observer.sub.Close())
-
-	require.NoError(t, writer.Reset(ctx))
-
-	observer.lock.RUnlock()
-
-	select {
-	case ev := <-ch:
-		require.Equal(t, EventReset, ev)
-	case <-time.After(wf):
-		t.Fatal("timed out waiting for reconnect reset event")
-	}
-}
-
-func TestNotifyWaitersUpToReleasesCommittedWriteAfterOverwrite(t *testing.T) {
-	// Recovery must unblock a committed SetAndWait even when a later revision has
-	// already advanced the key to a different value. Revision-based waiting keeps
-	// the acknowledgement tied to the committed write rather than the final value.
-	sm := &Map{waiters: make(map[uint64][]*setWaiter)}
-
-	waitCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	notifyCh := make(chan struct{}, 1)
-	sm.waiters[4] = []*setWaiter{{
-		ch:     notifyCh,
-		rev:    4,
-		ctx:    waitCtx,
-		cancel: cancel,
-	}}
-
-	sm.notifyWaitersUpTo(5)
-
-	select {
-	case <-notifyCh:
-	default:
-		t.Fatal("expected recovery to release waiter after committed write")
-	}
 }
 
 func cleanup(t *testing.T, m *Map) {

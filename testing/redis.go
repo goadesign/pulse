@@ -159,10 +159,9 @@ func isDestroyTombstone(ctx context.Context, rdb *redis.Client, key string) bool
 	if err != nil {
 		return false
 	}
-	if len(content) != 2 {
-		return false
-	}
-	if content["=kind"] != "destroy" {
+	// A destroyed map keeps only its bookkeeping fields: "=rev", and "=kind"
+	// holding "destroy:<generation>" (see internal/rmapwire publishClear).
+	if len(content) != 2 || !strings.HasPrefix(content["=kind"], "destroy:") {
 		return false
 	}
 	_, ok := content["=rev"]

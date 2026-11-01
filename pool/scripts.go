@@ -3,7 +3,10 @@
 // making singleton job admission one atomic Redis operation.
 package pool
 
-import redis "github.com/redis/go-redis/v9"
+import (
+	redis "github.com/redis/go-redis/v9"
+	"goa.design/pulse/internal/rmapwire"
+)
 
 const (
 	dispatchClaimed int64 = iota + 1
@@ -30,7 +33,7 @@ var (
 	// luaDispatchJob atomically resolves an exact dispatch retry or admits one
 	// new dispatch by writing its durable record, job-key index, and stream
 	// event at one Redis linearization point.
-	luaDispatchJob = redis.NewScript(`
+	luaDispatchJob = rmapwire.NewScript(`
 if redis.call("HGET", KEYS[1], "state") ~= ARGV[3]
 or redis.call("HGET", KEYS[1], "generation") ~= ARGV[4] then
     return redis.error_reply("POOLGENERATIONLOST")
@@ -84,17 +87,14 @@ redis.call("HSET", KEYS[5],
     "error", "")
 redis.call("SADD", KEYS[6], KEYS[5])
 redis.call("HSET", KEYS[3], ARGV[1], ARGV[2])
-local rev = tostring(redis.call("HINCRBY", KEYS[3], "=rev", 1))
-redis.call("HSET", KEYS[3], "=kind", "set")
-local msg = struct.pack("ic0ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(ARGV[2]), ARGV[2], string.len(rev), rev)
-redis.call("PUBLISH", KEYS[4], "set:" .. msg)
+local rev = publishSet(KEYS[3], KEYS[4], ARGV[1], ARGV[2])
 return {1, event_id, "", ""}
 `)
 
 	// luaSettleDispatch atomically records the immutable terminal outcome,
 	// clears admission, acknowledges the sink event, advances its durable
 	// recovery cursor, and deletes the settled event.
-	luaSettleDispatch = redis.NewScript(`
+	luaSettleDispatch = rmapwire.NewScript(`
 if redis.call("HGET", KEYS[1], "state") ~= ARGV[3]
 or redis.call("HGET", KEYS[1], "generation") ~= ARGV[4] then
     return redis.error_reply("POOLGENERATIONLOST")
@@ -129,10 +129,7 @@ redis.call("HSET", KEYS[4],
 redis.call("SREM", KEYS[5], KEYS[4])
 redis.call("PEXPIRE", KEYS[4], ARGV[9])
 redis.call("HDEL", KEYS[2], ARGV[1])
-local rev = tostring(redis.call("HINCRBY", KEYS[2], "=rev", 1))
-redis.call("HSET", KEYS[2], "=kind", "del")
-local msg = struct.pack("ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(rev), rev)
-redis.call("PUBLISH", KEYS[3], "del:" .. msg)
+local rev = publishDel(KEYS[2], KEYS[3], ARGV[1])
 redis.call("XACK", stream, ARGV[8], event_id)
 local pending = redis.call("XPENDING", stream, ARGV[8])
 local cursor
@@ -193,7 +190,7 @@ return {
 	// the worker's ownership, deletes the durable payload, and publishes both
 	// rmap updates. A worker may publish terminal Start failure only after this
 	// idempotent recipe succeeds.
-	cleanupFailedStartScript = redis.NewScript(`
+	cleanupFailedStartScript = rmapwire.NewScript(`
 if redis.call("HGET", KEYS[1], "state") ~= ARGV[4]
 or redis.call("HGET", KEYS[1], "generation") ~= ARGV[1] then
     return redis.error_reply("POOLGENERATIONLOST")
@@ -220,26 +217,17 @@ if encoded then
         local rev
         if #remaining == 0 then
             redis.call("HDEL", KEYS[2], worker)
-            rev = tostring(redis.call("HINCRBY", KEYS[2], "=rev", 1))
-            redis.call("HSET", KEYS[2], "=kind", "del")
-            local msg = struct.pack("ic0ic0", string.len(worker), worker, string.len(rev), rev)
-            redis.call("PUBLISH", KEYS[3], "del:" .. msg)
+            rev = publishDel(KEYS[2], KEYS[3], worker)
         else
             local value = cjson.encode(remaining)
             redis.call("HSET", KEYS[2], worker, value)
-            rev = tostring(redis.call("HINCRBY", KEYS[2], "=rev", 1))
-            redis.call("HSET", KEYS[2], "=kind", "set")
-            local msg = struct.pack("ic0ic0ic0", string.len(worker), worker, string.len(value), value, string.len(rev), rev)
-            redis.call("PUBLISH", KEYS[3], "set:" .. msg)
+            rev = publishSet(KEYS[2], KEYS[3], worker, value)
         end
     end
 end
 
 if redis.call("HDEL", KEYS[4], job) == 1 then
-    local rev = tostring(redis.call("HINCRBY", KEYS[4], "=rev", 1))
-    redis.call("HSET", KEYS[4], "=kind", "del")
-    local msg = struct.pack("ic0ic0", string.len(job), job, string.len(rev), rev)
-    redis.call("PUBLISH", KEYS[5], "del:" .. msg)
+    local rev = publishDel(KEYS[4], KEYS[5], job)
 end
 return 1
 `)
@@ -248,7 +236,7 @@ return 1
 	// ownership and payload for an exact dispatch that is still active. It
 	// leaves the original dispatch event, ID, admission index, and record
 	// untouched so sink recovery reclaims the same dispatch.
-	releaseCrashedDispatchStartScript = redis.NewScript(`
+	releaseCrashedDispatchStartScript = rmapwire.NewScript(`
 if redis.call("HGET", KEYS[1], "state") ~= ARGV[5]
 or redis.call("HGET", KEYS[1], "generation") ~= ARGV[1] then
     return redis.error_reply("POOLGENERATIONLOST")
@@ -293,27 +281,18 @@ if worker ~= "" then
             local rev
             if #remaining == 0 then
                 redis.call("HDEL", KEYS[4], worker)
-                rev = tostring(redis.call("HINCRBY", KEYS[4], "=rev", 1))
-                redis.call("HSET", KEYS[4], "=kind", "del")
-                local msg = struct.pack("ic0ic0", string.len(worker), worker, string.len(rev), rev)
-                redis.call("PUBLISH", KEYS[5], "del:" .. msg)
+                rev = publishDel(KEYS[4], KEYS[5], worker)
             else
                 local value = cjson.encode(remaining)
                 redis.call("HSET", KEYS[4], worker, value)
-                rev = tostring(redis.call("HINCRBY", KEYS[4], "=rev", 1))
-                redis.call("HSET", KEYS[4], "=kind", "set")
-                local msg = struct.pack("ic0ic0ic0", string.len(worker), worker, string.len(value), value, string.len(rev), rev)
-                redis.call("PUBLISH", KEYS[5], "set:" .. msg)
+                rev = publishSet(KEYS[4], KEYS[5], worker, value)
             end
         end
     end
 end
 
 if redis.call("HDEL", KEYS[6], job) == 1 then
-    local rev = tostring(redis.call("HINCRBY", KEYS[6], "=rev", 1))
-    redis.call("HSET", KEYS[6], "=kind", "del")
-    local msg = struct.pack("ic0ic0", string.len(job), job, string.len(rev), rev)
-    redis.call("PUBLISH", KEYS[7], "del:" .. msg)
+    local rev = publishDel(KEYS[6], KEYS[7], job)
 end
 return 1
 `)
@@ -325,7 +304,7 @@ return 1
 	// worker paused past WorkerTTL unable to claim after authoritative takeover.
 	// The claimed payload must match the dispatch record's canonical identity,
 	// so a worker can never start a job whose bytes diverged from admission.
-	claimWorkerStartScript = redis.NewScript(`
+	claimWorkerStartScript = rmapwire.NewScript(`
 if redis.call("HGET", KEYS[1], "state") ~= ARGV[2]
 or redis.call("HGET", KEYS[1], "generation") ~= ARGV[1] then
     return redis.error_reply("POOLGENERATIONLOST")
@@ -362,16 +341,10 @@ end
 table.insert(jobs, ARGV[3])
 local jobs_value = cjson.encode(jobs)
 redis.call("HSET", KEYS[5], ARGV[5], jobs_value)
-local jobs_rev = tostring(redis.call("HINCRBY", KEYS[5], "=rev", 1))
-redis.call("HSET", KEYS[5], "=kind", "set")
-local jobs_msg = struct.pack("ic0ic0ic0", string.len(ARGV[5]), ARGV[5], string.len(jobs_value), jobs_value, string.len(jobs_rev), jobs_rev)
-redis.call("PUBLISH", KEYS[6], "set:" .. jobs_msg)
+local jobs_rev = publishSet(KEYS[5], KEYS[6], ARGV[5], jobs_value)
 
 redis.call("HSET", KEYS[4], ARGV[3], ARGV[6])
-local payload_rev = tostring(redis.call("HINCRBY", KEYS[4], "=rev", 1))
-redis.call("HSET", KEYS[4], "=kind", "set")
-local payload_msg = struct.pack("ic0ic0ic0", string.len(ARGV[3]), ARGV[3], string.len(ARGV[6]), ARGV[6], string.len(payload_rev), payload_rev)
-redis.call("PUBLISH", KEYS[7], "set:" .. payload_msg)
+local payload_rev = publishSet(KEYS[4], KEYS[7], ARGV[3], ARGV[6])
 return 1
 `)
 )

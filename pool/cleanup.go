@@ -12,6 +12,7 @@ import (
 	"time"
 
 	redis "github.com/redis/go-redis/v9"
+	"goa.design/pulse/internal/rmapwire"
 )
 
 const (
@@ -78,7 +79,7 @@ return 1
 
 	// destroyCleanupStreamScript verifies the live cleanup lease and exact
 	// stream incarnation in the same operation that invalidates and deletes it.
-	destroyCleanupStreamScript = redis.NewScript(`
+	destroyCleanupStreamScript = rmapwire.NewScript(`
 local clock = redis.call("TIME")
 local now = (tonumber(clock[1]) * 1000) + math.floor(tonumber(clock[2]) / 1000)
 if redis.call("HGET", KEYS[1], "state") ~= ARGV[3]
@@ -104,20 +105,19 @@ if not physical then
     return redis.error_reply("STREAMDESTROYED")
 end
 redis.call("HSET", KEYS[2], "state", "destroyed")
-local rev = redis.call("HINCRBY", KEYS[3], "=rev", 1)
 local resources = redis.call("SMEMBERS", KEYS[5])
 if #resources > 0 then
     redis.call("DEL", unpack(resources))
 end
-redis.call("DEL", physical, physical .. ":sink-recovery:" .. ARGV[1], KEYS[3])
+redis.call("DEL", physical, physical .. ":sink-recovery:" .. ARGV[1])
 redis.call("DEL", KEYS[5])
-redis.call("PUBLISH", KEYS[4], "destroy:" .. tostring(rev))
+deleteMap(KEYS[3], KEYS[4])
 return 1
 `)
 
 	// destroyCleanupMapScript deletes one pool map only while this exact cleanup
 	// owner still holds an unexpired lease.
-	destroyCleanupMapScript = redis.NewScript(`
+	destroyCleanupMapScript = rmapwire.NewScript(`
 local clock = redis.call("TIME")
 local now = (tonumber(clock[1]) * 1000) + math.floor(tonumber(clock[2]) / 1000)
 if redis.call("HGET", KEYS[1], "state") ~= ARGV[3]
@@ -127,9 +127,7 @@ or tonumber(redis.call("HGET", KEYS[1], "lease_until") or "0") <= now then
     return redis.error_reply("POOLCLEANUPLOST")
 end
 redis.call("HSET", KEYS[1], "lease_until", tostring(now + tonumber(ARGV[4])))
-local rev = redis.call("HINCRBY", KEYS[2], "=rev", 1)
-redis.call("DEL", KEYS[2])
-redis.call("PUBLISH", KEYS[3], "destroy:" .. tostring(rev))
+deleteMap(KEYS[2], KEYS[3])
 return 1
 `)
 

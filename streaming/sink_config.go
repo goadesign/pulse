@@ -13,6 +13,7 @@ import (
 
 	redis "github.com/redis/go-redis/v9"
 
+	"goa.design/pulse/internal/rmapwire"
 	"goa.design/pulse/streaming/options"
 )
 
@@ -183,7 +184,7 @@ return redis.call(
 	// fencedStaleConsumerCleanupScript performs stale-consumer inspection and
 	// every resulting group and replicated-map mutation under one exact lease
 	// check. A predecessor whose lease expired cannot mutate the PEL or maps.
-	fencedStaleConsumerCleanupScript = redis.NewScript(`
+	fencedStaleConsumerCleanupScript = rmapwire.NewScript(`
 if redis.call("HGET", KEYS[1], "state") ~= ARGV[1]
 or redis.call("HGET", KEYS[1], "generation") ~= ARGV[2]
 or redis.call("HGET", KEYS[1], "physical_key") ~= ARGV[3] then
@@ -209,10 +210,7 @@ local function publish_delete(content, channel, key)
     if redis.call("HDEL", content, key) == 0 then
         return
     end
-    local rev = tostring(redis.call("HINCRBY", content, "=rev", 1))
-    redis.call("HSET", content, "=kind", "del")
-    local message = struct.pack("ic0ic0", string.len(key), key, string.len(rev), rev)
-    redis.call("PUBLISH", channel, "del:" .. message)
+    local rev = publishDel(content, channel, key)
 end
 
 local function remove_value(content, channel, key, removed_value)
@@ -247,15 +245,7 @@ local function remove_value(content, channel, key, removed_value)
     end
     local replacement = cjson.encode(remaining)
     redis.call("HSET", content, key, replacement)
-    local rev = tostring(redis.call("HINCRBY", content, "=rev", 1))
-    redis.call("HSET", content, "=kind", "set")
-    local message = struct.pack(
-        "ic0ic0ic0",
-        string.len(key), key,
-        string.len(replacement), replacement,
-        string.len(rev), rev
-    )
-    redis.call("PUBLISH", channel, "set:" .. message)
+    local rev = publishSet(content, channel, key, replacement)
 end
 
 local removed = {}

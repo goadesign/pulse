@@ -13,6 +13,7 @@ import (
 	"time"
 
 	redis "github.com/redis/go-redis/v9"
+	"goa.design/pulse/internal/rmapwire"
 )
 
 type (
@@ -157,7 +158,7 @@ return 1
 
 	// claimSchedulerJobScript stores a scheduler dispatch capability only while
 	// the transition lease is current and publishes the matching rmap update.
-	claimSchedulerJobScript = redis.NewScript(`
+	claimSchedulerJobScript = rmapwire.NewScript(`
 if redis.call("HGET", KEYS[1], "state") ~= ARGV[1]
 or redis.call("HGET", KEYS[1], "generation") ~= ARGV[2] then
     return redis.error_reply("POOLGENERATIONLOST")
@@ -174,21 +175,13 @@ if current then
     return current
 end
 redis.call("HSET", KEYS[2], ARGV[6], ARGV[7])
-local rev = tostring(redis.call("HINCRBY", KEYS[2], "=rev", 1))
-redis.call("HSET", KEYS[2], "=kind", "set")
-local message = struct.pack(
-    "ic0ic0ic0",
-    string.len(ARGV[6]), ARGV[6],
-    string.len(ARGV[7]), ARGV[7],
-    string.len(rev), rev
-)
-redis.call("PUBLISH", KEYS[3], "set:" .. message)
+local rev = publishSet(KEYS[2], KEYS[3], ARGV[6], ARGV[7])
 return ""
 `)
 
 	// dispatchScheduledJobScript admits the exact persisted scheduler dispatch
 	// only while the transition owner/fence is live.
-	dispatchScheduledJobScript = redis.NewScript(`
+	dispatchScheduledJobScript = rmapwire.NewScript(`
 if redis.call("HGET", KEYS[1], "state") ~= ARGV[1]
 or redis.call("HGET", KEYS[1], "generation") ~= ARGV[2] then
     return redis.error_reply("POOLGENERATIONLOST")
@@ -243,15 +236,7 @@ redis.call("HSET", KEYS[6],
     "error", "")
 redis.call("SADD", KEYS[7], KEYS[6])
 redis.call("HSET", KEYS[4], ARGV[6], ARGV[7])
-local rev = tostring(redis.call("HINCRBY", KEYS[4], "=rev", 1))
-redis.call("HSET", KEYS[4], "=kind", "set")
-local msg = struct.pack(
-    "ic0ic0ic0",
-    string.len(ARGV[6]), ARGV[6],
-    string.len(ARGV[7]), ARGV[7],
-    string.len(rev), rev
-)
-redis.call("PUBLISH", KEYS[5], "set:" .. msg)
+local rev = publishSet(KEYS[4], KEYS[5], ARGV[6], ARGV[7])
 return {1, event_id, "", ""}
 `)
 )

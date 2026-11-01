@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"strconv"
 
-	redis "github.com/redis/go-redis/v9"
+	"goa.design/pulse/internal/rmapwire"
 )
 
 // registerSinkConsumerScript atomically verifies the exact stream generation,
@@ -23,7 +23,7 @@ import (
 //	[5]=keepalive content [6]=keepalive channel
 //
 // ARGV: [1]=active state [2]=generation [3]=group [4]=consumer [5]=keep-alive
-var registerSinkConsumerScript = redis.NewScript(`
+var registerSinkConsumerScript = rmapwire.NewScript(`
 local lifecycle_type = redis.call("TYPE", KEYS[1]).ok
 if lifecycle_type ~= "hash" then
     return redis.error_reply("SINKLIFECYCLEINVALID " .. lifecycle_type)
@@ -47,15 +47,7 @@ if type(created) == "table" and created.err then
 end
 
 local function publish_set(content, channel, field, value)
-    local rev = tostring(redis.call("HINCRBY", content, "=rev", 1))
-    redis.call("HSET", content, "=kind", "set")
-    local message = struct.pack(
-        "ic0ic0ic0",
-        string.len(field), field,
-        string.len(value), value,
-        string.len(rev), rev
-    )
-    redis.call("PUBLISH", channel, "set:" .. message)
+    local rev = publishSet(content, channel, field, value)
 end
 
 local encoded = redis.call("HGET", KEYS[3], ARGV[3])
@@ -92,7 +84,7 @@ return 1
 //
 // KEYS: [1]=lifecycle [2]=stream [3]=keepalive content [4]=keepalive channel
 // ARGV: [1]=active state [2]=generation [3]=consumer [4]=keep-alive
-var fencedKeepAliveSetScript = redis.NewScript(`
+var fencedKeepAliveSetScript = rmapwire.NewScript(`
 if redis.call("HGET", KEYS[1], "state") ~= ARGV[1]
 or redis.call("HGET", KEYS[1], "generation") ~= ARGV[2]
 or redis.call("HGET", KEYS[1], "physical_key") ~= KEYS[2] then
@@ -103,19 +95,11 @@ if keepalive_type ~= "hash" and keepalive_type ~= "none" then
     return redis.error_reply("SINKKEEPALIVEINVALID " .. keepalive_type)
 end
 redis.call("HSET", KEYS[3], ARGV[3], ARGV[4])
-local rev = tostring(redis.call("HINCRBY", KEYS[3], "=rev", 1))
-redis.call("HSET", KEYS[3], "=kind", "set")
-local message = struct.pack(
-    "ic0ic0ic0",
-    string.len(ARGV[3]), ARGV[3],
-    string.len(ARGV[4]), ARGV[4],
-    string.len(rev), rev
-)
-redis.call("PUBLISH", KEYS[4], "set:" .. message)
+local rev = publishSet(KEYS[3], KEYS[4], ARGV[3], ARGV[4])
 return 1
 `)
 
-var detachSinkConsumerScript = redis.NewScript(`
+var detachSinkConsumerScript = rmapwire.NewScript(`
 local lifecycle_type = redis.call("TYPE", KEYS[1]).ok
 if lifecycle_type ~= "hash" then
     return redis.error_reply("SINKLIFECYCLEINVALID " .. lifecycle_type)
@@ -158,26 +142,11 @@ if #pending == 0 then
 end
 
 local function publish_delete(content, channel, field)
-    local rev = tostring(redis.call("HINCRBY", content, "=rev", 1))
-    redis.call("HSET", content, "=kind", "del")
-    local message = struct.pack(
-        "ic0ic0",
-        string.len(field), field,
-        string.len(rev), rev
-    )
-    redis.call("PUBLISH", channel, "del:" .. message)
+    local rev = publishDel(content, channel, field)
 end
 
 local function publish_set(content, channel, field, value)
-    local rev = tostring(redis.call("HINCRBY", content, "=rev", 1))
-    redis.call("HSET", content, "=kind", "set")
-    local message = struct.pack(
-        "ic0ic0ic0",
-        string.len(field), field,
-        string.len(value), value,
-        string.len(rev), rev
-    )
-    redis.call("PUBLISH", channel, "set:" .. message)
+    local rev = publishSet(content, channel, field, value)
 end
 
 local encoded = redis.call("HGET", KEYS[3], ARGV[3])

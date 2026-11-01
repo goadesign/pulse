@@ -26,6 +26,7 @@ import (
 	redis "github.com/redis/go-redis/v9"
 	"goa.design/clue/log"
 
+	"goa.design/pulse/internal/rmapwire"
 	"goa.design/pulse/pulse"
 	"goa.design/pulse/rmap"
 	"goa.design/pulse/streaming"
@@ -165,7 +166,7 @@ var (
 	// registerPoolNodeScript linearizes node registration against shutdown and
 	// final cleanup, verifies the exact pool incarnation, and publishes the
 	// keep-alive map update in the same operation.
-	registerPoolNodeScript = redis.NewScript(`
+	registerPoolNodeScript = rmapwire.NewScript(`
 if redis.call("HGET", KEYS[1], "state") ~= ARGV[3] or
    redis.call("HGET", KEYS[1], "generation") ~= ARGV[2] then
     return redis.error_reply("POOLGENERATIONLOST")
@@ -184,21 +185,13 @@ end
 local now = redis.call("TIME")
 local timestamp = now[1] .. string.format("%06d", now[2]) .. "000"
 redis.call("HSET", KEYS[3], ARGV[1], timestamp)
-local rev = tostring(redis.call("HINCRBY", KEYS[3], "=rev", 1))
-redis.call("HSET", KEYS[3], "=kind", "set")
-local msg = struct.pack(
-    "ic0ic0ic0",
-    string.len(ARGV[1]), ARGV[1],
-    string.len(timestamp), timestamp,
-    string.len(rev), rev
-)
-redis.call("PUBLISH", KEYS[4], "set:" .. msg)
+local rev = publishSet(KEYS[3], KEYS[4], ARGV[1], timestamp)
 return {1, timestamp}
 `)
 
 	// refreshPoolNodeScript renews an existing node through shutdown but
 	// rejects a stale-node cleanup fence or removed registration.
-	refreshPoolNodeScript = redis.NewScript(`
+	refreshPoolNodeScript = rmapwire.NewScript(`
 if redis.call("HGET", KEYS[1], "state") ~= ARGV[3] or
    redis.call("HGET", KEYS[1], "generation") ~= ARGV[2] then
     return redis.error_reply("POOLGENERATIONLOST")
@@ -210,29 +203,18 @@ end
 local now = redis.call("TIME")
 local timestamp = now[1] .. string.format("%06d", now[2]) .. "000"
 redis.call("HSET", KEYS[2], ARGV[1], timestamp)
-local rev = tostring(redis.call("HINCRBY", KEYS[2], "=rev", 1))
-redis.call("HSET", KEYS[2], "=kind", "set")
-local msg = struct.pack(
-    "ic0ic0ic0",
-    string.len(ARGV[1]), ARGV[1],
-    string.len(timestamp), timestamp,
-    string.len(rev), rev
-)
-redis.call("PUBLISH", KEYS[3], "set:" .. msg)
+local rev = publishSet(KEYS[2], KEYS[3], ARGV[1], timestamp)
 return timestamp
 `)
 
 	// publishPoolShutdownScript records the distributed shutdown obligation and
 	// emits the rmap wire notification without depending on a local map handle
 	// that a concurrent Close may already have closed.
-	publishPoolShutdownScript = redis.NewScript(`
+	publishPoolShutdownScript = rmapwire.NewScript(`
 local key = "shutdown"
 local value = ARGV[1]
 redis.call("HSET", KEYS[1], key, value)
-local rev = tostring(redis.call("HINCRBY", KEYS[1], "=rev", 1))
-redis.call("HSET", KEYS[1], "=kind", "set")
-local msg = struct.pack("ic0ic0ic0", string.len(key), key, string.len(value), value, string.len(rev), rev)
-redis.call("PUBLISH", KEYS[2], "set:" .. msg)
+local rev = publishSet(KEYS[1], KEYS[2], key, value)
 return rev
 `)
 )

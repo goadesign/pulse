@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -77,8 +78,17 @@ func TestSchedule(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Eventually(t, func() bool { return it() == 7 }, 5*time.Second, delay, "schedule should have stopped, got %d", it())
+	// The scheduler owns a job through a field named "<hex producer name>:<job
+	// key>" in this map; it also keeps private "=transition:..." fields there,
+	// which are not ownership.
+	ownerPrefix := hex.EncodeToString([]byte(producer.Name())) + ":"
 	assert.Eventually(t, func() bool {
-		return len(node.schedulerJobMap.Keys()) == 0
+		for _, key := range node.schedulerJobMap.Keys() {
+			if strings.HasPrefix(key, ownerPrefix) {
+				return false
+			}
+		}
+		return true
 	}, time.Second, delay, "scheduler ownership should be cleared")
 	assert.NotContains(t, buf.String(), "level=error", "unexpected logged error")
 }

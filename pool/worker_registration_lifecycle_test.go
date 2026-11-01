@@ -456,14 +456,16 @@ func (h *workerLifecycleHook) ProcessHook(next redis.ProcessHook) redis.ProcessH
 			return next(ctx, cmd)
 		}
 		args := cmd.Args()
-		if h.destroyError != nil && len(args) == 13 && args[2] == 6 &&
+		// Script calls built with rmapwire carry one trailing generation id
+		// after the caller's arguments, hence 14 and 18 rather than 13 and 17.
+		if h.destroyError != nil && len(args) == 14 && args[2] == 6 &&
 			args[3] == h.registration.lifecycleKey && args[9] == "active" &&
 			args[10] == h.registration.generation && args[11] == "destroyed" &&
 			args[12] == "physical_key" {
 			h.destroyAttempts.Add(1)
 			return h.destroyError
 		}
-		if len(args) != 17 || args[2] != 8 || args[4] != h.workersKey {
+		if len(args) != 18 || args[2] != 8 || args[4] != h.workersKey {
 			return next(ctx, cmd)
 		}
 		var err error

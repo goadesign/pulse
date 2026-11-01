@@ -73,7 +73,10 @@ func TestSinkCloseLocalCleanupRetainsDistributedRetry(t *testing.T) {
 				}
 				if cmd.Args()[1] == detachSinkConsumerScript.Hash() {
 					commandLock.Lock()
-					detachArgs[phase] = append(detachArgs[phase], append([]any(nil), cmd.Args()[3:]...))
+					// Drop the trailing generation id rmapwire.Script.Run appends;
+					// the test checks the caller's own keys and arguments.
+					args := cmd.Args()
+					detachArgs[phase] = append(detachArgs[phase], append([]any(nil), args[3:len(args)-1]...))
 					commandLock.Unlock()
 					if phase && stage == "detachment" {
 						return failure

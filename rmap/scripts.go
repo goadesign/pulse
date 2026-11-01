@@ -1,13 +1,15 @@
 // Package rmap keeps every replicated-map mutation in Lua so Redis updates,
 // revision bumps, and pubsub notifications stay atomic and totally ordered.
+// Scripts are built with rmapwire.NewScript, which supplies the shared
+// stamp/publish helpers that define the published format.
 package rmap
 
-import "github.com/redis/go-redis/v9"
+import "goa.design/pulse/internal/rmapwire"
 
 var (
 	// luaAppend is the Lua script used to append an item to an array key and
 	// return its new value.
-	luaAppend = redis.NewScript(`
+	luaAppend = rmapwire.NewScript(`
 	   local key = ARGV[1]
 	   local v = redis.call("HGET", KEYS[1], key)
 
@@ -33,16 +35,13 @@ var (
 
 	   local encoded = cjson.encode(values)
 	   redis.call("HSET", KEYS[1], key, encoded)
-	   local rev = tostring(redis.call("HINCRBY", KEYS[1], "=rev", 1))
-	   redis.call("HSET", KEYS[1], "=kind", "set")
-	   local msg = struct.pack("ic0ic0ic0", string.len(key), key, string.len(encoded), encoded, string.len(rev), rev)
-	   redis.call("PUBLISH", KEYS[2], "set:" .. msg)
+	   publishSet(KEYS[1], KEYS[2], key, encoded)
 	   return encoded
 	`)
 
 	// luaAppendUnique is the Lua script used to append an item to a set and return
 	// the result.
-	luaAppendUnique = redis.NewScript(`
+	luaAppendUnique = rmapwire.NewScript(`
 	  local key = ARGV[1]
 	  local v = redis.call("HGET", KEYS[1], key)
 
@@ -80,10 +79,7 @@ var (
 	  if changed then
 	     local encoded = cjson.encode(values)
 	     redis.call("HSET", KEYS[1], key, encoded)
-	     local rev = tostring(redis.call("HINCRBY", KEYS[1], "=rev", 1))
-	     redis.call("HSET", KEYS[1], "=kind", "set")
-	     local msg = struct.pack("ic0ic0ic0", string.len(key), key, string.len(encoded), encoded, string.len(rev), rev)
-	     redis.call("PUBLISH", KEYS[2], "set:" .. msg)
+	     publishSet(KEYS[1], KEYS[2], key, encoded)
 	     return encoded
 	  end
 
@@ -92,33 +88,27 @@ var (
 
 	// luaDelete is the Lua script used to delete a key and return its previous
 	// value.
-	luaDelete = redis.NewScript(`
+	luaDelete = rmapwire.NewScript(`
 	   local v = redis.call("HGET", KEYS[1], ARGV[1])
 	   if not v then
 	      return nil
 	   end
 	   redis.call("HDEL", KEYS[1], ARGV[1])
-	   local rev = tostring(redis.call("HINCRBY", KEYS[1], "=rev", 1))
-	   redis.call("HSET", KEYS[1], "=kind", "del")
-	   local msg = struct.pack("ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(rev), rev)
-	   redis.call("PUBLISH", KEYS[2], "del:" .. msg)
+	   publishDel(KEYS[1], KEYS[2], ARGV[1])
 	   return v
 	`)
 
 	// luaIncr is the Lua script used to increment a key and return the new value.
-	luaIncr = redis.NewScript(`
+	luaIncr = rmapwire.NewScript(`
 	   redis.call("HINCRBY", KEYS[1], ARGV[1], ARGV[2])
 	   local v = redis.call("HGET", KEYS[1], ARGV[1])
-	   local rev = tostring(redis.call("HINCRBY", KEYS[1], "=rev", 1))
-	   redis.call("HSET", KEYS[1], "=kind", "set")
-	   local msg = struct.pack("ic0ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(v), v, string.len(rev), rev)
-	   redis.call("PUBLISH", KEYS[2], "set:" .. msg)
+	   publishSet(KEYS[1], KEYS[2], ARGV[1], v)
 	   return v
 	`)
 
 	// luaRemove is the Lua script used to remove items from an array value and
 	// return the result along with a flag indicating if any value was removed.
-	luaRemove = redis.NewScript(`
+	luaRemove = rmapwire.NewScript(`
 	   local key = ARGV[1]
 	   local v = redis.call("HGET", KEYS[1], key)
 
@@ -157,73 +147,55 @@ var (
 
 	   if #remaining == 0 then
 	      redis.call("HDEL", KEYS[1], key)
-	      local rev = tostring(redis.call("HINCRBY", KEYS[1], "=rev", 1))
-	      redis.call("HSET", KEYS[1], "=kind", "del")
-	      local msg = struct.pack("ic0ic0", string.len(key), key, string.len(rev), rev)
-	      redis.call("PUBLISH", KEYS[2], "del:" .. msg)
+	      publishDel(KEYS[1], KEYS[2], key)
 	      return {"", 1}
 	   end
 
 	   local encoded = cjson.encode(remaining)
 	   redis.call("HSET", KEYS[1], key, encoded)
-	   local rev = tostring(redis.call("HINCRBY", KEYS[1], "=rev", 1))
-	   redis.call("HSET", KEYS[1], "=kind", "set")
-	   local msg = struct.pack("ic0ic0ic0", string.len(key), key, string.len(encoded), encoded, string.len(rev), rev)
-	   redis.call("PUBLISH", KEYS[2], "set:" .. msg)
+	   publishSet(KEYS[1], KEYS[2], key, encoded)
 	   return {encoded, 1}
 	`)
 
 	// luaReset is the Lua script used to reset the map.
-	luaReset = redis.NewScript(`
-	   local rev = redis.call("HINCRBY", KEYS[1], "=rev", 1)
-	   redis.call("DEL", KEYS[1])
-	   redis.call("HSET", KEYS[1], "=rev", rev, "=kind", "reset")
-	   redis.call("PUBLISH", KEYS[2], "reset:" .. tostring(rev))
+	luaReset = rmapwire.NewScript(`
+	   publishClear(KEYS[1], KEYS[2], "reset")
 	`)
 
 	// luaDestroy is the Lua script used to delete the map entirely.
-	luaDestroy = redis.NewScript(`
-	   local rev = redis.call("HINCRBY", KEYS[1], "=rev", 1)
-	   redis.call("DEL", KEYS[1])
-	   redis.call("HSET", KEYS[1], "=rev", rev, "=kind", "destroy")
-	   redis.call("PUBLISH", KEYS[2], "destroy:" .. tostring(rev))
+	luaDestroy = rmapwire.NewScript(`
+	   publishClear(KEYS[1], KEYS[2], "destroy")
 	`)
 
 	// luaSet is the Lua script used to set a key and return its previous value.  We
 	// use Lua scripts to publish notifications "at the same time" and preserve the
 	// order of operations (scripts are run atomically within Redis).
-	luaSet = redis.NewScript(`
+	luaSet = rmapwire.NewScript(`
 	   local v = redis.call("HGET", KEYS[1], ARGV[1])
 	   redis.call("HSET", KEYS[1], ARGV[1], ARGV[2])
-	   local rev = tostring(redis.call("HINCRBY", KEYS[1], "=rev", 1))
-	   redis.call("HSET", KEYS[1], "=kind", "set")
-	   local msg = struct.pack("ic0ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(ARGV[2]), ARGV[2], string.len(rev), rev)
-	   redis.call("PUBLISH", KEYS[2], "set:" .. msg)
+	   publishSet(KEYS[1], KEYS[2], ARGV[1], ARGV[2])
 	   local existed = 0
 	   local prev = ""
 	   if v then
 	      existed = 1
 	      prev = v
 	   end
-	   return {existed, prev, rev}
+	   return {existed, prev}
 	`)
 
 	// luaTestAndDel is the Lua script used to delete a key if it has a specific value.
-	luaTestAndDel = redis.NewScript(`
+	luaTestAndDel = rmapwire.NewScript(`
 	   local v = redis.call("HGET", KEYS[1], ARGV[1])
 	   if v == ARGV[2] then
 	      redis.call("HDEL", KEYS[1], ARGV[1])
-	      local rev = tostring(redis.call("HINCRBY", KEYS[1], "=rev", 1))
-	      redis.call("HSET", KEYS[1], "=kind", "del")
-	      local msg = struct.pack("ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(rev), rev)
-	      redis.call("PUBLISH", KEYS[2], "del:" .. msg)
+	      publishDel(KEYS[1], KEYS[2], ARGV[1])
 	   end
 	   return v
 	`)
 
 	// luaTestAndReset is the Lua script used to reset the map if all the given keys
 	// have the given values.
-	luaTestAndReset = redis.NewScript(`
+	luaTestAndReset = rmapwire.NewScript(`
 	  local hash = KEYS[1]
 	  local n = (#ARGV - 1) / 2
 	  
@@ -232,35 +204,26 @@ var (
 	          return 0
 	      end
 	  end
-	  local rev = redis.call("HINCRBY", hash, "=rev", 1)
-	  redis.call("DEL", hash)
-	  redis.call("HSET", hash, "=rev", rev, "=kind", "reset")
-	  redis.call("PUBLISH", KEYS[2], "reset:" .. tostring(rev))
+	  publishClear(hash, KEYS[2], "reset")
 	  return 1
 	`)
 
 	// luaTestAndSet is the Lua script used to set a key if it has a specific value.
-	luaTestAndSet = redis.NewScript(`
+	luaTestAndSet = rmapwire.NewScript(`
 	   local v = redis.call("HGET", KEYS[1], ARGV[1])
 	   if v == ARGV[2] then
 	      redis.call("HSET", KEYS[1], ARGV[1], ARGV[3])
-	      local rev = tostring(redis.call("HINCRBY", KEYS[1], "=rev", 1))
-	      redis.call("HSET", KEYS[1], "=kind", "set")
-	      local msg = struct.pack("ic0ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(ARGV[3]), ARGV[3], string.len(rev), rev)
-	      redis.call("PUBLISH", KEYS[2], "set:" .. msg)
+	      publishSet(KEYS[1], KEYS[2], ARGV[1], ARGV[3])
 	   end
 	   return v
 	`)
 
 	// luaSetIfNotExists is the Lua script used to set a key if it does not exist.
-	luaSetIfNotExists = redis.NewScript(`
+	luaSetIfNotExists = rmapwire.NewScript(`
         local v = redis.call("HGET", KEYS[1], ARGV[1])
         if not v then
             redis.call("HSET", KEYS[1], ARGV[1], ARGV[2])
-            local rev = tostring(redis.call("HINCRBY", KEYS[1], "=rev", 1))
-            redis.call("HSET", KEYS[1], "=kind", "set")
-            local msg = struct.pack("ic0ic0ic0", string.len(ARGV[1]), ARGV[1], string.len(ARGV[2]), ARGV[2], string.len(rev), rev)
-            redis.call("PUBLISH", KEYS[2], "set:" .. msg)
+            publishSet(KEYS[1], KEYS[2], ARGV[1], ARGV[2])
             return 1  -- Successfully set the value
         end
         return 0    -- Value already existed

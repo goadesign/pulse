@@ -36,6 +36,30 @@ Redis hash backing a map:
   created and never extended).
 - `rmap.WithSlidingTTL(ttl)` sets a **sliding TTL** (refreshed on every write).
 
+When the hash expires, the map's data is gone from Redis. The next write starts
+a new *generation* of the map, and every replica that receives a change from a
+generation it does not hold reloads the map from Redis, so no replica keeps
+serving the expired data once the map is written again. `Sync` also empties a
+replica's copy when it finds the map expired.
+
+### Upgrading and rolling back
+
+Every published change now carries the map's generation, which is stored with
+the last change's kind in the hash's existing `=kind` field. Processes that
+share a replicated map, including the `pool` and `streaming` packages, which
+write map hashes from their own scripts, must all run a Pulse version with the
+same change format:
+
+* **Upgrade every process together.** Stop every process that uses a given map,
+  deploy the new version everywhere, then start them. An older process cannot
+  decode the new reset and destroy notifications, and a newer process treats
+  an older process's changes as missing their generation.
+* **Rolling back your application** while keeping this Pulse version needs no
+  extra step.
+* **Downgrading Pulse** requires stopping every process that runs the newer
+  version before any older one starts. No data cleanup is needed: older
+  versions already hide `=kind` and treat its new value as an ordinary change.
+
 ### Writing to the Map
 
 * The `Set` method sets the value for a given key and returns the previous value. 
@@ -85,12 +109,50 @@ boundaries.
 
 [![Replicated Map Read](../snippets/rmap-map.png)](../examples/rmap/basics/main.go#L98-100)
 
+#### Reading after writes made elsewhere
+
+`Get`, `GetValues`, `Keys`, `Len`, and `Map` read the replica's in-memory copy,
+so they cost no network call. Each replica applies changes as Redis
+broadcasts them, which means a write that has just completed through *another*
+process may not be in this copy yet. Two methods order reads after writes:
+
+* `Sync` reads the whole map from Redis once and replaces the local copy when
+  Redis holds newer data, so the reads that follow include every write that
+  completed before the call, wherever it was made. Call it before a read that
+  must reflect an earlier request handled by a different process:
+
+```go
+// The previous request saved the user's settings through another replica.
+if err := m.Sync(ctx); err != nil {
+    return err
+}
+settings, _ := m.Get("settings:" + userID) // includes that save
+```
+
+* `SetAndWait` is `Set` followed by `Sync`, so the writer's own reads that
+  follow see its write.
+
+`Sync` does not stop other processes from writing to Redis, so a write that is
+still in progress when it is called may or may not be included. Each call reads
+the whole map, so use it where the freshness matters rather than before every
+read.
+
+Replicas also recover on their own: when the Redis connection drops, go-redis
+reconnects and resubscribes, and the replica then reloads the map, because
+changes published while it was disconnected were never delivered.
+
 ### Subscribing to Map Updates
 
 * The `Subscribe` method returns a channel that can be used to receive notifications
   when the map is updated. The channel is closed when the map is closed.
 
 [![Replicated Map Subscribe](../snippets/rmap-subscribe.png)](../examples/rmap/basics/main.go#L102-L03)
+
+When a replica reloads its whole copy from Redis (after missing changes, after
+the map expired, or on `Sync`), it sends one notification for the reload.
+That notification is `EventReset` whenever the copy changed generation or
+skipped more than one change, because the entries that changed are not known;
+read the map again with `Map`, `Get`, or `Keys` to see the current content.
 
 > **Note:** Notifications do not include any information about the change that
 > triggered them. The application must query the map to retrieve the current
