@@ -58,7 +58,7 @@ type (
 		closed  bool // true if Close returned - used by tests
 
 		wlock   sync.Mutex
-		waiters map[uint64][]*setWaiter // keyed by committed revision
+		waiters map[uint64][]*revWaiter // keyed by committed revision
 	}
 
 	// EventKind is the type of map event.
@@ -77,9 +77,9 @@ type (
 		rev     uint64
 	}
 
-	// setWaiter tracks a SetAndWait call until the local replica observes at
-	// least the committed revision returned by the write.
-	setWaiter struct {
+	// revWaiter tracks a SetAndWait or Sync call until the local replica
+	// observes at least the committed revision it waits for.
+	revWaiter struct {
 		ch     chan struct{}
 		rev    uint64
 		ctx    context.Context // context for cancellation
@@ -142,7 +142,7 @@ func Join(ctx context.Context, name string, rdb *redis.Client, opts ...MapOption
 		logger:               o.Logger.WithPrefix("map", name),
 		rdb:                  rdb,
 		content:              make(map[string]string),
-		waiters:              make(map[uint64][]*setWaiter),
+		waiters:              make(map[uint64][]*revWaiter),
 		setScript:            luaSet,
 		testAndSetScript:     luaTestAndSet,
 		setIfNotExistsScript: luaSetIfNotExists,
@@ -295,32 +295,10 @@ func (sm *Map) SetAndWait(ctx context.Context, key, value string) (string, error
 	if err != nil {
 		return "", err
 	}
-
-	notifyCh := make(chan struct{}, 1)
-	waitCtx, cancel := context.WithCancel(ctx)
-	waiter := &setWaiter{
-		ch:     notifyCh,
-		rev:    res.rev,
-		ctx:    waitCtx,
-		cancel: cancel,
+	if err := sm.waitForRevision(ctx, res.rev); err != nil {
+		return "", err
 	}
-	defer func() {
-		cancel()
-		sm.removeWaiter(waiter)
-	}()
-	if sm.registerWaiter(waiter) {
-		return res.prev, nil
-	}
-
-	// Wait for notification or context cancellation
-	select {
-	case <-ctx.Done():
-		return "", ctx.Err()
-	case <-sm.done:
-		return "", fmt.Errorf("pulse map: %s is stopped", sm.Name)
-	case <-notifyCh:
-		return res.prev, nil
-	}
+	return res.prev, nil
 }
 
 // SetIfNotExists sets the value for key only if it doesn't exist.
@@ -1024,7 +1002,7 @@ func (sm *Map) runSetScript(ctx context.Context, key, value string) (setResult, 
 
 // registerWaiter installs a waiter unless the local replica has already caught
 // up to the committed revision it targets.
-func (sm *Map) registerWaiter(waiter *setWaiter) bool {
+func (sm *Map) registerWaiter(waiter *revWaiter) bool {
 	sm.wlock.Lock()
 	defer sm.wlock.Unlock()
 	sm.lock.RLock()
@@ -1036,8 +1014,9 @@ func (sm *Map) registerWaiter(waiter *setWaiter) bool {
 	return false
 }
 
-// removeWaiter unregisters a waiter after SetAndWait returns or is canceled.
-func (sm *Map) removeWaiter(waiter *setWaiter) {
+// removeWaiter unregisters a waiter after its SetAndWait or Sync call returns
+// or is canceled.
+func (sm *Map) removeWaiter(waiter *revWaiter) {
 	sm.wlock.Lock()
 	defer sm.wlock.Unlock()
 	waiters, ok := sm.waiters[waiter.rev]
@@ -1061,7 +1040,7 @@ func (sm *Map) removeWaiter(waiter *setWaiter) {
 // visible in the local replica.
 func (sm *Map) notifyWaitersUpTo(rev uint64) {
 	sm.wlock.Lock()
-	var ready []*setWaiter
+	var ready []*revWaiter
 	for waiterRev, waiters := range sm.waiters {
 		if waiterRev > rev {
 			continue

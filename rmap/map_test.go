@@ -908,13 +908,13 @@ func TestNotifyWaitersUpToReleasesCommittedWriteAfterOverwrite(t *testing.T) {
 	// Recovery must unblock a committed SetAndWait even when a later revision has
 	// already advanced the key to a different value. Revision-based waiting keeps
 	// the acknowledgement tied to the committed write rather than the final value.
-	sm := &Map{waiters: make(map[uint64][]*setWaiter)}
+	sm := &Map{waiters: make(map[uint64][]*revWaiter)}
 
 	waitCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	notifyCh := make(chan struct{}, 1)
-	sm.waiters[4] = []*setWaiter{{
+	sm.waiters[4] = []*revWaiter{{
 		ch:     notifyCh,
 		rev:    4,
 		ctx:    waitCtx,

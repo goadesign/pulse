@@ -85,6 +85,31 @@ boundaries.
 
 [![Replicated Map Read](../snippets/rmap-map.png)](../examples/rmap/basics/main.go#L98-100)
 
+#### Reading after writes made elsewhere
+
+`Get`, `GetValues`, `Keys`, `Len`, and `Map` read the replica's in-memory copy,
+so they cost no network call. Each replica applies changes as Redis
+broadcasts them, which means a write that has just completed through *another*
+process may not be in this copy yet. Two methods order reads after writes:
+
+* `SetAndWait` writes a value and returns once this replica has applied that
+  write (or a newer one), so the writer's own reads that follow see it.
+* `Sync` waits until this replica has applied every write that completed
+  before the call, wherever it was made. It reads the map's revision from Redis
+  once, then waits for the local copy to reach it. Call it before a read that
+  must reflect an earlier request handled by a different process:
+
+```go
+// The previous request saved the user's settings through another replica.
+if err := m.Sync(ctx); err != nil {
+    return err
+}
+settings, _ := m.Get("settings:" + userID) // includes that save
+```
+
+`Sync` does not lock the map: a write that is still in progress when it is
+called may or may not be included.
+
 ### Subscribing to Map Updates
 
 * The `Subscribe` method returns a channel that can be used to receive notifications
