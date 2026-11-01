@@ -151,6 +151,40 @@ func TestExpiredMapStartsNewGeneration(t *testing.T) {
 	assert.Equal(t, "v4", v)
 }
 
+// TestSyncAfterLegacyMapExpires loads a map written by an older Pulse (a plain
+// "=kind" with no generation), lets its hash expire in Redis before any new
+// write, and checks that Sync empties the copy and notifies a reset, even
+// though the empty snapshot's revision is lower than the copy's.
+func TestSyncAfterLegacyMapExpires(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	// Each test is bounded so a regression fails here instead of hanging.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	const name = "legacy"
+	hashkey := "map:" + name + ":content"
+	require.NoError(t, rdb.HSet(ctx, hashkey, "k", "v", revField, "1", kindField, "set").Err())
+	m, err := Join(ctx, name, rdb)
+	require.NoError(t, err)
+	defer cleanup(t, m)
+	v, ok := m.Get("k")
+	require.True(t, ok)
+	require.Equal(t, "v", v)
+	events := m.Subscribe()
+
+	require.NoError(t, rdb.PExpire(ctx, hashkey, 50*time.Millisecond).Err())
+	require.Eventually(t, func() bool { return rdb.Exists(ctx, hashkey).Val() == 0 }, wf, tck)
+	require.NoError(t, m.Sync(ctx))
+
+	_, ok = m.Get("k")
+	assert.False(t, ok, "Sync must empty a copy whose map expired")
+	select {
+	case ev := <-events:
+		assert.Equal(t, EventReset, ev)
+	default:
+		t.Fatal("Sync must notify subscribers that the copy was replaced")
+	}
+}
+
 // TestStaleGenerationChangeDoesNotResurrectExpiredData handles a queued
 // change from an expired generation after Sync has seen the map gone. The
 // replica must check Redis rather than adopt the change, so the expired value

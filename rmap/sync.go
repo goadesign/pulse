@@ -35,11 +35,14 @@ func (sm *Map) Sync(ctx context.Context) error {
 	return sm.refresh(ctx)
 }
 
-// refresh replaces the local copy with the map's current content in Redis when
-// that content is newer: another generation, or a higher revision of the same
-// one. It holds the map lock from before the Redis read until the copy is
-// replaced, so no published change can be applied in between and the copy
-// never moves back to an older state.
+// refresh replaces the local copy with the map's current content in Redis
+// unless the copy already holds exactly that generation and revision. It holds
+// the map lock from before the Redis read until the copy is replaced, so no
+// published change can be applied in between: every change the copy holds was
+// already in Redis when the snapshot was read, and the snapshot is never older
+// than the copy. A snapshot with a lower revision in the same generation means
+// the map's data is gone (for example a map written by an older Pulse, whose
+// hash carries no generation, that then expired), so it is applied too.
 func (sm *Map) refresh(ctx context.Context) error {
 	sm.lock.Lock()
 	defer sm.lock.Unlock()
@@ -51,13 +54,13 @@ func (sm *Map) refresh(ctx context.Context) error {
 		return fmt.Errorf("pulse map: %s failed to read content: %w", sm.Name, err)
 	}
 	rev, kind, gen := extractState(content)
-	if gen == sm.gen && rev <= sm.rev {
+	if gen == sm.gen && rev == sm.rev {
 		return nil
 	}
-	if gen != sm.gen || rev > sm.rev+1 {
+	if gen != sm.gen || rev != sm.rev+1 {
 		// The stored kind describes only the last change. When the copy moves
-		// to another generation or skips several changes, the content is
-		// replaced wholesale, which subscribers see as a reset.
+		// to another generation, skips several changes, or loses data, the
+		// content is replaced wholesale, which subscribers see as a reset.
 		kind = EventReset
 	}
 	sm.content, sm.rev, sm.gen = content, rev, gen
