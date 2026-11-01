@@ -3,6 +3,7 @@ package rmap
 import (
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"net"
 	"strings"
 	"sync/atomic"
@@ -150,6 +151,30 @@ func TestExpiredMapStartsNewGeneration(t *testing.T) {
 	assert.Equal(t, "v4", v)
 }
 
+// TestStaleGenerationChangeDoesNotResurrectExpiredData delivers a queued
+// change from an expired generation after Sync has seen the map gone. The
+// replica must check Redis rather than adopt the change, so the expired value
+// stays gone.
+func TestStaleGenerationChangeDoesNotResurrectExpiredData(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	// Each test is bounded so a regression fails here instead of hanging.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	m, err := Join(ctx, "test", rdb)
+	require.NoError(t, err)
+	defer cleanup(t, m)
+	require.NoError(t, rdb.Del(ctx, m.hashkey).Err())
+	require.NoError(t, m.Sync(ctx))
+	_, ok := m.Get("k")
+	require.False(t, ok)
+
+	stale := "set:" + packStrings("k", "expired", "1", "old-generation")
+	require.NoError(t, rdb.Publish(ctx, m.chankey, stale).Err())
+	time.Sleep(200 * time.Millisecond)
+	_, ok = m.Get("k")
+	assert.False(t, ok, "a change from an expired generation must not be applied")
+}
+
 // TestResubscribeReloadsMissedChanges drops a replica's Redis connections and
 // holds it disconnected while another replica writes, so the notifications
 // are lost. Once go-redis reconnects and resubscribes, the replica must reload
@@ -249,4 +274,15 @@ func killSubscriber(t *testing.T, rdb *redis.Client, name string) {
 	}
 	require.Len(t, ids, 1, "expected exactly one subscriber connection named %s", name)
 	require.NoError(t, rdb.Do(ctx, "CLIENT", "KILL", "ID", ids[0]).Err())
+}
+
+// packStrings encodes strings the way the replicated map's Lua scripts
+// publish them: each as a little-endian uint32 length followed by its bytes.
+func packStrings(values ...string) string {
+	var out []byte
+	for _, v := range values {
+		out = binary.LittleEndian.AppendUint32(out, uint32(len(v)))
+		out = append(out, v...)
+	}
+	return string(out)
 }

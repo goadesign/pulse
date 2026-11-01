@@ -42,6 +42,25 @@ generation it does not hold reloads the map from Redis, so no replica keeps
 serving the expired data once the map is written again. `Sync` also empties a
 replica's copy when it finds the map expired.
 
+### Upgrading and rolling back
+
+Every write stamps the map's Redis hash with a generation (`=gen`) and each
+published change carries it. Processes that share a replicated map, including
+the `pool` and `streaming` packages, which write map hashes from their own
+scripts, must all run a Pulse version with the same format:
+
+* **Upgrade every process together.** Stop every process that uses a given map,
+  deploy the new version everywhere, then start them. An older process cannot
+  decode the new change format, and if it loads the map it shows `=gen` as if
+  it were an entry.
+* **Rolling back your application** while keeping this Pulse version needs no
+  extra step.
+* **Downgrading Pulse** requires stopping every process that runs the newer
+  version first, then removing the generation field from each map before an
+  older version starts, for example `HDEL map:<name>:content =gen` (or
+  `Destroy` the map). Starting older processes alone is not enough, because the
+  field stays in Redis.
+
 ### Writing to the Map
 
 * The `Set` method sets the value for a given key and returns the previous value. 

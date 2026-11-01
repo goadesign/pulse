@@ -888,12 +888,10 @@ func (sm *Map) applyMessageLocked(op string, data []byte) (mapChange, bool, erro
 		return mapChange{}, false, nil
 	}
 	if c.gen != sm.gen {
-		// An empty copy with no generation can take the first change of a
-		// new generation directly: there is nothing earlier in it to miss.
-		if sm.gen != "" || len(sm.content) != 0 || c.rev != 1 {
-			return mapChange{}, false, errMissedChanges
-		}
-		sm.gen, sm.rev = c.gen, 0
+		// The payload cannot tell a new generation from a stale one (for
+		// example an old change still queued after the map expired), so only
+		// Redis can say which generation is current.
+		return mapChange{}, false, errMissedChanges
 	}
 	if c.rev <= sm.rev {
 		return mapChange{}, false, nil
@@ -969,25 +967,5 @@ func parseStoredKind(kind string) EventKind {
 		return EventReset
 	default:
 		return EventChange
-	}
-}
-
-func strongerEventKind(current, next EventKind) EventKind {
-	if eventPriority(next) > eventPriority(current) {
-		return next
-	}
-	return current
-}
-
-func eventPriority(kind EventKind) int {
-	switch kind {
-	case EventReset:
-		return 3
-	case EventDelete:
-		return 2
-	case EventChange:
-		return 1
-	default:
-		return 0
 	}
 }
