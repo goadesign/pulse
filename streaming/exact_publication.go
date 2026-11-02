@@ -206,7 +206,10 @@ return {generation, physical, deadline or "", effective_retention, 1, event_id}
 
 	// snapshotScript binds an unbound handle using the same zero-migration
 	// lifecycle contract, verifies a bound handle, and returns one XRANGE
-	// result at the operation's single Redis linearization point.
+	// result at the operation's single Redis linearization point. Only a bound
+	// handle (non-empty generation) is checked against a generation and
+	// physical key: an unbound handle carries the generation-1 key, which a
+	// stream destroyed and created again no longer uses.
 	snapshotScript = redis.NewScript(`
 local state = redis.call("HGET", KEYS[1], "state")
 local generation = redis.call("HGET", KEYS[1], "generation")
@@ -215,8 +218,7 @@ if not generation then
 end
 local physical = redis.call("HGET", KEYS[1], ARGV[4])
 local deadline = redis.call("HGET", KEYS[1], ARGV[5])
-if state ~= ARGV[1] or (ARGV[2] ~= "" and generation ~= ARGV[2])
-or (ARGV[3] ~= "" and physical ~= ARGV[3]) then
+if state ~= ARGV[1] or (ARGV[2] ~= "" and (generation ~= ARGV[2] or physical ~= ARGV[3])) then
     return redis.error_reply("STREAMDESTROYED")
 end
 local retention = redis.call("HGET", KEYS[1], ARGV[6])

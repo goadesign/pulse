@@ -495,6 +495,39 @@ func TestExactPublicationOptionValidation(t *testing.T) {
 	require.NoError(t, ttlStream.Destroy(ctx))
 }
 
+// TestSnapshotReadsRecreatedStreamFromNewHandle verifies that a new handle
+// reads a stream that was destroyed and created again, whose events live
+// under a generation-scoped key, and that a handle still bound to the
+// destroyed generation is rejected.
+func TestSnapshotReadsRecreatedStreamFromNewHandle(t *testing.T) {
+	rdb := ptesting.NewRedisClient(t)
+	defer ptesting.CleanupRedis(t, rdb, false, "")
+	ctx := ptesting.NewTestContext(t)
+	first, err := NewStream(t.Name(), rdb)
+	require.NoError(t, err)
+	_, err = first.Add(ctx, "old", []byte("one"))
+	require.NoError(t, err)
+	require.NoError(t, first.Destroy(ctx))
+
+	second, err := NewStream(t.Name(), rdb)
+	require.NoError(t, err)
+	_, err = second.Add(ctx, "new", []byte("two"))
+	require.NoError(t, err)
+	require.Equal(t, "2", second.Generation())
+
+	fresh, err := NewStream(t.Name(), rdb)
+	require.NoError(t, err)
+	events, err := fresh.Snapshot(ctx)
+	require.NoError(t, err)
+	require.Len(t, events, 1)
+	require.Equal(t, "new", events[0].EventName())
+	require.Equal(t, "2", fresh.Generation())
+
+	_, err = first.Snapshot(ctx)
+	require.ErrorIs(t, err, ErrStreamDestroyed)
+	require.NoError(t, second.Destroy(ctx))
+}
+
 func TestSnapshotDoesNotInitializeAbsentStream(t *testing.T) {
 	rdb := ptesting.NewRedisClient(t)
 	defer ptesting.CleanupRedis(t, rdb, false, "")
