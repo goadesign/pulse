@@ -52,6 +52,7 @@ func TestRecoveredStartPreservesOwnershipAndScheduleProgress(t *testing.T) {
 		NodeID:    node.ID,
 		Requeued:  true,
 	}
+	require.NoError(t, node.setPoolMap(ctx, node.resources.jobPayloads, job.Key, string(job.Payload)))
 
 	// Both deliveries use the real recovery stream and acknowledgement path.
 	// Waiting for deletion of each pool event proves the worker handled it.
@@ -121,6 +122,7 @@ func TestRecoveredStartRejectsConflictingPayloadWithoutChangingOwnership(t *test
 	worker, err := node.AddWorker(ctx, handler)
 	require.NoError(t, err)
 	job := &Job{Key: "source", Payload: []byte("accepted"), NodeID: node.ID, Requeued: true}
+	require.NoError(t, node.setPoolMap(ctx, node.resources.jobPayloads, job.Key, string(job.Payload)))
 	require.NoError(t, worker.startJob(ctx, job))
 
 	conflict := *job
@@ -134,6 +136,7 @@ func TestRecoveredStartRejectsConflictingPayloadWithoutChangingOwnership(t *test
 
 	// Stopping the accepted job makes its key reusable for a new payload.
 	require.NoError(t, worker.stopJob(ctx, job.Key))
+	conflict.Requeued = false
 	require.NoError(t, worker.startJob(ctx, &conflict))
 	assert.EqualValues(t, 2, handler.attempts.Load())
 	payload, exists = snapshotValue(t, ctx, node, node.jobPayloadMap, job.Key)
@@ -208,6 +211,7 @@ func TestConcurrentRecoveredStartsEnterHandlerOnce(t *testing.T) {
 	handler := &exclusiveJobHandler{}
 	worker, err := node.AddWorker(ctx, handler)
 	require.NoError(t, err)
+	require.NoError(t, node.setPoolMap(ctx, node.resources.jobPayloads, "source", "accepted"))
 	ready := make(chan struct{})
 	results := make(chan error, 8)
 	for range cap(results) {
@@ -243,6 +247,7 @@ func TestAcceptedRecoveryRestoresMissingOwnershipWithoutRestart(t *testing.T) {
 			worker, err := node.AddWorker(ctx, handler)
 			require.NoError(t, err)
 			job := &Job{Key: "source", Payload: []byte("accepted"), NodeID: node.ID, Requeued: true}
+			require.NoError(t, node.setPoolMap(ctx, node.resources.jobPayloads, job.Key, string(job.Payload)))
 			require.NoError(t, worker.startJob(ctx, job))
 			if missing != "payload" {
 				require.NoError(t, node.removePoolMapValue(ctx, node.resources.jobs, worker.ID, job.Key))
@@ -282,6 +287,7 @@ func TestAcceptedRecoveryNeverOverwritesConflictingOwnership(t *testing.T) {
 			worker, err := node.AddWorker(ctx, handler)
 			require.NoError(t, err)
 			job := &Job{Key: "source", Payload: []byte("accepted"), NodeID: node.ID, Requeued: true}
+			require.NoError(t, node.setPoolMap(ctx, node.resources.jobPayloads, job.Key, string(job.Payload)))
 			require.NoError(t, worker.startJob(ctx, job))
 			require.NoError(t, node.removePoolMapValue(ctx, node.resources.jobs, worker.ID, job.Key))
 			replay := *job

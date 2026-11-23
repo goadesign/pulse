@@ -41,7 +41,8 @@ or redis.call("HGET", KEYS[1], "generation") ~= ARGV[2] then
 end
 local registration = redis.call("HGET", KEYS[4], ARGV[3])
 if not registration or registration == "-"
-or redis.call("HGET", KEYS[3], ARGV[3]) then
+or redis.call("HGET", KEYS[3], ARGV[3])
+or redis.call("HGET", KEYS[3], ARGV[4]) then
     return redis.error_reply("WORKERCLEANUPLOST")
 end
 local clock = redis.call("TIME")
@@ -130,8 +131,10 @@ return 1
 `)
 
 	// publishWorkerRequeueScript atomically fences and deduplicates one stale
-	// worker/job handoff before appending it to the pool stream.
-	publishWorkerRequeueScript = redis.NewScript(`
+	// worker/job handoff, removes the stale worker's ownership of that job key,
+	// and appends the requeued start event to the pool stream so surviving
+	// workers can claim it immediately without waiting for sibling jobs.
+	publishWorkerRequeueScript = rmapwire.NewScript(`
 if redis.call("HGET", KEYS[1], "state") ~= ARGV[1]
 or redis.call("HGET", KEYS[1], "generation") ~= ARGV[2] then
     return redis.error_reply("POOLGENERATIONLOST")
@@ -158,10 +161,12 @@ if not ok or type(jobs) ~= "table" then
     return redis.error_reply("POOLMAPINVALID")
 end
 local owned = false
+local remaining = {}
 for _, job in ipairs(jobs) do
     if job == ARGV[7] then
         owned = true
-        break
+    else
+        table.insert(remaining, job)
     end
 end
 if not owned then
@@ -176,6 +181,14 @@ if not stream then
 end
 local event_id = redis.call("XADD", stream, "*", "n", ARGV[8], "p", ARGV[10])
 redis.call("HSET", KEYS[2], ARGV[9], event_id)
+if #remaining == 0 then
+    redis.call("HDEL", KEYS[4], ARGV[3])
+    publishDel(KEYS[4], KEYS[6], ARGV[3])
+else
+    local update = cjson.encode(remaining)
+    redis.call("HSET", KEYS[4], ARGV[3], update)
+    publishSet(KEYS[4], KEYS[6], ARGV[3], update)
+end
 return {1, event_id}
 `)
 
@@ -391,6 +404,7 @@ func (node *Node) updateWorkerHeartbeat(ctx context.Context, workerID string) (s
 		"active",
 		node.resources.generation,
 		workerID,
+		workerCleanupFenceField(workerID),
 	).Text()
 	return timestamp, poolBoundaryError(err)
 }
@@ -427,6 +441,7 @@ func (node *Node) publishWorkerRequeue(
 			rmapUpdateChannel(node.resources.workerCleanup),
 			rmapContentKey(node.resources.jobs),
 			rmapContentKey(node.resources.jobPayloads),
+			rmapUpdateChannel(node.resources.jobs),
 		},
 		"active",
 		node.resources.generation,

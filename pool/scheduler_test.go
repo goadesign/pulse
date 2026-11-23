@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/oklog/ulid/v2"
+	redis "github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -449,6 +450,399 @@ func TestSchedulerKeepsOwnershipWhenItsOwnJobStillRuns(t *testing.T) {
 	require.Len(t, worker.Jobs(), 1)
 	require.NoError(t, sched.clearJobs(ctx, fence))
 	require.NoError(t, node.Shutdown(ctx))
+}
+
+func TestStopJobSurvivesWorkerOutagePastPendingEventTTL(t *testing.T) {
+	originalTTL := pendingEventTTL
+	pendingEventTTL = 40 * time.Millisecond
+	t.Cleanup(func() {
+		pendingEventTTL = originalTTL
+	})
+
+	newFastRecoveryNode := func(t *testing.T, ctx context.Context, rdb *redis.Client, name string) *Node {
+		t.Helper()
+		node, err := AddNode(
+			ctx,
+			name,
+			rdb,
+			WithRequeueTimeout(testFastRequeueTimeout),
+			WithJobSinkBlockDuration(20*time.Millisecond),
+			WithWorkerTTL(200*time.Millisecond),
+			WithDispatchTimeout(2*testAckGracePeriod),
+			WithRecoveryGrace(100*time.Millisecond),
+		)
+		require.NoError(t, err)
+		return node
+	}
+
+	t.Run("scheduled stop during worker outage stops requeued job after recovery", func(t *testing.T) {
+		rdb := ptesting.NewRedisClient(t)
+		defer ptesting.CleanupRedis(t, rdb, false, "")
+		ctx := ptesting.NewTestContext(t)
+		node := newFastRecoveryNode(t, ctx, rdb, ulid.Make().String())
+		defer func() {
+			assert.NoError(t, node.Shutdown(ctx))
+		}()
+
+		firstWorker := newTestWorker(t, ctx, node)
+		producer := newTestProducer("schedule", func() (*JobPlan, error) {
+			return &JobPlan{}, nil
+		})
+		encodedName := hex.EncodeToString([]byte(producer.Name()))
+		sched := &scheduler{
+			name:             node.PoolName + ":schedule",
+			interval:         20 * time.Millisecond,
+			producer:         producer,
+			node:             node,
+			keyPrefix:        encodedName + ":",
+			transitionPrefix: "=transition:" + encodedName + ":",
+			owner:            "test-" + ulid.Make().String(),
+			lease:            node.workerTTL,
+			logger:           node.logger,
+		}
+		fence := claimTestSchedulerTransition(t, ctx, sched)
+		const jobKey = "retired-during-outage"
+		require.NoError(t, sched.startJobs(ctx, fence, []*JobParam{{Key: jobKey, Payload: []byte("scheduled")}}))
+		require.Eventually(t, func() bool {
+			return len(firstWorker.Jobs()) == 1
+		}, time.Second, time.Millisecond)
+
+		// Remove the sole worker so the job is requeued with no active worker
+		// available, then retire the job from the schedule and wait past
+		// pendingEventTTL (40ms), orphaned-payload grace (2*workerTTL = 400ms),
+		// and one 500ms sink idle-reclaim pass before adding a replacement worker.
+		require.NoError(t, node.RemoveWorker(ctx, firstWorker))
+		require.Empty(t, node.activeWorkers())
+		require.NoError(t, sched.stopJobs(ctx, fence, &JobPlan{StopAll: true}))
+		require.NoError(t, sched.releaseTransition(ctx, fence))
+
+		node.requeueOrphanedPayloads(ctx)
+		time.Sleep(600 * time.Millisecond)
+		node.requeueOrphanedPayloads(ctx)
+
+		replacement := newTestWorker(t, ctx, node)
+		streamKey := generationStreamKey(ctx, rdb, node.poolStream.Name)
+		payloadHash := rmapContentKey(node.resources.jobPayloads)
+		pendingHash := rmapContentKey(node.resources.jobPending)
+		require.Eventually(t, func() bool {
+			_, hasPayload := node.JobPayload(jobKey)
+			payloadExists, payloadErr := rdb.HExists(ctx, payloadHash, jobKey).Result()
+			pendingExists, pendingErr := rdb.HExists(ctx, pendingHash, jobKey).Result()
+			length, lenErr := rdb.XLen(ctx, streamKey).Result()
+			return payloadErr == nil &&
+				pendingErr == nil &&
+				lenErr == nil &&
+				!payloadExists &&
+				!pendingExists &&
+				length == 0 &&
+				!hasPayload &&
+				len(replacement.Jobs()) == 0
+		}, 3*time.Second, 10*time.Millisecond)
+		assert.Empty(t, snapshotJobOwners(t, ctx, node, jobKey))
+	})
+
+	t.Run("stop requested for pending dispatch before worker joins stops job after recovery", func(t *testing.T) {
+		rdb := ptesting.NewRedisClient(t)
+		defer ptesting.CleanupRedis(t, rdb, false, "")
+		ctx := ptesting.NewTestContext(t)
+		node := newFastRecoveryNode(t, ctx, rdb, ulid.Make().String())
+		defer func() {
+			assert.NoError(t, node.Shutdown(ctx))
+		}()
+
+		const jobKey = "pending-dispatch-stop"
+		job := &Job{
+			Key:        jobKey,
+			Payload:    []byte("pending"),
+			CreatedAt:  time.Now(),
+			NodeID:     node.ID,
+			dispatchID: "dispatch-pending-stop",
+		}
+		_, err := node.publishDispatch(ctx, jobKey, job.dispatchID, marshalJob(job))
+		require.NoError(t, err)
+		require.NoError(t, node.StopJob(ctx, jobKey))
+
+		time.Sleep(600 * time.Millisecond)
+
+		worker := newTestWorker(t, ctx, node)
+		streamKey := generationStreamKey(ctx, rdb, node.poolStream.Name)
+		payloadHash := rmapContentKey(node.resources.jobPayloads)
+		pendingHash := rmapContentKey(node.resources.jobPending)
+		require.Eventually(t, func() bool {
+			_, hasPayload := node.JobPayload(jobKey)
+			payloadExists, payloadErr := rdb.HExists(ctx, payloadHash, jobKey).Result()
+			pendingExists, pendingErr := rdb.HExists(ctx, pendingHash, jobKey).Result()
+			length, lenErr := rdb.XLen(ctx, streamKey).Result()
+			return payloadErr == nil &&
+				pendingErr == nil &&
+				lenErr == nil &&
+				!payloadExists &&
+				!pendingExists &&
+				length == 0 &&
+				!hasPayload &&
+				len(worker.Jobs()) == 0
+		}, 3*time.Second, 10*time.Millisecond)
+		assert.Empty(t, snapshotJobOwners(t, ctx, node, jobKey))
+	})
+
+	t.Run("stop for missing or failed-start job settles without leaking stream entries", func(t *testing.T) {
+		rdb := ptesting.NewRedisClient(t)
+		defer ptesting.CleanupRedis(t, rdb, false, "")
+		ctx := ptesting.NewTestContext(t)
+		node := newFastRecoveryNode(t, ctx, rdb, ulid.Make().String())
+		defer func() {
+			assert.NoError(t, node.Shutdown(ctx))
+		}()
+
+		streamKey := generationStreamKey(ctx, rdb, node.poolStream.Name)
+		require.NoError(t, node.StopJob(ctx, "missing-job"))
+		require.Eventually(t, func() bool {
+			length, err := rdb.XLen(ctx, streamKey).Result()
+			return err == nil && length == 0
+		}, time.Second, 10*time.Millisecond)
+
+		const failedKey = "failed-pending-stop"
+		job := &Job{
+			Key:        failedKey,
+			Payload:    []byte("fail"),
+			CreatedAt:  time.Now(),
+			NodeID:     node.ID,
+			dispatchID: "dispatch-failed-stop",
+		}
+		_, err := node.publishDispatch(ctx, failedKey, job.dispatchID, marshalJob(job))
+		require.NoError(t, err)
+		require.NoError(t, node.StopJob(ctx, failedKey))
+
+		time.Sleep(600 * time.Millisecond)
+
+		handler := newMockHandler()
+		handler.startFunc = func(*Job) error {
+			return errors.New("start failed")
+		}
+		worker, err := node.AddWorker(ctx, handler)
+		require.NoError(t, err)
+
+		payloadHash := rmapContentKey(node.resources.jobPayloads)
+		pendingHash := rmapContentKey(node.resources.jobPending)
+		require.Eventually(t, func() bool {
+			payloadExists, payloadErr := rdb.HExists(ctx, payloadHash, failedKey).Result()
+			pendingExists, pendingErr := rdb.HExists(ctx, pendingHash, failedKey).Result()
+			length, lenErr := rdb.XLen(ctx, streamKey).Result()
+			return payloadErr == nil &&
+				pendingErr == nil &&
+				lenErr == nil &&
+				!payloadExists &&
+				!pendingExists &&
+				length == 0 &&
+				len(worker.Jobs()) == 0
+		}, 3*time.Second, 10*time.Millisecond)
+		assert.Empty(t, snapshotJobOwners(t, ctx, node, failedKey))
+	})
+
+	t.Run("trailing requeued start behind stop does not resurrect stopped job", func(t *testing.T) {
+		rdb := ptesting.NewRedisClient(t)
+		defer ptesting.CleanupRedis(t, rdb, false, "")
+		ctx := ptesting.NewTestContext(t)
+		node := newFastRecoveryNode(t, ctx, rdb, ulid.Make().String())
+		defer func() {
+			assert.NoError(t, node.Shutdown(ctx))
+		}()
+
+		worker := newTestWorker(t, ctx, node)
+		const jobKey = "trailing-requeue-after-stop"
+		require.NoError(t, node.DispatchJob(ctx, jobKey, []byte("payload")))
+		require.Eventually(t, func() bool {
+			return len(worker.Jobs()) == 1
+		}, time.Second, time.Millisecond)
+
+		require.NoError(t, node.StopJob(ctx, jobKey))
+		trailingRequeue := &Job{
+			Key:       jobKey,
+			Payload:   []byte("payload"),
+			CreatedAt: time.Now(),
+			NodeID:    node.ID,
+			Requeued:  true,
+		}
+		_, err := node.poolStream.Add(ctx, evStartJob, marshalJob(trailingRequeue))
+		require.NoError(t, err)
+
+		streamKey := generationStreamKey(ctx, rdb, node.poolStream.Name)
+		payloadHash := rmapContentKey(node.resources.jobPayloads)
+		require.Eventually(t, func() bool {
+			payloadExists, payloadErr := rdb.HExists(ctx, payloadHash, jobKey).Result()
+			length, lenErr := rdb.XLen(ctx, streamKey).Result()
+			return payloadErr == nil && lenErr == nil && !payloadExists && length == 0 && len(worker.Jobs()) == 0
+		}, 3*time.Second, 10*time.Millisecond)
+		assert.Empty(t, snapshotJobOwners(t, ctx, node, jobKey))
+	})
+
+	t.Run("stop settles delayed exact dispatch and retries cleanup without repeating handler stop", func(t *testing.T) {
+		rdb := ptesting.NewRedisClient(t)
+		defer ptesting.CleanupRedis(t, rdb, false, "")
+		ctx := ptesting.NewTestContext(t)
+		hook := &settlementFailureHook{
+			attempted:  make(chan struct{}),
+			err:        errors.New("transient settlement failure"),
+			scriptHash: luaSettleDispatch.Hash(),
+		}
+		cleanupHook := &poolRedisHook{
+			startCleanupSHA: cleanupFailedStartScript.Hash(),
+			failure:         errors.New("transient stop cleanup failure"),
+		}
+		rdb.AddHook(hook)
+		rdb.AddHook(cleanupHook)
+		node := newFastRecoveryNode(t, ctx, rdb, ulid.Make().String())
+		defer func() {
+			assert.NoError(t, node.Shutdown(ctx))
+		}()
+		defer hook.fail.Store(false)
+		defer cleanupHook.failStartCleanup.Store(false)
+
+		var stopCalls atomic.Int32
+		var failFirstStop atomic.Bool
+		failFirstStop.Store(true)
+		var stoppedOnce sync.Once
+		stoppedCh := make(chan struct{})
+		handler := newMockHandler()
+		handler.stopFunc = func(string) error {
+			stopCalls.Add(1)
+			if failFirstStop.CompareAndSwap(true, false) {
+				return errors.New("transient handler stop error")
+			}
+			stoppedOnce.Do(func() {
+				close(stoppedCh)
+			})
+			return nil
+		}
+		worker, err := node.AddWorker(ctx, handler)
+		require.NoError(t, err)
+		hook.fail.Store(true)
+
+		const jobKey = "stop-before-settlement"
+		job := &Job{
+			Key:        jobKey,
+			Payload:    []byte("payload"),
+			CreatedAt:  time.Now(),
+			NodeID:     node.ID,
+			dispatchID: "dispatch-stop-before-settlement",
+		}
+		_, err = node.publishDispatch(ctx, jobKey, job.dispatchID, marshalJob(job))
+		require.NoError(t, err)
+
+		select {
+		case <-hook.attempted:
+		case <-time.After(2 * time.Second):
+			t.Fatal("worker did not attempt initial settlement")
+		}
+
+		payloadHash := rmapContentKey(node.resources.jobPayloads)
+		pendingHash := rmapContentKey(node.resources.jobPending)
+		require.NoError(t, node.StopJob(ctx, jobKey))
+
+		// Wait until handler.Stop fails once and succeeds on retry while
+		// luaSettleDispatch is still blocked; neither jobPending nor jobPayloads
+		// may be deleted before dispatch settlement succeeds.
+		select {
+		case <-stoppedCh:
+		case <-time.After(2 * time.Second):
+			t.Fatal("worker did not complete handler.Stop retry")
+		}
+		assert.EqualValues(t, 2, stopCalls.Load())
+		payloadExists, err := rdb.HExists(ctx, payloadHash, jobKey).Result()
+		require.NoError(t, err)
+		assert.True(t, payloadExists)
+		pendingExists, err := rdb.HExists(ctx, pendingHash, jobKey).Result()
+		require.NoError(t, err)
+		assert.True(t, pendingExists)
+
+		// Fail cleanupFailedStart across at least two stopJob attempts once
+		// settlement unblocks, proving stopJob settles jobPending and retries
+		// durable cleanup without invoking handler.Stop again.
+		cleanupHook.failStartCleanup.Store(true)
+		hook.fail.Store(false)
+		require.Eventually(t, func() bool {
+			return cleanupHook.startCleanupAttempts.Load() >= 2
+		}, 2*time.Second, 10*time.Millisecond)
+		assert.EqualValues(t, 2, stopCalls.Load())
+		payloadExists, err = rdb.HExists(ctx, payloadHash, jobKey).Result()
+		require.NoError(t, err)
+		assert.True(t, payloadExists)
+		pendingExists, err = rdb.HExists(ctx, pendingHash, jobKey).Result()
+		require.NoError(t, err)
+		assert.False(t, pendingExists)
+
+		cleanupHook.failStartCleanup.Store(false)
+		streamKey := generationStreamKey(ctx, rdb, node.poolStream.Name)
+		require.Eventually(t, func() bool {
+			payloadExists, payloadErr := rdb.HExists(ctx, payloadHash, jobKey).Result()
+			pendingExists, pendingErr := rdb.HExists(ctx, pendingHash, jobKey).Result()
+			length, lenErr := rdb.XLen(ctx, streamKey).Result()
+			return payloadErr == nil &&
+				pendingErr == nil &&
+				lenErr == nil &&
+				!payloadExists &&
+				!pendingExists &&
+				length == 0 &&
+				len(worker.Jobs()) == 0
+		}, 3*time.Second, 10*time.Millisecond)
+		assert.EqualValues(t, 2, stopCalls.Load())
+		assert.Empty(t, snapshotJobOwners(t, ctx, node, jobKey))
+	})
+
+	t.Run("multi-job worker removal hands off requeued jobs without recoveryGrace stall", func(t *testing.T) {
+		rdb := ptesting.NewRedisClient(t)
+		defer ptesting.CleanupRedis(t, rdb, false, "")
+		ctx := ptesting.NewTestContext(t)
+		node, err := AddNode(
+			ctx,
+			ulid.Make().String(),
+			rdb,
+			WithRequeueTimeout(testFastRequeueTimeout),
+			WithJobSinkBlockDuration(20*time.Millisecond),
+			WithWorkerTTL(500*time.Millisecond),
+			WithDispatchTimeout(2*testAckGracePeriod),
+			WithRecoveryGrace(5*time.Second),
+		)
+		require.NoError(t, err)
+		defer func() {
+			assert.NoError(t, node.Shutdown(ctx))
+		}()
+
+		firstWorker := newTestWorker(t, ctx, node)
+		require.NoError(t, node.DispatchJob(ctx, "handoff-job-1", []byte("one")))
+		require.NoError(t, node.DispatchJob(ctx, "handoff-job-2", []byte("two")))
+		require.Eventually(t, func() bool {
+			return len(firstWorker.Jobs()) == 2
+		}, time.Second, time.Millisecond)
+
+		secondWorker := newTestWorker(t, ctx, node)
+		require.NoError(t, node.RemoveWorker(ctx, firstWorker))
+		require.Eventually(t, func() bool {
+			return len(secondWorker.Jobs()) == 2
+		}, time.Second, 10*time.Millisecond)
+	})
+
+	t.Run("transient notification and message still expire after pendingEventTTL", func(t *testing.T) {
+		rdb := ptesting.NewRedisClient(t)
+		defer ptesting.CleanupRedis(t, rdb, false, "")
+		ctx := ptesting.NewTestContext(t)
+		node := newFastRecoveryNode(t, ctx, rdb, ulid.Make().String())
+		defer func() {
+			assert.NoError(t, node.Shutdown(ctx))
+		}()
+
+		const jobKey = "transient-notify"
+		_, err := node.jobPayloadMap.SetAndWait(ctx, jobKey, "payload")
+		require.NoError(t, err)
+		require.NoError(t, node.NotifyWorker(ctx, jobKey, []byte("ping")))
+		require.NoError(t, node.DispatchMessage(ctx, jobKey, []byte("msg")))
+
+		streamKey := generationStreamKey(ctx, rdb, node.poolStream.Name)
+		require.Eventually(t, func() bool {
+			length, err := rdb.XLen(ctx, streamKey).Result()
+			return err == nil && length == 0
+		}, 2*time.Second, 10*time.Millisecond)
+	})
 }
 
 type testProducer struct {
