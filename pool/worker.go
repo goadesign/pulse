@@ -76,6 +76,9 @@ type (
 		// dispatchID correlates an admitted dispatch before its event is
 		// published. It is intentionally not part of the public job contract.
 		dispatchID string
+		// stopped marks a job whose local handler has already stopped while
+		// durable stop settlement and map cleanup are completing.
+		stopped bool
 	}
 
 	// JobHandler starts and stops jobs owned by a worker.
@@ -226,6 +229,9 @@ func (w *Worker) Jobs() []*Job {
 			continue
 		}
 		job := j.(*Job)
+		if job.stopped {
+			continue
+		}
 		jobs = append(jobs, &Job{
 			Key:       key,
 			Payload:   job.Payload,
@@ -304,6 +310,7 @@ func (w *Worker) handleEvents(ctx context.Context, c <-chan *streaming.Event) {
 				err = fmt.Errorf("unknown worker event %q", ev.EventName)
 			}
 			if redis.HasErrorPrefix(err, "WORKERCLEANUPLOST") {
+				w.stopIntake()
 				return
 			}
 			w.completeEvent(ctx, nodeID, ev, dispatched, err, w.ackPoolEvent, w.node.ownDispatchSettlement)
@@ -383,8 +390,12 @@ func (w *Worker) stopLocal() error {
 	w.jobsLock.Lock()
 	defer w.jobsLock.Unlock()
 	var stopErr error
-	w.jobs.Range(func(key, _ any) bool {
+	w.jobs.Range(func(key, value any) bool {
 		jobKey := key.(string)
+		if value.(*Job).stopped {
+			w.jobs.Delete(jobKey)
+			return true
+		}
 		if err := w.handler.Stop(jobKey); err != nil {
 			stopErr = errors.Join(stopErr, fmt.Errorf("failed to stop job %q: %w", jobKey, err))
 			return true
@@ -449,7 +460,11 @@ func (w *Worker) startJobLocked(ctx context.Context, job *Job) error {
 		return err
 	}
 	if value, ok := w.jobs.Load(job.Key); ok {
-		return w.acceptRunningJob(ctx, value.(*Job), job)
+		existing := value.(*Job)
+		if existing.stopped {
+			return ErrRequeue
+		}
+		return w.acceptRunningJob(ctx, existing, job)
 	}
 	if job.dispatchID != "" {
 		claimed, err := w.claimDispatchedStart(ctx, job)
@@ -463,6 +478,14 @@ func (w *Worker) startJobLocked(ctx context.Context, job *Job) error {
 		}
 		if !claimed {
 			return ErrRequeue
+		}
+	} else if job.Requeued {
+		claimed, err := w.claimRequeuedStart(ctx, job)
+		if err != nil {
+			return err
+		}
+		if !claimed {
+			return nil
 		}
 	} else {
 		if err := w.node.appendPoolMapValue(ctx, w.node.resources.jobs, w.ID, job.Key); err != nil {
@@ -570,9 +593,51 @@ func (w *Worker) claimDispatchedStart(ctx context.Context, job *Job) (bool, erro
 	return result == 1, nil
 }
 
+// claimRequeuedStart atomically binds this worker to an existing saved payload
+// for a Requeued: true delivery, returning (false, nil) when the job payload
+// was already deleted by stopJob or failed-start cleanup.
+func (w *Worker) claimRequeuedStart(ctx context.Context, job *Job) (bool, error) {
+	result, err := claimRequeuedStartScript.Run(
+		ctx,
+		w.node.rdb,
+		[]string{
+			fmt.Sprintf("pulse:stream:%s:lifecycle", w.node.poolStream.Name),
+			rmapContentKey(w.node.resources.jobPayloads),
+			rmapContentKey(w.node.resources.jobPending),
+			rmapContentKey(w.node.resources.jobs),
+			rmapUpdateChannel(w.node.resources.jobs),
+			rmapContentKey(w.node.resources.workers),
+			rmapContentKey(w.node.resources.workerCleanup),
+			rmapContentKey(w.node.resources.nodeKeepAlive),
+		},
+		w.node.resources.generation,
+		"active",
+		job.Key,
+		w.ID,
+		job.Payload,
+		workerCleanupFenceField(w.ID),
+		w.node.ID,
+		nodeCleanupField(w.node.ID),
+	).Int64()
+	if err != nil {
+		if redis.HasErrorPrefix(err, "JOBPAYLOADCONFLICT") {
+			return false, fmt.Errorf("%w: job %q has a different payload", ErrJobExists, job.Key)
+		}
+		if redis.HasErrorPrefix(err, "WORKERCLEANUPLOST") {
+			return false, err
+		}
+		return false, errors.Join(ErrRequeue, fmt.Errorf("claim requeued start for job %q: %w", job.Key, poolBoundaryError(err)))
+	}
+	if result == 2 {
+		return false, ErrRequeue
+	}
+	return result == 1, nil
+}
+
 // cleanupFailedStart atomically removes durable ownership and payload under the
-// exact pool-stream generation. Callers must retry the event while this recipe
-// fails and may report terminal handler failure only after it succeeds.
+// exact pool, node, and worker liveness fences. Callers must retry the event
+// while this recipe fails and may report terminal handler failure or acknowledge
+// stop only after it succeeds.
 func (w *Worker) cleanupFailedStart(ctx context.Context, key string) error {
 	err := cleanupFailedStartScript.Run(
 		ctx,
@@ -583,14 +648,23 @@ func (w *Worker) cleanupFailedStart(ctx context.Context, key string) error {
 			rmapUpdateChannel(w.node.resources.jobs),
 			rmapContentKey(w.node.resources.jobPayloads),
 			rmapUpdateChannel(w.node.resources.jobPayloads),
+			rmapContentKey(w.node.resources.workers),
+			rmapContentKey(w.node.resources.workerCleanup),
+			rmapContentKey(w.node.resources.nodeKeepAlive),
 		},
 		w.node.resources.generation,
 		w.ID,
 		key,
 		"active",
+		workerCleanupFenceField(w.ID),
+		w.node.ID,
+		nodeCleanupField(w.node.ID),
 	).Err()
 	if err != nil {
-		return fmt.Errorf("clean failed start for job %q: %w", key, err)
+		if redis.HasErrorPrefix(err, "WORKERCLEANUPLOST") {
+			return err
+		}
+		return fmt.Errorf("clean failed start for job %q: %w", key, poolBoundaryError(err))
 	}
 	return nil
 }
@@ -614,19 +688,60 @@ func (w *Worker) markDispatchSettled(key, dispatchID string) {
 	w.jobs.Store(key, &settled)
 }
 
-// stopJob stops a job.
+// stopJob stops local execution, settles any pending exact-dispatch record so a
+// redelivered start cannot re-claim the stopped job, and atomically removes
+// durable worker ownership and job payload before acknowledging evStopJob.
 func (w *Worker) stopJob(ctx context.Context, key string) error {
 	w.jobsLock.Lock()
 	defer w.jobsLock.Unlock()
-	if err := w.releaseJob(ctx, key); err != nil {
-		if errors.Is(err, errJobNotOwned) {
-			return ErrRequeue
+
+	if w.IsStopped() {
+		return fmt.Errorf("%w: worker %q stopped before stopping job %q", ErrRequeue, w.ID, key)
+	}
+	if err := w.refreshHeartbeat(ctx); err != nil {
+		if redis.HasErrorPrefix(err, "WORKERCLEANUPLOST") {
+			return err
 		}
-		return err
+		return errors.Join(ErrRequeue, err)
 	}
-	if err := w.node.deletePoolMap(ctx, w.node.resources.jobPayloads, key); err != nil {
-		w.logger.Error(fmt.Errorf("stop job: failed to remove job payload %q from job payloads map: %w", key, err))
+	value, ok := w.jobs.Load(key)
+	if !ok {
+		return ErrRequeue
 	}
+	running := value.(*Job)
+	if err := w.node.ensureGenerationActive(ctx); err != nil {
+		return errors.Join(ErrRequeue, err)
+	}
+	if !running.stopped {
+		if err := w.handler.Stop(key); err != nil {
+			return errors.Join(ErrRequeue, fmt.Errorf("failed to stop job %q: %w", key, err))
+		}
+		stopped := *running
+		stopped.stopped = true
+		w.jobs.Store(key, &stopped)
+		running = &stopped
+		if err := w.refreshHeartbeat(ctx); err != nil {
+			if redis.HasErrorPrefix(err, "WORKERCLEANUPLOST") {
+				return err
+			}
+			return errors.Join(ErrRequeue, err)
+		}
+	}
+	if running.dispatchID != "" {
+		if _, err := w.node.settleDispatch(ctx, key, running.dispatchID, nil); err != nil {
+			return errors.Join(ErrRequeue, err)
+		}
+		settled := *running
+		settled.dispatchID = ""
+		w.jobs.Store(key, &settled)
+	}
+	if err := w.cleanupFailedStart(ctx, key); err != nil {
+		if redis.HasErrorPrefix(err, "WORKERCLEANUPLOST") {
+			return err
+		}
+		return errors.Join(ErrRequeue, err)
+	}
+	w.jobs.Delete(key)
 	w.logger.Info("stopped job", "job", key)
 	return nil
 }
@@ -658,7 +773,8 @@ func (w *Worker) notify(_ context.Context, key string, payload []byte) error {
 		w.logger.Debug("worker stopped, ignoring notification")
 		return nil
 	}
-	if _, ok := w.jobs.Load(key); !ok {
+	value, ok := w.jobs.Load(key)
+	if !ok || value.(*Job).stopped {
 		return ErrRequeue
 	}
 	nh, ok := w.handler.(NotificationHandler)
@@ -771,7 +887,7 @@ func (w *Worker) rebalance(ctx context.Context, activeWorkers []string) {
 	rebalanced := make(map[string]*Job)
 	w.jobs.Range(func(key, value any) bool {
 		job := value.(*Job)
-		if job.dispatchID != "" {
+		if job.dispatchID != "" || job.stopped {
 			return true
 		}
 		wid := activeWorkers[w.node.h.Hash(job.Key, int64(len(activeWorkers)))]

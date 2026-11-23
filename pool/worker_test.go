@@ -147,6 +147,7 @@ func TestWorkerStartFailurePayloadOwnership(t *testing.T) {
 	assert.False(t, ok)
 	assert.Empty(t, snapshotJobOwners(t, ctx, node, "new-job"))
 
+	require.NoError(t, node.setPoolMap(ctx, node.resources.jobPayloads, "requeued-job", "requeued payload"))
 	err = worker.startJob(ctx, &Job{
 		Key:       "requeued-job",
 		Payload:   []byte("requeued payload"),

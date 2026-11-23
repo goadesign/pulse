@@ -35,6 +35,7 @@ type poolRedisHook struct {
 	failDetach           atomic.Bool
 	failNodeInit         atomic.Bool
 	failStartCleanup     atomic.Bool
+	startCleanupAttempts atomic.Int64
 	blockShutdownCheck   atomic.Bool
 	key                  string
 	detachKey            string
@@ -74,6 +75,7 @@ func (h *poolRedisHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 		if h.failStartCleanup.Load() && cmd.Name() == "evalsha" {
 			args := cmd.Args()
 			if len(args) > 1 && args[1] == h.startCleanupSHA {
+				h.startCleanupAttempts.Add(1)
 				return h.failure
 			}
 		}
@@ -657,6 +659,18 @@ func TestControlEventRoutingDuringOwnershipGaps(t *testing.T) {
 	assert.ErrorIs(t, err, errJobAwaitingOwner)
 
 	_, err = node.jobPayloadMap.Delete(ctx, jobKey)
+	require.NoError(t, err)
+
+	_, err = node.jobPendingMap.SetAndWait(ctx, jobKey, "dispatch-1")
+	require.NoError(t, err)
+
+	_, err = node.workerForEvent(evStopJob, jobKey)
+	assert.ErrorIs(t, err, errJobAwaitingOwner)
+
+	_, err = node.workerForEvent(evNotify, jobKey)
+	assert.ErrorIs(t, err, errJobAwaitingOwner)
+
+	_, err = node.jobPendingMap.Delete(ctx, jobKey)
 	require.NoError(t, err)
 
 	_, err = node.workerForEvent(evStopJob, jobKey)

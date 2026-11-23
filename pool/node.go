@@ -139,7 +139,8 @@ const (
 	evAck string = "a"
 )
 
-// pendingEventTTL is the TTL for pending events.
+// pendingEventTTL bounds transient message and notification deliveries while a
+// job has no active worker. Durable start and stop events do not expire.
 var pendingEventTTL = 2 * time.Minute
 
 var (
@@ -1710,23 +1711,17 @@ func (node *Node) handlePoolEvents(c <-chan *streaming.Event) {
 
 // routeWorkerEvent routes a dispatched event to the proper worker.
 func (node *Node) routeWorkerEvent(ev *streaming.Event) error {
-	// Filter out stale events
+	// Filter out stale transient events; start and stop requests stay durable
+	// until a worker accepts them or no durable job record remains.
 	now, err := node.rdb.Time(context.Background()).Result()
 	if err != nil {
 		return fmt.Errorf("routeWorkerEvent: read Redis time: %w", err)
 	}
 	age := now.Sub(ev.CreatedAt())
-	if age > pendingEventTTL && ev.EventName != evStartJob {
+	if age > pendingEventTTL && ev.EventName != evStartJob && ev.EventName != evStopJob {
 		node.logger.Debug("routeWorkerEvent: stale event, not routing", "event", ev.EventName, "id", ev.ID, "since", age, "TTL", pendingEventTTL)
-		settled, err := node.releaseTerminalDispatch(ev, errors.New("pool event expired before routing"))
-		if err != nil {
-			node.logger.Error(err, "event", ev.EventName, "id", ev.ID)
-		}
 		// Ack the sink event so it does not get redelivered.
-		if !settled {
-			err = node.settlePoolEvent(context.Background(), ev)
-		}
-		if err != nil {
+		if err := node.settlePoolEvent(context.Background(), ev); err != nil {
 			node.logger.Error(fmt.Errorf("routeWorkerEvent: failed to ack event: %w", err), "event", ev.EventName, "id", ev.ID)
 		}
 		return nil
@@ -1966,11 +1961,11 @@ func (node *Node) workerForEvent(eventName, key string) (string, error) {
 			return "", err
 		}
 		if !ok {
-			exists, err := node.jobPayloadExists(context.Background(), key)
+			awaitingOwner, err := node.jobAwaitingOwner(context.Background(), key)
 			if err != nil {
 				return "", err
 			}
-			if exists {
+			if awaitingOwner {
 				return "", fmt.Errorf("%w: %q", errJobAwaitingOwner, key)
 			}
 			return "", fmt.Errorf("%w: %q", errJobNotFound, key)
@@ -1980,14 +1975,24 @@ func (node *Node) workerForEvent(eventName, key string) (string, error) {
 	return "", fmt.Errorf("routeWorkerEvent: unknown worker event %q", eventName)
 }
 
-// jobPayloadExists reads the durable job record from Redis, which is the source
-// of truth when the local ownership map has no active owner during handoff.
-func (node *Node) jobPayloadExists(ctx context.Context, key string) (bool, error) {
-	exists, err := node.rdb.HExists(ctx, rmapContentKey(node.resources.jobPayloads), key).Result()
+// jobAwaitingOwner reports whether Redis holds either a saved job payload or an
+// unsettled pending dispatch for key at a single Redis linearization point when
+// the local ownership map has no active worker during admission, recovery, or
+// handoff.
+func (node *Node) jobAwaitingOwner(ctx context.Context, key string) (bool, error) {
+	exists, err := jobAwaitingOwnerScript.Run(
+		ctx,
+		node.rdb,
+		[]string{
+			rmapContentKey(node.resources.jobPayloads),
+			rmapContentKey(node.resources.jobPending),
+		},
+		key,
+	).Int64()
 	if err != nil {
-		return false, fmt.Errorf("routeWorkerEvent: failed to check job payload %q: %w", key, err)
+		return false, fmt.Errorf("routeWorkerEvent: failed to check job ownership state for %q: %w", key, err)
 	}
-	return exists, nil
+	return exists == 1, nil
 }
 
 // activeJobOwner returns the single active worker that owns a job key according
@@ -2284,6 +2289,7 @@ func (node *Node) requeueOrphanedPayloads(ctx context.Context) {
 	if grace < node.recoveryGrace {
 		grace = node.recoveryGrace
 	}
+	hasActiveWorkers := len(node.activeWorkers()) > 0
 
 	now := time.Now()
 	for key := range node.jobPayloadMap.Map() {
@@ -2313,6 +2319,14 @@ func (node *Node) requeueOrphanedPayloads(ctx context.Context) {
 				)
 				continue
 			}
+		}
+		// While no active worker is registered in the pool, already-requeued jobs
+		// wait in poolStream for a worker to join; start the orphan grace window
+		// only once an active worker exists so outages do not append duplicate
+		// requeue events behind a pending stop.
+		if !hasActiveWorkers {
+			node.orphanedPayloads.Delete(key)
+			continue
 		}
 
 		firstAny, ok := node.orphanedPayloads.Load(key)

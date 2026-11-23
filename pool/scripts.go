@@ -186,43 +186,138 @@ return {
 }
 `)
 
-	// cleanupFailedStartScript atomically verifies this pool generation, removes
-	// the worker's ownership, deletes the durable payload, and publishes both
-	// rmap updates. A worker may publish terminal Start failure only after this
-	// idempotent recipe succeeds.
+	// jobAwaitingOwnerScript atomically checks whether Redis holds either a
+	// saved job payload or an unsettled pending dispatch for a job key so
+	// routing never observes a false-negative gap while a worker claims and
+	// settles an admitted start.
+	jobAwaitingOwnerScript = redis.NewScript(`
+if redis.call("HEXISTS", KEYS[1], ARGV[1]) == 1
+or redis.call("HEXISTS", KEYS[2], ARGV[1]) == 1 then
+    return 1
+end
+return 0
+`)
+
+	// claimRequeuedStartScript claims an existing saved job payload for a
+	// Requeued: true start delivery. When stopJob or failed-start cleanup has
+	// already deleted the payload (and no new pending dispatch exists), it
+	// returns 0 so trailing requeue events acknowledge cleanly instead of
+	// resurrecting a stopped job.
+	claimRequeuedStartScript = rmapwire.NewScript(`
+if redis.call("HGET", KEYS[1], "state") ~= ARGV[2]
+or redis.call("HGET", KEYS[1], "generation") ~= ARGV[1] then
+    return redis.error_reply("POOLGENERATIONLOST")
+end` + nodeLivenessFenceLua + `
+local worker = ARGV[4]
+local job = ARGV[3]
+local registration = redis.call("HGET", KEYS[6], worker)
+if not registration or registration == "-"
+or redis.call("HGET", KEYS[7], worker)
+or redis.call("HGET", KEYS[7], ARGV[6]) then
+    return redis.error_reply("WORKERCLEANUPLOST")
+end
+if redis.call("HEXISTS", KEYS[3], job) == 1 then
+    return 2
+end
+local payload = redis.call("HGET", KEYS[2], job)
+if not payload then
+    return 0
+end
+if payload ~= ARGV[5] then
+    return redis.error_reply("JOBPAYLOADCONFLICT")
+end
+
+local own_jobs = {}
+local owned = false
+local owners = redis.call("HGETALL", KEYS[4])
+for i = 1, #owners, 2 do
+    local owner = owners[i]
+    if string.sub(owner, 1, 1) ~= "=" then
+        local ok, jobs = pcall(cjson.decode, owners[i + 1])
+        if not ok or type(jobs) ~= "table" then
+            return redis.error_reply("INVALIDJOBOWNERSHIP")
+        end
+        if owner == worker then
+            own_jobs = jobs
+        end
+        for _, key in ipairs(jobs) do
+            if key == job then
+                if owner ~= worker then
+                    return 2
+                end
+                owned = true
+            end
+        end
+    end
+end
+
+if not owned then
+    table.insert(own_jobs, job)
+    local value = cjson.encode(own_jobs)
+    redis.call("HSET", KEYS[4], worker, value)
+    local rev = publishSet(KEYS[4], KEYS[5], worker, value)
+end
+return 1
+`)
+
+	// cleanupFailedStartScript atomically verifies pool, node, and worker
+	// liveness, confirms no other worker has taken over the job key, removes
+	// this worker's ownership, deletes the durable payload, and publishes both
+	// rmap updates. A worker may publish terminal Start failure or acknowledge
+	// Stop only after this idempotent recipe succeeds.
 	cleanupFailedStartScript = rmapwire.NewScript(`
 if redis.call("HGET", KEYS[1], "state") ~= ARGV[4]
 or redis.call("HGET", KEYS[1], "generation") ~= ARGV[1] then
     return redis.error_reply("POOLGENERATIONLOST")
-end
-
+end` + nodeLivenessFenceLua + `
 local worker = ARGV[2]
 local job = ARGV[3]
-local encoded = redis.call("HGET", KEYS[2], worker)
-if encoded then
-    local ok, values = pcall(cjson.decode, encoded)
-    if not ok or type(values) ~= "table" then
-        return redis.error_reply("INVALIDJOBOWNERSHIP")
-    end
-    local remaining = {}
-    local removed = false
-    for _, value in ipairs(values) do
-        if value == job then
-            removed = true
+local registration = redis.call("HGET", KEYS[6], worker)
+if not registration or registration == "-"
+or redis.call("HGET", KEYS[7], worker)
+or redis.call("HGET", KEYS[7], ARGV[5]) then
+    return redis.error_reply("WORKERCLEANUPLOST")
+end
+
+local own_jobs = nil
+local removed = false
+local owners = redis.call("HGETALL", KEYS[2])
+for i = 1, #owners, 2 do
+    local owner = owners[i]
+    if string.sub(owner, 1, 1) ~= "=" then
+        local ok, values = pcall(cjson.decode, owners[i + 1])
+        if not ok or type(values) ~= "table" then
+            return redis.error_reply("INVALIDJOBOWNERSHIP")
+        end
+        if owner == worker then
+            local remaining = {}
+            for _, value in ipairs(values) do
+                if value == job then
+                    removed = true
+                else
+                    table.insert(remaining, value)
+                end
+            end
+            own_jobs = remaining
         else
-            table.insert(remaining, value)
+            for _, value in ipairs(values) do
+                if value == job then
+                    return redis.error_reply("WORKERCLEANUPLOST")
+                end
+            end
         end
     end
-    if removed then
-        local rev
-        if #remaining == 0 then
-            redis.call("HDEL", KEYS[2], worker)
-            rev = publishDel(KEYS[2], KEYS[3], worker)
-        else
-            local value = cjson.encode(remaining)
-            redis.call("HSET", KEYS[2], worker, value)
-            rev = publishSet(KEYS[2], KEYS[3], worker, value)
-        end
+end
+
+if removed then
+    local rev
+    if #own_jobs == 0 then
+        redis.call("HDEL", KEYS[2], worker)
+        rev = publishDel(KEYS[2], KEYS[3], worker)
+    else
+        local value = cjson.encode(own_jobs)
+        redis.call("HSET", KEYS[2], worker, value)
+        rev = publishSet(KEYS[2], KEYS[3], worker, value)
     end
 end
 
